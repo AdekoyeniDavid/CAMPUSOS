@@ -2,9 +2,10 @@
 
 ## What is configured
 
+- Live deployment: [https://campusos.ajiboladavid697.workers.dev](https://campusos.ajiboladavid697.workers.dev). The production build points Firebase Firestore to this same-origin Worker.
 - `wrangler.jsonc` deploys the Vite build from `dist/` as Cloudflare Worker static assets. Cloudflare serves and caches the hashed JS, CSS, and image assets from its global edge network. The React single-page app fallback is enabled.
 - `workers/index.js` proxies only Firestore WebChannel RPC requests to `firestore.googleapis.com`. All other requests go to the static asset binding. Firebase Authentication remains with Firebase Auth.
-- Set `VITE_FIRESTORE_WORKER_HOST` to the Worker hostname (for example, `campusos.<account-subdomain>.workers.dev`, without a scheme) to opt the Firebase SDK into the proxy. Leave it blank to use Firebase directly until Cloudflare is configured.
+- `VITE_FIRESTORE_WORKER_HOST` is set to `campusos.ajiboladavid697.workers.dev` for the deployed build. For another environment, set it to the Worker hostname without a scheme; leave it blank to connect directly to Firebase.
 - Worker Smart Placement is enabled to let Cloudflare optimize the proxy's location relative to the Firestore backend. Placement needs real traffic to evaluate and is not an unconditional latency guarantee.
 
 ## Security and caching
@@ -15,11 +16,10 @@ Exam, profile, course, assignment, and timetable data is personal. Proxy respons
 
 ## Deploy
 
-1. Install Wrangler for this checkout: `npm install --save-dev wrangler`.
-2. Sign in to the intended Cloudflare account: `npx wrangler login`.
-3. Build and deploy: `npm run cloudflare:deploy`.
-4. Set `VITE_FIRESTORE_WORKER_HOST` in the production build environment to the deployed Worker hostname, rebuild, and deploy again. Do not commit the populated `.env` file.
-5. If the app is served from a different origin than the Worker, set the Worker environment variable `CAMPUSOS_ALLOWED_ORIGINS` to the exact comma-separated app origins. Avoid wildcard origins. Local Worker development can use an ignored `.dev.vars` file.
-6. Verify sign-in, exam create/edit/delete, course/assignment/timetable writes, offline/error states, and check that Firestore proxy responses have `Cache-Control: private, no-store`. Compare client request timing before and after enabling the proxy. Roll back by clearing `VITE_FIRESTORE_WORKER_HOST` if the extra hop increases latency.
+1. Install dependencies with `npm install` (Wrangler is included in `devDependencies`).
+2. Sign in to the intended Cloudflare account with `npx wrangler login`.
+3. Set `VITE_FIRESTORE_WORKER_HOST` in the production build environment to the deployed Worker hostname, then run `npm run cloudflare:deploy`. Do not commit `.env` or `.dev.vars` files.
+4. If the app is served from a different origin than the Worker, set the Worker environment variable `CAMPUSOS_ALLOWED_ORIGINS` to the exact comma-separated app origins. Avoid wildcard origins. Local Worker development can use an ignored `.dev.vars` file.
+5. Verify sign-in, exam create/edit/delete, course/assignment/timetable writes, offline/error states, and check that Firestore proxy responses have `Cache-Control: private, no-store`. Compare client request timing before and after enabling the proxy. Roll back by clearing `VITE_FIRESTORE_WORKER_HOST` if the extra hop increases latency.
 
-Cloudflare account access and the final hostname are not present in the repository. Deployment remains an operator step after authenticating to the intended Cloudflare account. Keep Firebase Security Rules deployed from `firestore.rules` in sync with the data shapes the app writes.
+The current deployment is in the signed-in Cloudflare account; its Worker hostname is documented above. Keep Firebase Security Rules deployed from `firestore.rules` in sync with the data shapes the app writes.
