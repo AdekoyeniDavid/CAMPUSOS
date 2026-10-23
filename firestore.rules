@@ -1,0 +1,124 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedInAndVerified() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function ownsStudent(studentUid) {
+      return signedInAndVerified() && request.auth.uid == studentUid;
+    }
+
+    function isAdmin() {
+      return signedInAndVerified() && request.auth.token.role == 'admin';
+    }
+
+    function isAssignedLecturer(studentUid) {
+      let student = get(/databases/$(database)/documents/students/$(studentUid)).data;
+      return signedInAndVerified()
+        && request.auth.token.role == 'lecturer'
+        && student.authorizedStaffUids is list
+        && request.auth.uid in student.authorizedStaffUids;
+    }
+
+    function canReadStudent(studentUid) {
+      return ownsStudent(studentUid) || isAdmin() || isAssignedLecturer(studentUid);
+    }
+
+    function validStudentDocument(studentUid) {
+      return request.resource.data.keys().hasOnly([
+          'uid', 'email', 'profile', 'institution', 'personal', 'contact',
+          'academic', 'enrolment', 'courses', 'progress',
+          'authorizedStaffUids', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.uid == studentUid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.profile is map
+        && request.resource.data.authorizedStaffUids is list
+        && request.resource.data.authorizedStaffUids.size() <= 20;
+    }
+
+    function studentEditableFieldsOnly() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'profile', 'institution', 'personal', 'contact', 'academic',
+        'enrolment', 'courses', 'progress', 'updatedAt'
+      ])
+      && request.resource.data.email == resource.data.email
+      && request.resource.data.uid == resource.data.uid
+      && request.resource.data.authorizedStaffUids == resource.data.authorizedStaffUids
+      && request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    function validCourse() {
+      return request.resource.data.keys().hasOnly([
+          'code', 'name', 'color', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.code is string
+        && request.resource.data.code.size() > 0
+        && request.resource.data.code.size() <= 32
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 160;
+    }
+
+    function validAssignment() {
+      return request.resource.data.keys().hasOnly([
+          'title', 'question', 'course', 'due', 'completed', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.question is string
+        && request.resource.data.question.size() <= 10000
+        && request.resource.data.course is string
+        && request.resource.data.course.size() <= 32
+        && request.resource.data.due is string
+        && request.resource.data.due.size() > 0
+        && request.resource.data.due.size() <= 80
+        && request.resource.data.completed is bool;
+    }
+
+    function validSchedule() {
+      return request.resource.data.keys().hasOnly([
+          'courseCode', 'day', 'start', 'end', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.courseCode is string
+        && request.resource.data.courseCode.size() > 0
+        && request.resource.data.courseCode.size() <= 32
+        && request.resource.data.day in [
+          'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
+        ]
+        && request.resource.data.start is string
+        && request.resource.data.end is string
+        && request.resource.data.start < request.resource.data.end;
+    }
+
+    match /students/{studentUid} {
+      allow get: if canReadStudent(studentUid);
+      allow list: if isAdmin();
+      allow create: if ownsStudent(studentUid) && validStudentDocument(studentUid)
+        && request.resource.data.authorizedStaffUids == [];
+      allow update: if (ownsStudent(studentUid) && validStudentDocument(studentUid) && studentEditableFieldsOnly())
+        || isAdmin();
+      allow delete: if isAdmin();
+
+      match /courses/{courseId} {
+        allow read: if canReadStudent(studentUid);
+        allow create, update: if (ownsStudent(studentUid) && validCourse()) || isAdmin();
+        allow delete: if ownsStudent(studentUid) || isAdmin();
+      }
+
+      match /assignments/{assignmentId} {
+        allow read: if canReadStudent(studentUid);
+        allow create, update: if (ownsStudent(studentUid) && validAssignment()) || isAdmin();
+        allow delete: if ownsStudent(studentUid) || isAdmin();
+      }
+
+      match /schedules/{scheduleId} {
+        allow read: if canReadStudent(studentUid);
+        allow create, update: if (ownsStudent(studentUid) && validSchedule()) || isAdmin();
+        allow delete: if ownsStudent(studentUid) || isAdmin();
+      }
+    }
+  }
+}
