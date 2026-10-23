@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ProfilePanel } from "./ProfilePanel";
 import { AuthScreen, VerificationScreen } from "./AuthScreen";
 import { EmailAuthProvider, browserSessionPersistence, onIdTokenChanged, reauthenticateWithCredential, setPersistence, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
@@ -7,11 +7,13 @@ import { collection, doc, onSnapshot } from "firebase/firestore";
 import {
   deleteAssignment as deleteAssignmentRecord,
   deleteCourse as deleteCourseRecord,
+  deleteExam as deleteExamRecord,
   deleteSchedule as deleteScheduleRecord,
   ensureStudentRecord,
   renameCourse as renameCourseRecord,
   saveAssignment as saveAssignmentRecord,
   saveCourse as saveCourseRecord,
+  saveExam as saveExamRecord,
   saveSchedule as saveScheduleRecord,
 } from "./firestore";
 import "./App.css";
@@ -39,6 +41,17 @@ type Assignment = {
   completed: boolean;
 };
 
+type Exam = {
+  id: string;
+  title: string;
+  courseCode: string;
+  date: string;
+  start: string;
+  location: string;
+};
+
+type ThemeMode = "light" | "dark" | "system";
+
 const initialAssignments: Assignment[] = [];
 const initialCourses: Course[] = [];
 const initialSchedules: Schedule[] = [];
@@ -53,6 +66,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [studentName, setStudentName] = useState(user.displayName || user.email?.split("@")[0] || "Student");
   const [menuOpen, setMenuOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    const saved = window.localStorage.getItem("campusos-theme");
+    return saved === "light" || saved === "dark" ? saved : "system";
+  });
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const themeMenuRef = useRef<HTMLDivElement>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [reminderMessage, setReminderMessage] = useState("");
@@ -63,6 +83,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [recentCourseCodes, setRecentCourseCodes] = useState<string[]>([]);
   const [openCourseMenu, setOpenCourseMenu] = useState<string | null>(null);
   const [schedules, setSchedules] = useState(initialSchedules);
+  const [exams, setExams] = useState<Exam[]>([]);
+  const [examFormOpen, setExamFormOpen] = useState(false);
+  const [editingExamId, setEditingExamId] = useState<string | null>(null);
+  const [examDraft, setExamDraft] = useState({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
   const [scheduleFormOpen, setScheduleFormOpen] = useState(false);
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [cloudReady, setCloudReady] = useState(false);
@@ -83,6 +107,33 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [newDue, setNewDue] = useState("");
 
   useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const updatePreference = () => setSystemPrefersDark(media.matches);
+    media.addEventListener("change", updatePreference);
+    return () => media.removeEventListener("change", updatePreference);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("campusos-theme", themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    if (!themeMenuOpen) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (event.target instanceof Node && !themeMenuRef.current?.contains(event.target)) setThemeMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setThemeMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [themeMenuOpen]);
+
+  useEffect(() => {
     const db = firestoreDb;
     if (!db) {
       setCloudReady(true);
@@ -94,7 +145,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     let unsubscribers: Array<() => void> = [];
     const markReady = (key: string) => {
       readyParts.add(key);
-      if (readyParts.size === 4) {
+      if (readyParts.size === 5) {
         setCloudReady(true);
         setCloudMessage("");
       }
@@ -129,6 +180,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           setSchedules(snapshot.docs.map((item) => ({ ...item.data(), id: item.id })) as Schedule[]);
           markReady("schedules");
         }, failed),
+        onSnapshot(collection(db, "students", user.uid, "exams"), (snapshot) => {
+          setExams(snapshot.docs.map((item) => ({ ...item.data(), id: item.id })) as Exam[]);
+          markReady("exams");
+        }, failed),
       ];
     }).catch(failed);
     return () => {
@@ -142,8 +197,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       await save();
       setCloudMessage("Saved to your secure student account.");
       return true;
-    } catch {
-      setCloudMessage("Could not save to Firestore. Check your connection and try again.");
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code: unknown }).code)
+        : "";
+      if (code.endsWith("permission-denied")) {
+        setCloudMessage("Firestore denied this save. Make sure your email is verified and the database rules are up to date.");
+      } else if (code.endsWith("unavailable") || code.endsWith("deadline-exceeded")) {
+        setCloudMessage("CampusOS could not reach Firestore. Your entry is still here; check your connection and save again.");
+      } else {
+        setCloudMessage("CampusOS could not save this entry. Please retry; if it continues, contact support.");
+      }
       return false;
     }
   }
@@ -238,6 +302,35 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (saved) setOpenCourseMenu(null);
   }
 
+  async function saveExam(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const title = examDraft.title.trim();
+    const courseCode = examDraft.courseCode.trim().toUpperCase();
+    const date = examDraft.date;
+    const start = examDraft.start;
+    const location = examDraft.location.trim();
+    if (!title || !courseCode || !date || !start || !location) return;
+    const id = editingExamId ?? crypto.randomUUID();
+    const saved = await persistCloudRecord(() => saveExamRecord(user.uid, id, { title, courseCode, date, start, location }, !editingExamId));
+    if (saved) {
+      setExamDraft({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
+      setEditingExamId(null);
+      setExamFormOpen(false);
+    }
+  }
+
+  function beginEditExam(exam: Exam) {
+    setEditingExamId(exam.id);
+    setExamDraft({ title: exam.title, courseCode: exam.courseCode, date: exam.date, start: exam.start, location: exam.location });
+    setExamFormOpen(true);
+    setOpenCourseMenu(null);
+  }
+
+  async function removeExam(id: string) {
+    const saved = await persistCloudRecord(() => deleteExamRecord(user.uid, id));
+    if (saved) setOpenCourseMenu(null);
+  }
+
   async function removeAssignment(id: string) {
     const saved = await persistCloudRecord(() => deleteAssignmentRecord(user.uid, id));
     if (saved) setOpenCourseMenu(null);
@@ -329,9 +422,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     { name: "Assignments", page: "Assignments", icon: "✓" },
     { name: "Timetable", page: "Timetable", icon: "▦" },
   ];
+  const activeTheme = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-theme={activeTheme}>
       <main className="main-content">
         <header className="topbar">
           <div className="topbar-left">
@@ -346,6 +440,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           </div>
           <div className="topbar-right">
             <span className="today-label">{new Date().toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}</span>
+            <div className="theme-control" ref={themeMenuRef}>
+              <button className="theme-trigger" aria-label={`Appearance: ${themeMode}`} aria-expanded={themeMenuOpen} aria-haspopup="menu" title={`Appearance: ${themeMode}`} onClick={() => setThemeMenuOpen((open) => !open)}>
+                {activeTheme === "dark" ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2Z" /></svg> : <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>}
+              </button>
+              {themeMenuOpen && <div className="theme-menu liquid-glass" role="menu" aria-label="Choose appearance">
+                <p className="theme-menu-heading">Appearance</p>
+                {(["light", "dark", "system"] as ThemeMode[]).map((mode) => <button key={mode} className={`theme-option ${themeMode === mode ? "selected" : ""}`} role="menuitemradio" aria-checked={themeMode === mode} onClick={() => { setThemeMode(mode); setThemeMenuOpen(false); }}>
+                  <span className="theme-option-icon">{mode === "light" ? "☼" : mode === "dark" ? "☾" : "◐"}</span><span>{mode === "system" ? "System default" : `${mode.charAt(0).toUpperCase()}${mode.slice(1)} mode`}</span>{themeMode === mode && <span className="theme-check">✓</span>}
+                </button>)}
+              </div>}
+            </div>
             <div className="notification-controls">
               <button className={`notification-toggle ${soundEnabled ? "sound-on" : "sound-muted"}`} aria-label={soundEnabled ? "Mute reminder sounds" : "Turn reminder sounds on"} aria-pressed={!soundEnabled} title={soundEnabled ? "Sound on" : "Muted"} onClick={() => setSoundEnabled((enabled) => !enabled)}>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />{!soundEnabled && <path d="m4 4 16 16" />}</svg>
@@ -741,6 +846,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           )}
 
           {activePage === "Timetable" && (
+            <>
             <section className="panel">
               <div className="section-heading">
                 <div>
@@ -784,6 +890,42 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 {schedules.length === 0 && <p className="empty-state">No scheduled courses yet. Add one to get started.</p>}
               </div>
             </section>
+            <section className="panel exam-panel">
+              <div className="section-heading">
+                <div>
+                  <h2>Exam timetable</h2>
+                  <p>Keep upcoming examinations, times, and venues in one place.</p>
+                </div>
+                <button className="primary-button" onClick={() => { setEditingExamId(null); setExamDraft({ title: "", courseCode: "", date: "", start: "09:00", location: "" }); setExamFormOpen((open) => !open); }}>
+                  <span>＋</span> Add exam
+                </button>
+              </div>
+              {examFormOpen && <form className="assignment-form exam-form" onSubmit={saveExam}>
+                <label>Exam title<input value={examDraft.title} onChange={(event) => setExamDraft((draft) => ({ ...draft, title: event.target.value }))} placeholder="e.g. Final examination" maxLength={160} required /></label>
+                <label>Course code<input value={examDraft.courseCode} onChange={(event) => setExamDraft((draft) => ({ ...draft, courseCode: event.target.value }))} placeholder="e.g. COS 102" maxLength={32} required /></label>
+                <label>Exam date<input type="date" value={examDraft.date} onChange={(event) => setExamDraft((draft) => ({ ...draft, date: event.target.value }))} required /></label>
+                <label>Start time<input type="time" value={examDraft.start} onChange={(event) => setExamDraft((draft) => ({ ...draft, start: event.target.value }))} required /></label>
+                <label>Venue<input value={examDraft.location} onChange={(event) => setExamDraft((draft) => ({ ...draft, location: event.target.value }))} placeholder="e.g. Main auditorium" maxLength={160} required /></label>
+                <div className="exam-form-actions"><button className="primary-button" type="submit">{editingExamId ? "Save exam" : "Add to exam timetable"}</button>{editingExamId && <button className="profile-cancel" type="button" onClick={() => { setEditingExamId(null); setExamFormOpen(false); }}>Cancel</button>}</div>
+              </form>}
+              <div className="exam-list">
+                {[...exams].sort((a, b) => `${a.date}T${a.start}`.localeCompare(`${b.date}T${b.start}`)).map((exam) => {
+                  const examDate = new Date(`${exam.date}T00:00:00`);
+                  const daysAway = Math.ceil((examDate.getTime() - new Date(new Date().toDateString()).getTime()) / 86400000);
+                  const dateLabel = Number.isNaN(examDate.getTime()) ? exam.date : examDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+                  return <article className="exam-row" key={exam.id}>
+                    <div className="exam-date-tile"><strong>{Number.isNaN(examDate.getTime()) ? "—" : examDate.getDate()}</strong><span>{Number.isNaN(examDate.getTime()) ? "" : examDate.toLocaleDateString("en-GB", { month: "short" })}</span></div>
+                    <div className="exam-info"><strong>{exam.title}</strong><span>{exam.courseCode} · {dateLabel} · {exam.start}</span><span className="exam-location">{exam.location}</span></div>
+                    <span className={`exam-countdown ${daysAway < 0 ? "exam-past" : ""}`}>{daysAway < 0 ? "Past" : daysAway === 0 ? "Today" : daysAway === 1 ? "Tomorrow" : `${daysAway} days`}</span>
+                    <div className="course-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={() => setOpenCourseMenu((current) => current === `exam-${exam.id}` ? null : `exam-${exam.id}`)}>⋯</button>
+                      {openCourseMenu === `exam-${exam.id}` && <div className="course-menu"><button type="button" onClick={() => beginEditExam(exam)}>Edit exam</button><button type="button" onClick={() => void removeExam(exam.id)}>Delete exam</button></div>}
+                    </div>
+                  </article>;
+                })}
+                {exams.length === 0 && <p className="empty-state">No exams added yet. Add an upcoming examination to keep its date and venue handy.</p>}
+              </div>
+            </section>
+            </>
           )}
 
           <footer className="footer">

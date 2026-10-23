@@ -8,6 +8,7 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
   writeBatch,
   type DocumentData,
@@ -19,6 +20,7 @@ export type StudentSection = "profile" | "institution" | "personal" | "contact" 
 export type CourseRecord = { code: string; name: string; color: string };
 export type AssignmentRecord = { title: string; question: string; course: string; due: string; completed: boolean };
 export type ScheduleRecord = { courseCode: string; day: string; start: string; end: string };
+export type ExamRecord = { title: string; courseCode: string; date: string; start: string; location: string };
 
 function requireDatabase() {
   if (!firestoreDb) throw new Error("Firebase is not configured.");
@@ -29,7 +31,7 @@ function studentRef(uid: string) {
   return doc(requireDatabase(), "students", uid);
 }
 
-function studentCollection(uid: string, name: "courses" | "assignments" | "schedules") {
+function studentCollection(uid: string, name: "courses" | "assignments" | "schedules" | "exams") {
   return collection(requireDatabase(), "students", uid, name);
 }
 
@@ -61,15 +63,17 @@ export async function saveStudentSection(uid: string, section: StudentSection, v
   await setDoc(studentRef(uid), { [section]: values, updatedAt: serverTimestamp() }, { merge: true });
 }
 
-export async function saveCourse(uid: string, code: string, course: CourseRecord) {
-  const db = requireDatabase();
-  const ref = doc(db, "students", uid, "courses", code);
-  const existing = await getDoc(ref);
-  await setDoc(ref, { ...course, createdAt: existing.data()?.createdAt ?? serverTimestamp(), updatedAt: serverTimestamp() }, { merge: true });
+export async function saveCourse(uid: string, code: string, course: CourseRecord, isNew = true) {
+  const ref = doc(requireDatabase(), "students", uid, "courses", code);
+  if (isNew) {
+    await setDoc(ref, { ...course, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    return;
+  }
+  await updateDoc(ref, { ...course, updatedAt: serverTimestamp() });
 }
 
 export async function renameCourse(uid: string, oldCode: string, newCode: string, course: CourseRecord) {
-  if (oldCode === newCode) return saveCourse(uid, newCode, course);
+  if (oldCode === newCode) return saveCourse(uid, newCode, course, false);
   const db = requireDatabase();
   const [oldCourse, assignments, schedules] = await Promise.all([
     getDoc(doc(db, "students", uid, "courses", oldCode)),
@@ -110,8 +114,11 @@ export async function deleteCourse(uid: string, code: string) {
 
 export async function saveAssignment(uid: string, id: string, assignment: AssignmentRecord, isNew: boolean) {
   const ref = doc(requireDatabase(), "students", uid, "assignments", id);
-  const existing = isNew ? null : await getDoc(ref);
-  await setDoc(ref, { ...assignment, createdAt: existing?.data()?.createdAt ?? serverTimestamp(), updatedAt: serverTimestamp() }, { merge: true });
+  if (isNew) {
+    await setDoc(ref, { ...assignment, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    return;
+  }
+  await updateDoc(ref, { ...assignment, updatedAt: serverTimestamp() });
 }
 
 export async function deleteAssignment(uid: string, id: string) {
@@ -120,12 +127,28 @@ export async function deleteAssignment(uid: string, id: string) {
 
 export async function saveSchedule(uid: string, id: string, schedule: ScheduleRecord, isNew: boolean) {
   const ref = doc(requireDatabase(), "students", uid, "schedules", id);
-  const existing = isNew ? null : await getDoc(ref);
-  await setDoc(ref, { ...schedule, createdAt: existing?.data()?.createdAt ?? serverTimestamp(), updatedAt: serverTimestamp() }, { merge: true });
+  if (isNew) {
+    await setDoc(ref, { ...schedule, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    return;
+  }
+  await updateDoc(ref, { ...schedule, updatedAt: serverTimestamp() });
 }
 
 export async function deleteSchedule(uid: string, id: string) {
   await deleteDoc(doc(requireDatabase(), "students", uid, "schedules", id));
+}
+
+export async function saveExam(uid: string, id: string, exam: ExamRecord, isNew: boolean) {
+  const ref = doc(requireDatabase(), "students", uid, "exams", id);
+  if (isNew) {
+    await setDoc(ref, { ...exam, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    return;
+  }
+  await updateDoc(ref, { ...exam, updatedAt: serverTimestamp() });
+}
+
+export async function deleteExam(uid: string, id: string) {
+  await deleteDoc(doc(requireDatabase(), "students", uid, "exams", id));
 }
 
 export function recordData(snapshot: QuerySnapshot<DocumentData>) {

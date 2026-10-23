@@ -12,7 +12,9 @@ Students can register with their name, email, and password, verify their email, 
 
 ## Database and access
 
-The app requires a signed-in, email-verified Firebase user before showing the CampusOS workspace. Student profile sections and My Courses, Assignment, and Timetable records sync to Firestore. Each student’s records are stored under that account’s UID. Firestore Security Rules are in [`firestore.rules`](firestore.rules); schema, deployment, access-control, and operational guidance is in [`docs/FIRESTORE.md`](docs/FIRESTORE.md).
+The app requires a signed-in, email-verified Firebase user before showing the CampusOS workspace. Student profile sections and My Courses, Assignment, weekly Timetable, and Exam timetable records sync to Firestore. Each student’s records are stored under that account’s UID. Firestore Security Rules are in [`firestore.rules`](firestore.rules); schema, deployment, access-control, and operational guidance is in [`docs/FIRESTORE.md`](docs/FIRESTORE.md).
+
+For the optional Cloudflare Worker proxy, Smart Placement, and global static-asset delivery setup, see [`docs/CLOUDFLARE.md`](docs/CLOUDFLARE.md). Cloudflare deployment requires signing in to the intended Cloudflare account and setting its Worker hostname in the production build environment.
 
 The rules expect trusted role claims for administrators and lecturers. Do not assign these claims from the client. Configure them only from a trusted Admin SDK environment, and add lecturer UIDs to a student record’s `authorizedStaffUids` only after verifying authorization. The Firestore region is permanent for this database.
 

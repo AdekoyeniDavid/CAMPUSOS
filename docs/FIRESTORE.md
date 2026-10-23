@@ -25,9 +25,11 @@ students/{uid}/assignments/{assignmentId}
   title, question, course, due, completed, createdAt, updatedAt
 students/{uid}/schedules/{scheduleId}
   courseCode, day, start, end, createdAt, updatedAt
+students/{uid}/exams/{examId}
+  title, courseCode, date, start, location, createdAt, updatedAt
 ```
 
-The client creates the student root record at first verified sign-in and listens for live changes. Courses, assignments, schedules, and profile sections are written directly through the Firebase Web SDK. UUID document IDs are used by the app for new course, assignment, and schedule entries.
+The client creates the student root record at first verified sign-in and listens for live changes. Courses, assignments, weekly schedules, exams, and profile sections are written directly through the Firebase Web SDK. Course codes identify course documents; UUID document IDs identify assignment, schedule, and exam entries. Exam records include a title, course code, date, start time, and venue.
 
 ## Access control
 

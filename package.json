@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "cloudflare:dev": "npm run build && npx wrangler dev",
+    "cloudflare:deploy": "npm run build && npx wrangler deploy"
   },
   "dependencies": {
     "firebase": "^13.1.0",

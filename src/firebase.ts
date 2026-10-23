@@ -1,6 +1,6 @@
 import { getApp, getApps, initializeApp, type FirebaseOptions } from "firebase/app";
 import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
+import { getFirestore, initializeFirestore } from "firebase/firestore";
 
 const firebaseConfig: FirebaseOptions = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -23,4 +23,9 @@ const firebaseApp = firebaseConfigured
   : null;
 
 export const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
-export const firestoreDb = firebaseApp ? getFirestore(firebaseApp) : null;
+const firestoreWorkerHost = import.meta.env.VITE_FIRESTORE_WORKER_HOST?.trim();
+export const firestoreDb = firebaseApp
+  ? firestoreWorkerHost
+    ? initializeFirestore(firebaseApp, { host: firestoreWorkerHost, ssl: true })
+    : getFirestore(firebaseApp)
+  : null;

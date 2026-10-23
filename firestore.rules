@@ -93,6 +93,25 @@ service cloud.firestore {
         && request.resource.data.start < request.resource.data.end;
     }
 
+    function validExam() {
+      return request.resource.data.keys().hasOnly([
+          'title', 'courseCode', 'date', 'start', 'location', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 160
+        && request.resource.data.courseCode is string
+        && request.resource.data.courseCode.size() > 0
+        && request.resource.data.courseCode.size() <= 32
+        && request.resource.data.date is string
+        && request.resource.data.date.size() == 10
+        && request.resource.data.start is string
+        && request.resource.data.start.size() == 5
+        && request.resource.data.location is string
+        && request.resource.data.location.size() > 0
+        && request.resource.data.location.size() <= 160;
+    }
+
     match /students/{studentUid} {
       allow get: if canReadStudent(studentUid);
       allow list: if isAdmin();
@@ -117,6 +136,12 @@ service cloud.firestore {
       match /schedules/{scheduleId} {
         allow read: if canReadStudent(studentUid);
         allow create, update: if (ownsStudent(studentUid) && validSchedule()) || isAdmin();
+        allow delete: if ownsStudent(studentUid) || isAdmin();
+      }
+
+      match /exams/{examId} {
+        allow read: if canReadStudent(studentUid);
+        allow create, update: if (ownsStudent(studentUid) && validExam()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
     }
