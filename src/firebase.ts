@@ -1,6 +1,6 @@
 import { getApp, getApps, initializeApp, type FirebaseOptions } from "firebase/app";
 import { getAuth } from "firebase/auth";
-import { getFirestore, initializeFirestore } from "firebase/firestore";
+import type { Firestore } from "firebase/firestore";
 
 const firebaseConfig: FirebaseOptions = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -24,8 +24,20 @@ const firebaseApp = firebaseConfigured
 
 export const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
 const firestoreWorkerHost = import.meta.env.VITE_FIRESTORE_WORKER_HOST?.trim();
-export const firestoreDb = firebaseApp
-  ? firestoreWorkerHost
-    ? initializeFirestore(firebaseApp, { host: firestoreWorkerHost, ssl: true })
-    : getFirestore(firebaseApp)
-  : null;
+let firestoreDbPromise: Promise<Firestore | null> | undefined;
+
+/** Load Firestore only after a user enters the signed-in workspace. */
+export function getFirestoreDb(): Promise<Firestore | null> {
+  if (!firebaseApp) return Promise.resolve(null);
+  if (!firestoreDbPromise) {
+    firestoreDbPromise = import("firebase/firestore").then(({ getFirestore, initializeFirestore }) =>
+      firestoreWorkerHost
+        ? initializeFirestore(firebaseApp, { host: firestoreWorkerHost, ssl: true })
+        : getFirestore(firebaseApp),
+    ).catch((error: unknown) => {
+      firestoreDbPromise = undefined;
+      throw error;
+    });
+  }
+  return firestoreDbPromise;
+}

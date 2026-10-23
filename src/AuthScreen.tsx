@@ -1,10 +1,13 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import {
   createUserWithEmailAndPassword,
   sendEmailVerification,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
+  setPersistence,
+  browserLocalPersistence,
+  browserSessionPersistence,
   getIdToken,
   reload,
   signOut,
@@ -12,6 +15,7 @@ import {
   updateProfile,
 } from "firebase/auth";
 import { firebaseAuth } from "./firebase";
+import { readStoredValue, removeStoredValue, writeStoredValue } from "./browser";
 
 type Mode = "signin" | "register" | "reset";
 
@@ -31,12 +35,70 @@ function readableAuthError(error: unknown) {
 export function AuthScreen({ initialError = "" }: { initialError?: string }) {
   const [mode, setMode] = useState<Mode>("signin");
   const [fullName, setFullName] = useState("");
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(() => mode === "signin" ? readStoredValue("campusos-remembered-email") ?? "" : "");
+  const [rememberMe, setRememberMe] = useState(() => readStoredValue("campusos-remember-me") === "true");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState(initialError);
+  const emailInput = useRef<HTMLInputElement>(null);
+  const passwordInput = useRef<HTMLInputElement>(null);
+  const autoSignInStarted = useRef(false);
+
+  async function signIn(emailValue: string, passwordValue: string) {
+    if (!firebaseAuth || busy) return;
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      await setPersistence(firebaseAuth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
+      await signInWithEmailAndPassword(firebaseAuth, emailValue.trim(), passwordValue);
+      if (rememberMe) {
+        writeStoredValue("campusos-remember-me", "true");
+        writeStoredValue("campusos-remembered-email", emailValue.trim());
+      } else {
+        removeStoredValue("campusos-remember-me");
+        removeStoredValue("campusos-remembered-email");
+      }
+    } catch (caught) {
+      setError(readableAuthError(caught));
+      autoSignInStarted.current = false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function tryAutofillSignIn() {
+    if (mode !== "signin" || busy || autoSignInStarted.current) return;
+    const emailElement = emailInput.current;
+    const passwordElement = passwordInput.current;
+    if (!emailElement || !passwordElement) return;
+    let passwordWasAutofilled = false;
+    try { passwordWasAutofilled = passwordElement.matches(":-webkit-autofill"); } catch { /* selector is browser-specific */ }
+    const emailValue = emailElement.value;
+    const passwordValue = passwordElement.value;
+    if (passwordWasAutofilled && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailValue) && passwordValue.length >= 8) {
+      autoSignInStarted.current = true;
+      setEmail(emailValue);
+      setPassword(passwordValue);
+      void signIn(emailValue, passwordValue);
+    }
+  }
+
+  useEffect(() => {
+    if (mode !== "signin") return;
+    const scheduleCheck = () => {
+      window.setTimeout(tryAutofillSignIn, 120);
+      window.setTimeout(tryAutofillSignIn, 500);
+    };
+    document.addEventListener("visibilitychange", scheduleCheck);
+    window.addEventListener("pageshow", scheduleCheck);
+    return () => {
+      document.removeEventListener("visibilitychange", scheduleCheck);
+      window.removeEventListener("pageshow", scheduleCheck);
+    };
+  }, [mode, busy, rememberMe]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -63,7 +125,15 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
         await sendEmailVerification(credential.user);
         setMessage("Account created. Check your email for a verification link before continuing.");
       } else if (mode === "signin") {
+        await setPersistence(firebaseAuth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
         await signInWithEmailAndPassword(firebaseAuth, email.trim(), password);
+        if (rememberMe) {
+          writeStoredValue("campusos-remember-me", "true");
+          writeStoredValue("campusos-remembered-email", email.trim());
+        } else {
+          removeStoredValue("campusos-remember-me");
+          removeStoredValue("campusos-remembered-email");
+        }
       } else {
         await sendPasswordResetEmail(firebaseAuth, email.trim());
         setMessage("If an account exists for that address, a password reset link has been sent.");
@@ -92,8 +162,9 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
       {message && <div className="auth-notice" role="status">{message}</div>}
       <form className="auth-form" onSubmit={submit}>
         {mode === "register" && <label>Full name<input type="text" autoComplete="name" value={fullName} onChange={(event) => setFullName(event.target.value)} required disabled={busy} /></label>}
-        <label>Email address<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required disabled={busy} /></label>
-        {mode !== "reset" && <label>Password<input type="password" autoComplete={mode === "register" ? "new-password" : "current-password"} minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required disabled={busy} /></label>}
+        <label>Email address<input ref={emailInput} type="email" autoComplete="email" value={email} onFocus={() => window.setTimeout(tryAutofillSignIn, 120)} onInput={tryAutofillSignIn} onAnimationStart={tryAutofillSignIn} onChange={(event) => setEmail(event.target.value)} required disabled={busy} /></label>
+        {mode !== "reset" && <label>Password<input ref={mode === "signin" ? passwordInput : undefined} type="password" autoComplete={mode === "register" ? "new-password" : "current-password"} minLength={8} value={password} onFocus={() => window.setTimeout(tryAutofillSignIn, 120)} onInput={tryAutofillSignIn} onAnimationStart={tryAutofillSignIn} onChange={(event) => setPassword(event.target.value)} required disabled={busy} /></label>}
+        {mode === "signin" && <label className="remember-me-option"><input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} disabled={busy} /><span>Remember me</span></label>}
         {mode === "register" && <label>Confirm password<input type="password" autoComplete="new-password" minLength={8} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required disabled={busy} /></label>}
         <button className="primary-button auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "register" ? "Create account" : mode === "reset" ? "Send reset link" : "Sign in"}</button>
       </form>
@@ -102,7 +173,7 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
         {mode === "register" && <><span>Already have an account?</span><button onClick={() => switchMode("signin")}>Sign in</button></>}
         {mode === "reset" && <button onClick={() => switchMode("signin")}>Back to sign in</button>}
       </div>
-      <p className="auth-session-note">Sign-in stays active for this browser session and ends when you sign out or close the session.</p>
+      <p className="auth-session-note">{rememberMe ? "You’ll stay signed in on this device until you sign out." : "You’ll stay signed in for this browser session. Your password is never saved."}</p>
     </section>
   </main>;
 }

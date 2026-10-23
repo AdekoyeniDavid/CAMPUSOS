@@ -27,9 +27,13 @@ students/{uid}/schedules/{scheduleId}
   courseCode, day, start, end, createdAt, updatedAt
 students/{uid}/exams/{examId}
   title, courseCode, date, start, location, createdAt, updatedAt
+students/{uid}/security/session-control
+  revokedAt, exemptAuthTime
 ```
 
-The client creates the student root record at first verified sign-in and listens for live changes. Courses, assignments, weekly schedules, exams, and profile sections are written directly through the Firebase Web SDK. Course codes identify course documents; UUID document IDs identify assignment, schedule, and exam entries. Exam records include a title, course code, date, start time, and venue.
+The client creates the student root record at first verified sign-in and listens for live changes. Courses, assignments, weekly schedules, exams, profile sections, study notes, and grade records are persisted in a per-account IndexedDB cache before a Firestore write is attempted. The durable outbox coalesces edits by record and retries after connectivity returns. Firestore remains the shared source of truth; offline changes are available on the same browser/device and become available elsewhere after sync. Course codes identify course documents; UUID document IDs identify assignment, schedule, and exam entries. Exam records include a title, course code, date, start time, and venue.
+
+The Account & Security panel can sign out other active devices while keeping the device that initiated the action signed in. It writes a server-timestamped `revokedAt` and the initiating Firebase session's `auth_time` to `students/{uid}/security/session-control`. Clients listen to this document and sign out when their session predates the revocation. Firestore rules use the same timestamp to reject revoked sessions' access to the student's records, while allowing the initiating session to continue. Deploy the updated Firestore rules with the app; deploying only the frontend does not enforce revocation at the database boundary.
 
 ## Access control
 
@@ -56,7 +60,7 @@ Do not point a production build at an unintended Firebase project. Review the se
 
 ## Validation and errors
 
-Rules are the database security boundary; client-side validation is for usability only. Keep both aligned when changing record fields. The UI listens for Firestore errors and reports a cloud sync message. When Firestore is unavailable or access is denied, fix connectivity/rules rather than falling back to browser storage as the permanent source of official student data.
+Rules are the database security boundary; client-side validation is for usability only. Keep both aligned when changing record fields. The UI listens for Firestore errors and reports a cloud sync message. Network outages leave edits queued locally; permission-denied errors remain visible and need a rules/account fix before those queued writes can sync. Authentication, password changes, and session revocation still require a connection.
 
 ## Backups, billing, and retention
 

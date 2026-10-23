@@ -5,18 +5,37 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.email_verified == true;
     }
 
+    function sessionIsActive(studentUid) {
+      let controlPath = /databases/$(database)/documents/students/$(studentUid)/security/session-control;
+      return !exists(controlPath)
+        || request.auth.token.auth_time >= get(controlPath).data.revokedAt.seconds()
+        || request.auth.token.auth_time == get(controlPath).data.exemptAuthTime;
+    }
+
     function ownsStudent(studentUid) {
-      return signedInAndVerified() && request.auth.uid == studentUid;
+      return signedInAndVerified()
+        && request.auth.uid == studentUid
+        && sessionIsActive(studentUid);
+    }
+
+    function validSessionControl() {
+      return request.resource.data.keys().hasOnly(['revokedAt', 'exemptAuthTime'])
+        && request.resource.data.keys().hasAll(['revokedAt', 'exemptAuthTime'])
+        && request.resource.data.revokedAt == request.time
+        && request.resource.data.exemptAuthTime == request.auth.token.auth_time;
     }
 
     function isAdmin() {
-      return signedInAndVerified() && request.auth.token.role == 'admin';
+      return signedInAndVerified()
+        && request.auth.token.role == 'admin'
+        && sessionIsActive(request.auth.uid);
     }
 
     function isAssignedLecturer(studentUid) {
       let student = get(/databases/$(database)/documents/students/$(studentUid)).data;
       return signedInAndVerified()
         && request.auth.token.role == 'lecturer'
+        && sessionIsActive(request.auth.uid)
         && student.authorizedStaffUids is list
         && request.auth.uid in student.authorizedStaffUids;
     }
@@ -120,6 +139,19 @@ service cloud.firestore {
       allow update: if (ownsStudent(studentUid) && validStudentDocument(studentUid) && studentEditableFieldsOnly())
         || isAdmin();
       allow delete: if isAdmin();
+
+      match /security/{securityDoc} {
+        // Revoked sessions can still read this control document so the client can detect
+        // the revocation and clear its local Firebase session.
+        allow get: if securityDoc == 'session-control'
+          && signedInAndVerified()
+          && request.auth.uid == studentUid;
+        allow list: if false;
+        allow create, update: if securityDoc == 'session-control'
+          && ownsStudent(studentUid)
+          && validSessionControl();
+        allow delete: if false;
+      }
 
       match /courses/{courseId} {
         allow read: if canReadStudent(studentUid);

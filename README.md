@@ -8,13 +8,17 @@ This checkout is configured for Firebase project `campusos-f5cfc`; its web app i
 
 For another checkout, copy `.env.example` to `.env`, fill in the Firebase Web app values, enable Email/Password in **Authentication → Sign-in method**, and restart the development server. Firebase web configuration is intended to be used by client apps; never put service account credentials in `.env`.
 
-Students can register with their name, email, and password, verify their email, sign in, request a password reset, and sign out. Sessions use browser-session persistence. Firebase verification and password-reset messages use the templates configured in the Firebase console.
+Students can register with their name, email, and password, verify their email, sign in, request a password reset, and sign out. The sign-in “Remember me” choice controls whether the session persists across browser restarts; the workspace keeps that Firebase setting instead of overriding it. Firebase verification and password-reset messages use the templates configured in the Firebase console.
 
 ## Database and access
 
-The app requires a signed-in, email-verified Firebase user before showing the CampusOS workspace. Student profile sections and My Courses, Assignment, weekly Timetable, and Exam timetable records sync to Firestore. Each student’s records are stored under that account’s UID. Firestore Security Rules are in [`firestore.rules`](firestore.rules); schema, deployment, access-control, and operational guidance is in [`docs/FIRESTORE.md`](docs/FIRESTORE.md).
+The app requires a signed-in, email-verified Firebase user before showing the CampusOS workspace. Student profile sections, courses, assignments, timetable, exams, study notes, and grades are saved to IndexedDB on this device first, then queued for Firestore sync. Each student’s records are partitioned by account UID. Offline edits remain on the device until connectivity returns; they are not visible on another device until sync completes. Firestore remains the shared source of truth. Firestore Security Rules are in [`firestore.rules`](firestore.rules); schema, deployment, access-control, and operational guidance is in [`docs/FIRESTORE.md`](docs/FIRESTORE.md).
 
-The production app is deployed at [campusos.ajiboladavid697.workers.dev](https://campusos.ajiboladavid697.workers.dev) with Cloudflare static-asset delivery, Smart Placement, and a same-origin Firestore Worker proxy. See [`docs/CLOUDFLARE.md`](docs/CLOUDFLARE.md) for deployment, security, caching, and rollback details.
+The app is deployed at [campusos.campusos-app.workers.dev](https://campusos.campusos-app.workers.dev) with Cloudflare static-asset delivery, Smart Placement, and a same-origin Firestore Worker proxy. See [`docs/CLOUDFLARE.md`](docs/CLOUDFLARE.md) for deployment, security, caching, and rollback details.
+
+## Device support
+
+CampusOS is a responsive web app and installable PWA for current browsers on iOS, iPadOS, Android, macOS, Windows, and Linux. Layouts account for safe areas, touch targets, small viewports, and reduced-motion preferences. The web build is not a native watchOS app; watchOS web views are not supported by Apple, so dedicated Apple Watch support would require a separate native watchOS companion.
 
 The rules expect trusted role claims for administrators and lecturers. Do not assign these claims from the client. Configure them only from a trusted Admin SDK environment, and add lecturer UIDs to a student record’s `authorizedStaffUids` only after verifying authorization. The Firestore region is permanent for this database.
 

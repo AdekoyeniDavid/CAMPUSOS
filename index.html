@@ -2,12 +2,18 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/campusos-icon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="preconnect" href="https://identitytoolkit.googleapis.com" crossorigin />
+    <link rel="preconnect" href="https://securetoken.googleapis.com" crossorigin />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7f8fc" />
+    <meta name="description" content="CampusOS student academic dashboard" />
     <title>campusos</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><main class="startup-screen" role="status">Opening CampusOS…</main></div>
+    <noscript><p class="startup-noscript">CampusOS needs JavaScript enabled to open. Turn on JavaScript in your browser and reload.</p></noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

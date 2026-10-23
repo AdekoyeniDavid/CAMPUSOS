@@ -1,22 +1,32 @@
-import { useEffect, useRef, useState } from "react";
-import { ProfilePanel } from "./ProfilePanel";
-import { AuthScreen, VerificationScreen } from "./AuthScreen";
-import { EmailAuthProvider, browserSessionPersistence, onIdTokenChanged, reauthenticateWithCredential, setPersistence, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
-import { firebaseAuth, firebaseConfigured, firestoreDb } from "./firebase";
-import { collection, doc, onSnapshot } from "firebase/firestore";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { EmailAuthProvider, getIdToken, onIdTokenChanged, reauthenticateWithCredential, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
+import { firebaseAuth, firebaseConfigured } from "./firebase";
 import {
   deleteAssignment as deleteAssignmentRecord,
   deleteCourse as deleteCourseRecord,
   deleteExam as deleteExamRecord,
   deleteSchedule as deleteScheduleRecord,
+  cacheStudentDocument,
   ensureStudentRecord,
   renameCourse as renameCourseRecord,
   saveAssignment as saveAssignmentRecord,
   saveCourse as saveCourseRecord,
   saveExam as saveExamRecord,
   saveSchedule as saveScheduleRecord,
+  revokeOtherSessions as revokeOtherSessionsRecord,
+  watchSessionRevocation,
+  watchStudentCollection,
+  watchStudentDocument,
 } from "./firestore";
+import { pendingWriteCount, replaceWithRemoteRecords, syncPendingWrites, watchLocalRecords } from "./offlineStore";
 import "./App.css";
+import { createRecordId, readStoredValue, writeStoredValue } from "./browser";
+import { normalizeCourseRecords } from "./courseRecords";
+
+const ProfilePanel = lazy(() => import("./ProfilePanel").then((module) => ({ default: module.ProfilePanel })));
+const StudyTools = lazy(() => import("./StudyTools").then((module) => ({ default: module.StudyTools })));
+const AuthScreen = lazy(() => import("./AuthScreen").then((module) => ({ default: module.AuthScreen })));
+const VerificationScreen = lazy(() => import("./AuthScreen").then((module) => ({ default: module.VerificationScreen })));
 
 type Course = {
   code: string;
@@ -67,15 +77,18 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [menuOpen, setMenuOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
-    const saved = window.localStorage.getItem("campusos-theme");
+    const saved = readStoredValue("campusos-theme");
     return saved === "light" || saved === "dark" ? saved : "system";
   });
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement>(null);
+  const reminderCancelRef = useRef<HTMLButtonElement>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [reminderMessage, setReminderMessage] = useState("");
+  const [reminderConfirmation, setReminderConfirmation] = useState<"desktop" | "email" | null>(null);
+  const [emailReminderSending, setEmailReminderSending] = useState(false);
   const [assignments, setAssignments] = useState(initialAssignments);
   const [editingAssignmentId, setEditingAssignmentId] = useState<string | null>(null);
   const [assignmentDraft, setAssignmentDraft] = useState({ title: "", question: "", course: "", due: "" });
@@ -90,7 +103,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [scheduleFormOpen, setScheduleFormOpen] = useState(false);
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [cloudReady, setCloudReady] = useState(false);
-  const [cloudMessage, setCloudMessage] = useState("Loading your saved student data…");
+  const [cloudMessage, setCloudMessage] = useState("Loading your saved student data from this device…");
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine);
+  const [queuedWriteCount, setPendingCount] = useState(0);
+  const [syncFailure, setSyncFailure] = useState("");
   const [scheduleCode, setScheduleCode] = useState("");
   const [scheduleName, setScheduleName] = useState("");
   const [scheduleDay, setScheduleDay] = useState("Monday");
@@ -114,8 +130,21 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem("campusos-theme", themeMode);
+    writeStoredValue("campusos-theme", themeMode);
   }, [themeMode]);
+
+  useEffect(() => {
+    if (!reminderConfirmation) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setReminderConfirmation(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    const focusTimer = window.setTimeout(() => reminderCancelRef.current?.focus(), 0);
+    return () => {
+      window.removeEventListener("keydown", closeOnEscape);
+      window.clearTimeout(focusTimer);
+    };
+  }, [reminderConfirmation]);
 
   useEffect(() => {
     if (!themeMenuOpen) return;
@@ -134,10 +163,101 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }, [themeMenuOpen]);
 
   useEffect(() => {
-    const db = firestoreDb;
-    if (!db) {
+    const auth = firebaseAuth;
+    if (!auth) return;
+    let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
+    let signOutStarted = false;
+
+    void user.getIdTokenResult().then(({ claims }) => {
+      if (cancelled || typeof claims.auth_time !== "number") return;
+      const authTime = claims.auth_time;
+      unsubscribe = watchSessionRevocation(user.uid, authTime, () => {
+        if (cancelled || signOutStarted) return;
+        signOutStarted = true;
+        void signOut(auth).catch(() => {
+          setCloudMessage("This session was revoked. Sign out and sign back in to continue.");
+        });
+      }, () => {
+        if (!cancelled) setCloudMessage("Session security could not sync. Check your connection.");
+      });
+    }).catch(() => {
+      if (!cancelled) setCloudMessage("Session security could not be checked. Check your connection.");
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, [user]);
+
+  useEffect(() => {
+    const refreshPending = (event?: Event) => {
+      if (event instanceof CustomEvent && event.detail?.uid === user.uid) {
+        if (event.detail.failed) {
+          const code = event.detail.code as string | undefined;
+          setSyncFailure(code === "permission-denied"
+            ? "Firestore rejected the queued changes. Check the account and Firestore rules."
+            : code === "unauthenticated"
+              ? "Your sign-in expired. Sign in again to sync saved changes."
+              : "Cloud sync failed and will retry automatically.");
+        } else {
+          setSyncFailure("");
+        }
+      }
+      void pendingWriteCount(user.uid).then(setPendingCount).catch(() => undefined);
+    };
+    const unsubscribe = [
+      watchLocalRecords(user.uid, "courses", (records) => setCourses(normalizeCourseRecords(records))),
+      watchLocalRecords(user.uid, "assignments", (records) => setAssignments(records as Assignment[])),
+      watchLocalRecords(user.uid, "schedules", (records) => setSchedules(records as Schedule[])),
+      watchLocalRecords(user.uid, "exams", (records) => setExams(records as Exam[])),
+    ];
+    const resumeSync = () => {
+      if (!navigator.onLine) return;
+      setIsOnline(true);
+      refreshPending();
+      if (firebaseConfigured) void syncPendingWrites(user.uid).finally(refreshPending);
+    };
+    const updateConnection = () => {
+      const online = navigator.onLine;
+      setIsOnline(online);
+      if (online) resumeSync();
+      else setCloudMessage("You’re offline. Your courses, assignments, and timetable are saved on this device.");
+      refreshPending();
+    };
+    const resumeWhenVisible = () => { if (document.visibilityState === "visible") resumeSync(); };
+    window.addEventListener("online", updateConnection);
+    window.addEventListener("offline", updateConnection);
+    window.addEventListener("focus", resumeSync);
+    window.addEventListener("pageshow", resumeSync);
+    document.addEventListener("visibilitychange", resumeWhenVisible);
+    window.addEventListener("campusos-sync", refreshPending);
+    refreshPending();
+    if (navigator.onLine) resumeSync();
+    setCloudReady(true);
+    if (!navigator.onLine) setCloudMessage("You’re offline. Your courses, assignments, and timetable are saved on this device.");
+    return () => {
+      unsubscribe.forEach((stop) => stop());
+      window.removeEventListener("online", updateConnection);
+      window.removeEventListener("offline", updateConnection);
+      window.removeEventListener("focus", resumeSync);
+      window.removeEventListener("pageshow", resumeSync);
+      document.removeEventListener("visibilitychange", resumeWhenVisible);
+      window.removeEventListener("campusos-sync", refreshPending);
+    };
+  }, [user.uid]);
+
+  useEffect(() => {
+    if (!queuedWriteCount && cloudReady && isOnline && !syncFailure) {
+      setCloudMessage((message) => message.startsWith("Saved on this device") || message.startsWith("Cloud sync is temporarily unavailable") ? "" : message);
+    }
+  }, [queuedWriteCount, cloudReady, isOnline, syncFailure]);
+
+  useEffect(() => {
+    if (!firebaseConfigured) {
       setCloudReady(true);
-      setCloudMessage("Firebase is not configured; cloud records are unavailable.");
+      setCloudMessage("Cloud sync is not configured. Your records stay on this device.");
       return;
     }
     let cancelled = false;
@@ -152,40 +272,49 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     };
     const failed = () => {
       setCloudReady(true);
-      setCloudMessage("CampusOS could not sync with Firestore. Changes will not be saved until the connection is restored.");
+      setCloudMessage(navigator.onLine
+        ? "Cloud sync is temporarily unavailable. Changes are saved on this device and queued for retry."
+        : "You’re offline. Changes are saved on this device and queued for sync.");
     };
-    void ensureStudentRecord(user).then(() => {
+    void (async () => {
+      try { if (navigator.onLine) await ensureStudentRecord(user); } catch { failed(); }
       if (cancelled) return;
       unsubscribers = [
-        onSnapshot(doc(db, "students", user.uid), (snapshot) => {
-          const profileName = snapshot.data()?.profile?.fullName;
+        watchStudentDocument(user.uid, (studentData, fromCache) => {
+          if (studentData) void cacheStudentDocument(user.uid, studentData, !fromCache);
+          const profileName = (studentData?.profile as Record<string, unknown> | undefined)?.fullName;
           if (typeof profileName === "string" && profileName.trim()) setStudentName(profileName);
           markReady("profile");
         }, failed),
-        onSnapshot(collection(db, "students", user.uid, "courses"), (snapshot) => {
-          const records = snapshot.docs.map((item) => ({ ...item.data(), code: item.id })) as Course[];
-          setCourses(records);
-          setRecentCourseCodes(snapshot.docs
+        watchStudentCollection(user.uid, "courses", (records, fromCache) => {
+          const normalized = records.map((item) => ({ ...item, code: item.id }));
+          // Keep the course code in the cached record as well as using it as its local ID.
+          void replaceWithRemoteRecords(user.uid, "courses", normalized, !fromCache);
+          setRecentCourseCodes(records
             .slice()
-            .sort((left, right) => (right.data().createdAt?.toMillis?.() ?? 0) - (left.data().createdAt?.toMillis?.() ?? 0))
+            .sort((left, right) => {
+              const timestamp = (value: unknown) => typeof value === "number" ? value : (value as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0;
+              return timestamp(right.createdAt) - timestamp(left.createdAt);
+            })
             .map((item) => item.id)
             .slice(0, 6));
           markReady("courses");
         }, failed),
-        onSnapshot(collection(db, "students", user.uid, "assignments"), (snapshot) => {
-          setAssignments(snapshot.docs.map((item) => ({ ...item.data(), id: item.id })) as Assignment[]);
+        watchStudentCollection(user.uid, "assignments", (records, fromCache) => {
+          void replaceWithRemoteRecords(user.uid, "assignments", records, !fromCache);
           markReady("assignments");
         }, failed),
-        onSnapshot(collection(db, "students", user.uid, "schedules"), (snapshot) => {
-          setSchedules(snapshot.docs.map((item) => ({ ...item.data(), id: item.id })) as Schedule[]);
+        watchStudentCollection(user.uid, "schedules", (records, fromCache) => {
+          void replaceWithRemoteRecords(user.uid, "schedules", records, !fromCache);
           markReady("schedules");
         }, failed),
-        onSnapshot(collection(db, "students", user.uid, "exams"), (snapshot) => {
-          setExams(snapshot.docs.map((item) => ({ ...item.data(), id: item.id })) as Exam[]);
+        watchStudentCollection(user.uid, "exams", (records, fromCache) => {
+          void replaceWithRemoteRecords(user.uid, "exams", records, !fromCache);
           markReady("exams");
         }, failed),
       ];
-    }).catch(failed);
+      if (navigator.onLine) void syncPendingWrites(user.uid);
+    })();
     return () => {
       cancelled = true;
       unsubscribers.forEach((unsubscribe) => unsubscribe());
@@ -195,7 +324,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   async function persistCloudRecord(save: () => Promise<void>) {
     try {
       await save();
-      setCloudMessage("Saved to your secure student account.");
+      void pendingWriteCount(user.uid).then(setPendingCount).catch(() => undefined);
+      setCloudMessage(navigator.onLine
+        ? "Saved on this device. Cloud sync is running in the background."
+        : "Saved on this device and queued to sync when you’re back online.");
       return true;
     } catch (error) {
       const code = typeof error === "object" && error !== null && "code" in error
@@ -204,7 +336,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       if (code.endsWith("permission-denied")) {
         setCloudMessage("Firestore denied this save. Make sure your email is verified and the database rules are up to date.");
       } else if (code.endsWith("unavailable") || code.endsWith("deadline-exceeded")) {
-        setCloudMessage("CampusOS could not reach Firestore. Your entry is still here; check your connection and save again.");
+        setCloudMessage("Cloud sync is unavailable. Your entry is saved locally and queued for retry.");
       } else {
         setCloudMessage("CampusOS could not save this entry. Please retry; if it continues, contact support.");
       }
@@ -222,6 +354,12 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const credential = EmailAuthProvider.credential(user.email, currentPassword);
     await reauthenticateWithCredential(user, credential);
     await updatePassword(user, newPassword);
+  }
+
+  async function signOutOtherSessions() {
+    const { claims } = await user.getIdTokenResult();
+    if (typeof claims.auth_time !== "number") throw new Error("The current sign-in session could not be verified.");
+    await revokeOtherSessionsRecord(user.uid, claims.auth_time);
   }
 
   useEffect(() => {
@@ -251,6 +389,24 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setShowCourseForm(false);
   }
 
+  function resetAssignmentForm() {
+    setNewTitle("");
+    setNewQuestion("");
+    setNewCourse(courses[0]?.code ?? "");
+    setNewDue("");
+  }
+
+  function startNewCourse() {
+    if (showCourseForm && !editingCourseCode) {
+      setShowCourseForm(false);
+      return;
+    }
+    setEditingCourseCode(null);
+    setNewCourseCode("");
+    setNewCourseName("");
+    setShowCourseForm(true);
+  }
+
   function beginEditCourse(code: string) {
     const course = courses.find((item) => item.code === code);
     if (!course) return;
@@ -268,7 +424,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const name = scheduleName.trim();
     if (!code || !name || scheduleStart >= scheduleEnd) return;
     const existing = courses.find((course) => course.code === code);
-    const id = editingScheduleId ?? crypto.randomUUID();
+    const id = editingScheduleId ?? createRecordId();
     const saved = await persistCloudRecord(async () => {
       if (!existing) await saveCourseRecord(user.uid, code, { code, name, color: "leather" });
       await saveScheduleRecord(user.uid, id, { courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd }, !editingScheduleId);
@@ -310,7 +466,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const start = examDraft.start;
     const location = examDraft.location.trim();
     if (!title || !courseCode || !date || !start || !location) return;
-    const id = editingExamId ?? crypto.randomUUID();
+    const id = editingExamId ?? createRecordId();
     const saved = await persistCloudRecord(() => saveExamRecord(user.uid, id, { title, courseCode, date, start, location }, !editingExamId));
     if (saved) {
       setExamDraft({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
@@ -366,15 +522,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       { day: "numeric", month: "short" },
     );
 
-    const id = crypto.randomUUID();
+    const id = createRecordId();
     const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, {
       title: newTitle.trim(), question: newQuestion.trim(), course: newCourse, due: formattedDate, completed: false,
     }, true));
     if (!saved) return;
 
-    setNewTitle("");
-    setNewQuestion("");
-    setNewDue("");
+    resetAssignmentForm();
     setShowForm(false);
     setActivePage("Assignments");
   }
@@ -387,14 +541,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     (assignment) => assignment.completed,
   ).length;
 
-  async function sendPendingReminders() {
-    const pending = assignments.filter((assignment) => !assignment.completed);
-    if (!pending.length) {
-      setReminderMessage("You are all caught up. There are no pending assignments.");
-      return;
-    }
+  async function sendDesktopReminders() {
     if (typeof Notification === "undefined") {
-      setReminderMessage("This browser does not support desktop notifications. Your pending tasks are listed here.");
+      setReminderMessage("This browser does not support notifications on this page. On iPhone or iPad, add CampusOS to your Home Screen and open the installed app to enable device notifications.");
       return;
     }
     let permission = Notification.permission;
@@ -403,16 +552,56 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       setReminderMessage("Notifications are blocked. Allow notifications in your browser to receive these reminders.");
       return;
     }
+    const pending = assignments.filter((assignment) => !assignment.completed);
+    if (!pending.length) {
+      setReminderMessage("Device notifications are allowed. Add a pending assignment to send a reminder.");
+      return;
+    }
     try {
-      pending.forEach((assignment) => new Notification(`Assignment reminder: ${assignment.title}`, {
-        body: `${assignment.course} · Due ${assignment.due}`,
-        icon: "/favicon.svg",
-        tag: `assignment-${assignment.id}`,
-        silent: !soundEnabled,
-      }));
+      let registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration().catch(() => undefined) : undefined;
+      if (!registration && "serviceWorker" in navigator) {
+        registration = await navigator.serviceWorker.register("/service-worker.js").catch(() => undefined);
+      }
+      for (const assignment of pending) {
+        const options = {
+          body: `${assignment.course} · Due ${assignment.due}`,
+          icon: "/campusos-icon.svg",
+          badge: "/campusos-icon.svg",
+          tag: `assignment-${assignment.id}`,
+          renotify: false,
+          silent: !soundEnabled,
+          data: { url: "/" },
+        };
+        if (registration && "showNotification" in registration) await registration.showNotification(`Assignment reminder: ${assignment.title}`, options);
+        else new Notification(`Assignment reminder: ${assignment.title}`, options);
+      }
       setReminderMessage(`${pending.length} pending assignment ${pending.length === 1 ? "reminder was" : "reminders were"} sent.`);
     } catch {
       setReminderMessage("The browser could not send reminders. Check notification permissions and try again.");
+    }
+  }
+
+  async function emailPendingReminders() {
+    if (emailReminderSending) return;
+    const pending = assignments.filter((assignment) => !assignment.completed);
+    if (!pending.length) return setReminderMessage("You are all caught up. There are no pending assignments.");
+    if (!user.email || !user.emailVerified) return setReminderMessage("Verify your signed-in email address before sending reminders.");
+    if (!navigator.onLine) return setReminderMessage("Email reminders need an internet connection. Your assignments remain saved on this device.");
+    setEmailReminderSending(true);
+    try {
+      const idToken = await getIdToken(user);
+      const response = await fetch("/api/reminders/email", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ reminders: pending.slice(0, 20).map(({ title, course, due }) => ({ title, course, due })) }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "Could not send email reminders.");
+      setReminderMessage(`Sent ${result.count} assignment reminder${result.count === 1 ? "" : "s"} to ${user.email}.`);
+    } catch (error) {
+      setReminderMessage(error instanceof Error ? error.message : "Could not send email reminders. Try again later.");
+    } finally {
+      setEmailReminderSending(false);
     }
   }
 
@@ -421,6 +610,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     { name: "My Courses", page: "My Courses", icon: "▤" },
     { name: "Assignments", page: "Assignments", icon: "✓" },
     { name: "Timetable", page: "Timetable", icon: "▦" },
+    { name: "Notes & Resources", page: "Notes & Resources", icon: "▧" },
+    { name: "Grade Calculator", page: "Grade Calculator", icon: "∑" },
+    { name: "Cloud Database", page: "Cloud Database", icon: "☁" },
+    { name: "Backup & Recovery", page: "Backup & Recovery", icon: "↻" },
   ];
   const activeTheme = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
 
@@ -465,18 +658,49 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           <>
             <button className="reminder-backdrop" aria-label="Close assignment reminders" onClick={() => setNotificationsOpen(false)} />
             <section className="notification-panel liquid-glass" aria-label="Pending assignment reminders">
-              <header className="notification-panel-heading"><div><p className="profile-kicker">CAMPUSOS REMINDERS</p><h2>Pending assignments</h2></div><span className="notification-panel-count">{pendingCount}</span></header>
+              <header className="notification-panel-heading"><div><p className="profile-kicker">CAMPUSOS REMINDERS</p><h2>Pending assignments</h2></div><button className="notification-panel-close" type="button" aria-label="Close CampusOS reminders" title="Close reminders" onClick={() => setNotificationsOpen(false)}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg></button></header>
               <div className="reminder-task-list">
                 {assignments.filter((assignment) => !assignment.completed).map((assignment) => <article className="reminder-task" key={assignment.id}><strong>{assignment.title}</strong><span>{assignment.course} · Due {assignment.due}</span></article>)}
                 {pendingCount === 0 && <p className="empty-state">You are all caught up.</p>}
               </div>
               {reminderMessage && <p className="reminder-message" role="status">{reminderMessage}</p>}
-              <button className="primary-button reminder-send-button" onClick={() => void sendPendingReminders()} disabled={pendingCount === 0}>Send reminders now</button>
+              <div className="reminder-actions">
+                <button className="primary-button reminder-send-button" onClick={() => setReminderConfirmation("desktop")}>Device notification</button>
+                <button className="primary-button reminder-email-button reminder-send-button" onClick={() => pendingCount ? setReminderConfirmation("email") : setReminderMessage("You are all caught up. Add a pending assignment to email a reminder.")} disabled={!isOnline || !user.emailVerified || emailReminderSending}>{emailReminderSending ? "Sending…" : "Email me"}</button>
+              </div>
+              <p className="reminder-sound-note">Email reminders go to your verified account address. Device alerts require permission; iPhone and iPad require CampusOS on the Home Screen.</p>
               <p className="reminder-sound-note">Reminder sound is {soundEnabled ? "on" : "muted"}. Toggle the bell to change it.</p>
             </section>
           </>
         )}
-        {profileOpen && <ProfilePanel studentUid={user.uid} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onSignOut={onSignOut} onClose={() => setProfileOpen(false)} />}
+        {reminderConfirmation && (
+          <div className="reminder-confirm-backdrop" onClick={() => setReminderConfirmation(null)}>
+            <section className="reminder-confirm-dialog liquid-glass" role="dialog" aria-modal="true" aria-labelledby="reminder-confirm-title" aria-describedby="reminder-confirm-description" onClick={(event) => event.stopPropagation()}>
+              <span className="reminder-confirm-icon" aria-hidden="true">{reminderConfirmation === "desktop" ? "⌁" : "✉"}</span>
+              <p className="profile-kicker">CAMPUSOS REMINDERS</p>
+              <h2 id="reminder-confirm-title">{reminderConfirmation === "desktop" ? "Send reminders to this device?" : "Email your reminders?"}</h2>
+              <p id="reminder-confirm-description">
+                {reminderConfirmation === "desktop"
+                  ? pendingCount
+                    ? `Send ${pendingCount} pending assignment reminder${pendingCount === 1 ? "" : "s"} as desktop notifications on this device. Your browser may ask for notification permission.`
+                    : "Allow CampusOS to show notifications on this device. You can send reminders here when you have pending assignments."
+                  : `Send up to ${Math.min(pendingCount, 20)} pending assignment reminder${pendingCount === 1 ? "" : "s"} to your verified account email, ${user.email}.`}
+              </p>
+              <div className="reminder-confirm-actions">
+                <button ref={reminderCancelRef} className="reminder-confirm-cancel" onClick={() => setReminderConfirmation(null)}>Cancel</button>
+                <button className="primary-button reminder-confirm-send" onClick={() => {
+                  const action = reminderConfirmation;
+                  setReminderConfirmation(null);
+                  if (action === "desktop") void sendDesktopReminders();
+                  else void emailPendingReminders();
+                }} disabled={reminderConfirmation === "email" && (!isOnline || !user.email || !user.emailVerified || emailReminderSending)}>
+                  {reminderConfirmation === "desktop" ? pendingCount ? "Send to device" : "Enable notifications" : "Send email"}
+                </button>
+              </div>
+            </section>
+          </div>
+        )}
+        {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
         {menuOpen && (
           <>
             <button className="menu-backdrop" aria-label="Close navigation menu" onClick={() => setMenuOpen(false)} />
@@ -493,7 +717,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         )}
 
         <div className="page-content">
-          {(!cloudReady || cloudMessage) && <div className={`cloud-sync-notice ${cloudReady ? "" : "is-loading"}`} role="status">{cloudMessage || "Your records are synced with Firestore."}</div>}
+          {(!cloudReady || cloudMessage || queuedWriteCount > 0 || syncFailure) && <div className={`cloud-sync-notice ${cloudReady ? "" : "is-loading"}`} role="status">
+            {!isOnline
+              ? `Offline · Saved on this device${queuedWriteCount ? ` · ${queuedWriteCount} change${queuedWriteCount === 1 ? "" : "s"} queued` : ""}`
+              : queuedWriteCount > 0
+                ? `Saved on this device · Syncing ${queuedWriteCount} queued change${queuedWriteCount === 1 ? "" : "s"}${syncFailure ? ` · ${syncFailure}` : ""}`
+                : syncFailure || cloudMessage || "Your records are synced with Firestore."}
+          </div>}
           <section className="welcome-row">
             <div>
               <p className="eyebrow">YOUR ACADEMIC WORKSPACE</p>
@@ -509,7 +739,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             {activePage === "Assignments" && (
               <button
                 className="primary-button"
-                onClick={() => setShowForm(true)}
+                onClick={() => { resetAssignmentForm(); setShowForm(true); }}
               >
                 <span>＋</span> Add assignment
               </button>
@@ -525,7 +755,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 </div>
                 <button
                   className="close-button"
-                  onClick={() => setShowForm(false)}
+                  onClick={() => { resetAssignmentForm(); setShowForm(false); }}
                   aria-label="Close form"
                 >
                   ×
@@ -712,7 +942,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                   <h2>Your courses</h2>
                   <p>Courses currently displayed in your workspace.</p>
                 </div>
-                <button className="primary-button" onClick={() => setShowCourseForm((shown) => !shown)}>
+                <button className="primary-button" onClick={startNewCourse}>
                   <span>＋</span> Add course
                 </button>
               </div>
@@ -847,7 +1077,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
           {activePage === "Timetable" && (
             <>
-            <section className="panel">
+            <section className={`panel timetable-panel ${openCourseMenu?.startsWith("schedule-") ? "schedule-menu-open" : ""}`}>
               <div className="section-heading">
                 <div>
                   <h2>Your weekly timetable</h2>
@@ -918,7 +1148,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <div className="exam-info"><strong>{exam.title}</strong><span>{exam.courseCode} · {dateLabel} · {exam.start}</span><span className="exam-location">{exam.location}</span></div>
                     <span className={`exam-countdown ${daysAway < 0 ? "exam-past" : ""}`}>{daysAway < 0 ? "Past" : daysAway === 0 ? "Today" : daysAway === 1 ? "Tomorrow" : `${daysAway} days`}</span>
                     <div className="course-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={() => setOpenCourseMenu((current) => current === `exam-${exam.id}` ? null : `exam-${exam.id}`)}>⋯</button>
-                      {openCourseMenu === `exam-${exam.id}` && <div className="course-menu"><button type="button" onClick={() => beginEditExam(exam)}>Edit exam</button><button type="button" onClick={() => void removeExam(exam.id)}>Delete exam</button></div>}
+                      {openCourseMenu === `exam-${exam.id}` && <div className="course-menu"><button type="button" onClick={() => beginEditExam(exam)}>Edit schedule</button><button type="button" onClick={() => void removeExam(exam.id)}>Delete schedule</button><button type="button" onClick={() => beginEditCourse(exam.courseCode)}>Edit course</button><button type="button" onClick={() => void removeCourse(exam.courseCode)}>Delete course</button></div>}
                     </div>
                   </article>;
                 })}
@@ -927,6 +1157,16 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             </section>
             </>
           )}
+
+          {["Notes & Resources", "Grade Calculator", "Cloud Database", "Backup & Recovery"].includes(activePage) && <Suspense fallback={<section className="panel study-loading" role="status">Loading study tools…</section>}><StudyTools
+            page={activePage}
+            studentUid={user.uid}
+            connected={cloudReady && isOnline}
+            online={isOnline}
+            syncPending={queuedWriteCount > 0}
+            cloudMessage={cloudMessage}
+            recordCounts={{ courses: courses.length, assignments: assignments.length, schedules: schedules.length, exams: exams.length }}
+          /></Suspense>}
 
           <footer className="footer">
             <span>CampusOS</span>
@@ -949,31 +1189,19 @@ function App() {
       setAuthReady(true);
       return;
     }
-    let cancelled = false;
-    let unsubscribe: (() => void) | undefined;
-    void setPersistence(auth, browserSessionPersistence).then(() => {
-      if (cancelled) return;
-      unsubscribe = onIdTokenChanged(auth, (currentUser) => {
-        setUser(currentUser);
-        setAuthReady(true);
-      }, () => {
-        setAuthError("We could not check your sign-in session. Please try again.");
-        setAuthReady(true);
-      });
-    }).catch(() => {
-      setAuthError("We could not start a secure sign-in session. Check the Firebase configuration.");
+    return onIdTokenChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthReady(true);
+    }, () => {
+      setAuthError("We could not check your sign-in session. Please try again.");
       setAuthReady(true);
     });
-    return () => {
-      cancelled = true;
-      unsubscribe?.();
-    };
   }, []);
 
   if (!authReady) return <main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Checking your secure session…</section></main>;
-  if (authError) return <AuthScreen initialError={authError} />;
-  if (!user) return <AuthScreen />;
-  if (!user.emailVerified) return <VerificationScreen user={user} />;
+  if (authError) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening sign in…</section></main>}><AuthScreen initialError={authError} /></Suspense>;
+  if (!user) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening sign in…</section></main>}><AuthScreen /></Suspense>;
+  if (!user.emailVerified) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Loading verification…</section></main>}><VerificationScreen user={user} /></Suspense>;
   return <CampusOSWorkspace key={user.uid} user={user} onSignOut={() => firebaseAuth ? signOut(firebaseAuth) : Promise.resolve()} />;
 }
 

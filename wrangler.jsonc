@@ -3,14 +3,24 @@
   "name": "campusos",
   "main": "workers/index.js",
   "compatibility_date": "2026-10-23",
+  "vars": {
+    "FIREBASE_PROJECT_ID": "campusos-f5cfc"
+  },
   "placement": {
     "mode": "smart"
   },
+  "d1_databases": [
+    {
+      "binding": "CAMPUSOS_DB",
+      "database_name": "campusos-data",
+      "database_id": "3f7b8870-a13b-4b9c-99d2-9e8e65dc5659"
+    }
+  ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    "not_found_handling": "single-page-application",
-    "run_worker_first": ["/google.firestore.v1.Firestore/*"]
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/api/d1/*", "/api/reminders/*", "/google.firestore.v1.Firestore/*"]
   },
   "observability": {
     "enabled": true
