@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { firebaseConfigured } from "./firebase";
-import { cacheStudentDocument, saveStudentSection, watchStudentDocument } from "./firestore";
+import { saveStudentSection } from "./firestore";
 import { watchLocalRecords } from "./offlineStore";
 
 type CourseSummary = { code: string; name: string };
@@ -171,11 +171,8 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
       setMessage("Firebase is not configured. Your profile edits are stored on this device only.");
       return localUnsubscribe;
     }
-    const remoteUnsubscribe = watchStudentDocument(studentUid, (student, fromCache) => {
-      if (!student) return;
-      void cacheStudentDocument(studentUid, student, !fromCache);
-    }, () => setMessage("Cloud sync is unavailable. Your saved profile remains on this device and will retry when connected."));
-    return () => { localUnsubscribe(); remoteUnsubscribe(); };
+    setMessage("");
+    return localUnsubscribe;
   }, [studentUid, registeredEmail]);
 
   function propsFor(id: Exclude<SectionId, "security">): SectionProps {

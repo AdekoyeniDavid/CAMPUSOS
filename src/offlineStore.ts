@@ -1,4 +1,4 @@
-import { getFirestoreDb } from "./firebase";
+import { getFirestoreDb } from "./firebase.ts";
 
 export type OfflineCollection = "courses" | "assignments" | "schedules" | "exams" | "studentSections";
 type StoredRecord = { key: string; uid: string; collection: OfflineCollection; id: string; data: Record<string, unknown> };
@@ -13,6 +13,11 @@ let databasePromise: Promise<StoreDatabase> | undefined;
 const flushRunning = new Set<string>();
 const retryDelayMs = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const maxRetryDelayMs = 15_000;
+const localChangeChannel = (() => {
+  if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") return undefined;
+  try { return new BroadcastChannel("campusos-local-record-changes-v1"); } catch { return undefined; }
+})();
 
 function openDatabase(): Promise<StoreDatabase> {
   if (typeof indexedDB === "undefined") return Promise.reject(new Error("This browser does not support local data storage."));
@@ -50,12 +55,24 @@ function readAll<T>(storeName: string): Promise<T[]> {
   }));
 }
 
-function commit(uid: string, collection: OfflineCollection) {
+function refreshWatchers(uid: string, collection: OfflineCollection) {
   const key = watcherKey(uid, collection);
   const listeners = watchers.get(key);
   if (!listeners?.size) return;
   void listLocalRecords(uid, collection).then((records) => listeners.forEach((listener) => listener(records)));
 }
+
+function commit(uid: string, collection: OfflineCollection) {
+  refreshWatchers(uid, collection);
+  try { localChangeChannel?.postMessage({ uid, collection }); } catch { /* IndexedDB remains the source of truth if tab messaging fails. */ }
+}
+
+localChangeChannel?.addEventListener("message", (event: MessageEvent<unknown>) => {
+  const change = event.data as { uid?: unknown; collection?: unknown } | null;
+  if (!change || typeof change.uid !== "string" || typeof change.collection !== "string") return;
+  if (!["courses", "assignments", "schedules", "exams", "studentSections"].includes(change.collection)) return;
+  refreshWatchers(change.uid, change.collection as OfflineCollection);
+});
 
 export async function listLocalRecords(uid: string, collection: OfflineCollection): Promise<Array<Record<string, unknown> & { id: string }>> {
   return (await readAll<StoredRecord>(recordStore))
@@ -68,8 +85,24 @@ export function watchLocalRecords(uid: string, collection: OfflineCollection, li
   const listeners = watchers.get(key) ?? new Set();
   listeners.add(listener);
   watchers.set(key, listeners);
-  void listLocalRecords(uid, collection).then(listener);
-  return () => { listeners.delete(listener); if (!listeners.size) watchers.delete(key); };
+  refreshWatchers(uid, collection);
+  const refreshOnResume = () => {
+    if (typeof document === "undefined" || document.visibilityState === "visible") refreshWatchers(uid, collection);
+  };
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", refreshOnResume);
+    window.addEventListener("pageshow", refreshOnResume);
+  }
+  if (typeof document !== "undefined") document.addEventListener("visibilitychange", refreshOnResume);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size) watchers.delete(key);
+    if (typeof window !== "undefined") {
+      window.removeEventListener("focus", refreshOnResume);
+      window.removeEventListener("pageshow", refreshOnResume);
+    }
+    if (typeof document !== "undefined") document.removeEventListener("visibilitychange", refreshOnResume);
+  };
 }
 
 export async function saveLocalRecord(uid: string, collection: OfflineCollection, id: string, data: Record<string, unknown>) {
@@ -203,7 +236,7 @@ export async function syncPendingWrites(uid: string) {
         void syncPendingWrites(uid);
       }, delay);
       retryTimers.set(uid, timer);
-      if (failed) retryDelayMs.set(uid, Math.min((retryDelayMs.get(uid) ?? 1_000) * 2, 60_000));
+      if (failed) retryDelayMs.set(uid, Math.min((retryDelayMs.get(uid) ?? 1_000) * 2, maxRetryDelayMs));
     } else if (!failed && !hasMore) {
       retryDelayMs.set(uid, 1_000);
       const timer = retryTimers.get(uid);

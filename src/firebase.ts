@@ -3,12 +3,12 @@ import { getAuth } from "firebase/auth";
 import type { Firestore } from "firebase/firestore";
 
 const firebaseConfig: FirebaseOptions = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  apiKey: import.meta.env?.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env?.VITE_FIREBASE_PROJECT_ID,
+  appId: import.meta.env?.VITE_FIREBASE_APP_ID,
+  messagingSenderId: import.meta.env?.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  storageBucket: import.meta.env?.VITE_FIREBASE_STORAGE_BUCKET,
 };
 
 export const firebaseConfigured = Boolean(
@@ -23,7 +23,7 @@ const firebaseApp = firebaseConfigured
   : null;
 
 export const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
-const firestoreWorkerHost = import.meta.env.VITE_FIRESTORE_WORKER_HOST?.trim();
+const firestoreWorkerHost = import.meta.env?.VITE_FIRESTORE_WORKER_HOST?.trim();
 let firestoreDbPromise: Promise<Firestore | null> | undefined;
 
 /** Load Firestore only after a user enters the signed-in workspace. */

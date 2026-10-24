@@ -1060,7 +1060,7 @@ h1 {
 }
 .quick-search-trigger:hover, .quick-search-trigger[aria-expanded="true"] { transform: translateY(-2px) scale(1.04); background: rgba(255,255,255,.76); box-shadow: 0 9px 24px rgba(64,55,44,.16); }
 .quick-search-trigger svg, .quick-search-input-wrap svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.quick-search-popover { position: fixed; top: 70px; left: 8px; right: auto; z-index: 1000; width: min(390px, calc(100vw - 16px)); max-height: min(70vh, 560px); max-height: min(70dvh, 560px); overflow-y: auto; overscroll-behavior: contain; padding: 13px; border-radius: 22px; transform-origin: top left; animation: glassDrop .34s cubic-bezier(.2,.8,.2,1) both, glassDrift 8s ease-in-out infinite; }
+.quick-search-popover { position: fixed; top: calc(84px + env(safe-area-inset-top)); left: auto; right: calc(16px + env(safe-area-inset-right)); z-index: 1000; width: min(390px, calc(100vw - 32px)); max-height: min(70vh, 560px); max-height: min(70dvh, 560px); overflow-y: auto; overscroll-behavior: contain; padding: 13px; border-radius: 22px; transform-origin: top right; animation: glassDrop .34s cubic-bezier(.2,.8,.2,1) both, glassDrift 8s ease-in-out infinite; }
 .quick-search-input-wrap { min-height: 46px; display: flex; align-items: center; gap: 10px; padding: 0 11px; border: 1px solid rgba(185,149,112,.22); border-radius: 14px; color: #8c6a4b; background: rgba(255,255,255,.62); box-shadow: inset 0 1px 2px rgba(64,55,44,.06), 0 4px 15px rgba(64,55,44,.06); }
 .quick-search-input-wrap input { width: 100%; min-width: 0; min-height: 42px; border: 0; outline: 0; color: #403b35; background: transparent; font: inherit; font-size: 13px; }
 .quick-search-input-wrap input::placeholder { color: #999187; }
@@ -1194,6 +1194,12 @@ h1 {
 .app-shell[data-theme="dark"] .exam-countdown { background: rgba(185,149,112,.2); color: #e8c9a6; }
 
 @media (max-width: 700px) {
+  .quick-search-popover {
+    top: calc(84px + env(safe-area-inset-top));
+    right: calc(8px + env(safe-area-inset-right));
+    width: calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right));
+  }
+
   .topbar-left { gap: 8px; }
   .topbar-right { gap: 6px; }
   .breadcrumb { flex: 1 1 auto; }
@@ -1611,7 +1617,7 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .breadcrumb { flex: 1 1 0%; font-size: 0; }
   .breadcrumb span { display: none; }
   .breadcrumb strong { font-size: 12px; }
-  .popup-navigation, .profile-panel, .notification-panel { top: calc(112px + env(safe-area-inset-top)); }
+  .popup-navigation, .profile-panel, .notification-panel, .quick-search-popover { top: calc(112px + env(safe-area-inset-top)); }
   .stats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
   .stat-card { padding: 11px 9px; border-radius: 12px; }
   .stat-top { display: block; margin-bottom: 8px; }
@@ -1686,4 +1692,56 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
     border: 1px solid ButtonText;
   }
   .liquid-glass, .panel, .stat-card, .course-card { border: 1px solid CanvasText; }
+}
+
+/* Keep the mobile menu and utility controls level; place the page title below. */
+@media (max-width: 700px) {
+  .topbar {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr);
+    grid-template-rows: 44px auto;
+    align-items: center;
+    column-gap: 8px;
+    row-gap: 5px;
+  }
+
+  .topbar-left { display: contents; }
+  .topbar-left .menu-trigger { grid-column: 1; grid-row: 1; align-self: center; }
+  .topbar-left .brand-top { display: none; }
+  .topbar-left .breadcrumb {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    padding: 0 2px 2px;
+  }
+
+  .topbar-right {
+    grid-column: 2;
+    grid-row: 1;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    min-width: 0;
+    width: 100%;
+    gap: clamp(1px, 0.8vw, 6px);
+  }
+
+  .topbar-right > * { flex-shrink: 1; }
+  .today-label { display: none; }
+}
+
+@media (max-width: 480px) {
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat-card:last-child { grid-column: 1 / -1; }
+  .reminder-actions { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 360px) {
+  .topbar {
+    padding-right: calc(8px + env(safe-area-inset-right));
+    padding-left: calc(8px + env(safe-area-inset-left));
+    column-gap: 5px;
+  }
+
+  .topbar-right { gap: 1px; }
 }

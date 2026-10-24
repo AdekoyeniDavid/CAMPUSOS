@@ -2,6 +2,7 @@ import type { User } from "firebase/auth";
 import type { DocumentData, QuerySnapshot } from "firebase/firestore";
 import { getFirestoreDb } from "./firebase";
 import { deleteLocalRecord, listLocalRecords, replaceWithRemoteRecords, saveLocalRecord, syncPendingWrites, type OfflineCollection } from "./offlineStore";
+import { watchWithReconnect } from "./reconnect";
 
 export type StudentSection = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress";
 export type CourseRecord = { code: string; name: string; color: string };
@@ -51,17 +52,14 @@ export function watchStudentDocument(
   listener: (student: Record<string, unknown> | undefined, fromCache: boolean) => void,
   onError: (error: unknown) => void,
 ) {
-  let cancelled = false;
-  let unsubscribe = () => {};
-  void getFirestoreDb().then(async (db) => {
+  return watchWithReconnect<[Record<string, unknown> | undefined, boolean]>(async (next, error) => {
+    const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { doc, onSnapshot } = await import("firebase/firestore");
-    if (cancelled) return;
-    unsubscribe = onSnapshot(doc(db, "students", uid), (snapshot) => {
-      listener(snapshot.exists() ? snapshot.data() : undefined, snapshot.metadata.fromCache);
-    }, onError);
-  }).catch(onError);
-  return () => { cancelled = true; unsubscribe(); };
+    return onSnapshot(doc(db, "students", uid), (snapshot) => {
+      next([snapshot.exists() ? snapshot.data() : undefined, snapshot.metadata.fromCache]);
+    }, error);
+  }, ([student, fromCache]) => listener(student, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
 }
 
 export function watchStudentCollection(
@@ -70,17 +68,14 @@ export function watchStudentCollection(
   listener: (records: Array<Record<string, unknown> & { id: string }>, fromCache: boolean) => void,
   onError: (error: unknown) => void,
 ) {
-  let cancelled = false;
-  let unsubscribe = () => {};
-  void getFirestoreDb().then(async (db) => {
+  return watchWithReconnect<[Array<Record<string, unknown> & { id: string }>, boolean]>(async (next, error) => {
+    const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { collection, onSnapshot } = await import("firebase/firestore");
-    if (cancelled) return;
-    unsubscribe = onSnapshot(collection(db, "students", uid, collectionName), (snapshot) => {
-      listener(snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache);
-    }, onError);
-  }).catch(onError);
-  return () => { cancelled = true; unsubscribe(); };
+    return onSnapshot(collection(db, "students", uid, collectionName), (snapshot) => {
+      next([snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache]);
+    }, error);
+  }, ([records, fromCache]) => listener(records, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
 }
 
 export function watchSessionRevocation(
@@ -89,22 +84,19 @@ export function watchSessionRevocation(
   onRevoked: () => void,
   onError: (error: unknown) => void,
 ) {
-  let cancelled = false;
-  let unsubscribe = () => {};
-  void getFirestoreDb().then(async (db) => {
+  return watchWithReconnect<void>(async (next, error) => {
+    const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { doc, onSnapshot } = await import("firebase/firestore");
-    if (cancelled) return;
-    unsubscribe = onSnapshot(doc(db, "students", uid, "security", "session-control"), (snapshot) => {
+    return onSnapshot(doc(db, "students", uid, "security", "session-control"), (snapshot) => {
       if (!snapshot.exists()) return;
       const revokedAt = snapshot.get("revokedAt");
       const exemptAuthTime = snapshot.get("exemptAuthTime");
       if (!revokedAt || typeof revokedAt.seconds !== "number") return;
       if (authTime === exemptAuthTime || authTime >= revokedAt.seconds) return;
-      onRevoked();
-    }, onError);
-  }).catch(onError);
-  return () => { cancelled = true; unsubscribe(); };
+      next(undefined);
+    }, error);
+  }, () => onRevoked(), onError);
 }
 
 export async function revokeOtherSessions(uid: string, authTime: number) {
@@ -192,7 +184,9 @@ export async function deleteExam(uid: string, id: string) {
 
 async function saveAndQueue(uid: string, collection: OfflineCollection, id: string, data: Record<string, unknown>, isNew = false) {
   const now = Date.now();
-  await saveLocalRecord(uid, collection, id, { ...data, ...(isNew && !("createdAt" in data) ? { createdAt: now } : {}), updatedAt: now });
+  // The document ID belongs in the Firestore path, not in its data payload.
+  const recordData = Object.fromEntries(Object.entries(data).filter(([key]) => key !== "id"));
+  await saveLocalRecord(uid, collection, id, { ...recordData, ...(isNew && !("createdAt" in recordData) ? { createdAt: now } : {}), updatedAt: now });
   if (navigator.onLine) void syncPendingWrites(uid);
 }
 

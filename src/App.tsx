@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { EmailAuthProvider, getIdToken, onIdTokenChanged, reauthenticateWithCredential, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
 import { firebaseAuth, firebaseConfigured } from "./firebase";
@@ -110,7 +110,6 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const themeMenuRef = useRef<HTMLDivElement>(null);
   const [quickSearchOpen, setQuickSearchOpen] = useState(false);
   const [quickSearchQuery, setQuickSearchQuery] = useState("");
-  const [quickSearchPosition, setQuickSearchPosition] = useState<{ top: number; left: number; width: number; maxHeight: number }>({ top: 70, left: 8, width: 390, maxHeight: 560 });
   const [searchMaterials, setSearchMaterials] = useState<StudyMaterial[]>([]);
   const [searchTargetId, setSearchTargetId] = useState<string | null>(null);
   const [studentMatriculationNo, setStudentMatriculationNo] = useState("Not provided");
@@ -137,6 +136,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [scheduleFormOpen, setScheduleFormOpen] = useState(false);
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [cloudReady, setCloudReady] = useState(false);
+  const [cloudConnected, setCloudConnected] = useState(false);
   const [cloudMessage, setCloudMessage] = useState("Loading your saved student data from this device…");
   const [isOnline, setIsOnline] = useState(() => navigator.onLine);
   const [queuedWriteCount, setPendingCount] = useState(0);
@@ -212,45 +212,6 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       window.clearTimeout(focusTimer);
       document.removeEventListener("pointerdown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [quickSearchOpen]);
-
-  useLayoutEffect(() => {
-    if (!quickSearchOpen) return;
-    const positionPopover = () => {
-      const trigger = quickSearchRef.current?.querySelector<HTMLElement>(".quick-search-trigger");
-      const controls = quickSearchRef.current?.parentElement;
-      if (!trigger || !controls) return;
-      const triggerRect = trigger.getBoundingClientRect();
-      const controlsRect = controls.getBoundingClientRect();
-      const viewport = window.visualViewport;
-      const viewportLeft = viewport?.offsetLeft ?? 0;
-      const viewportTop = viewport?.offsetTop ?? 0;
-      const viewportWidth = viewport?.width ?? window.innerWidth;
-      const viewportHeight = viewport?.height ?? window.innerHeight;
-      const width = Math.max(0, Math.min(390, viewportWidth - 16));
-      const minLeft = viewportLeft + 8;
-      const maxLeft = Math.max(minLeft, viewportLeft + viewportWidth - width - 8);
-      const left = Math.max(minLeft, Math.min(controlsRect.right - width, maxLeft));
-      const viewportBottom = viewportTop + viewportHeight;
-      const belowTop = triggerRect.bottom + 8;
-      const belowHeight = viewportBottom - belowTop - 8;
-      const top = belowHeight >= 180
-        ? belowTop
-        : Math.max(viewportTop + 8, viewportBottom - Math.min(360, viewportHeight - 16));
-      const maxHeight = Math.max(100, Math.min(560, viewportBottom - top - 8));
-      setQuickSearchPosition({ top, left, width, maxHeight });
-    };
-    positionPopover();
-    window.addEventListener("resize", positionPopover);
-    window.addEventListener("scroll", positionPopover, true);
-    window.visualViewport?.addEventListener("resize", positionPopover);
-    window.visualViewport?.addEventListener("scroll", positionPopover);
-    return () => {
-      window.removeEventListener("resize", positionPopover);
-      window.removeEventListener("scroll", positionPopover, true);
-      window.visualViewport?.removeEventListener("resize", positionPopover);
-      window.visualViewport?.removeEventListener("scroll", positionPopover);
     };
   }, [quickSearchOpen]);
 
@@ -337,7 +298,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       const online = navigator.onLine;
       setIsOnline(online);
       if (online) resumeSync();
-      else setCloudMessage("You’re offline. Your courses, assignments, and timetable are saved on this device.");
+      else {
+        setCloudConnected(false);
+        setCloudMessage("You’re offline. Your courses, assignments, and timetable are saved on this device.");
+      }
       refreshPending();
     };
     const resumeWhenVisible = () => { if (document.visibilityState === "visible") resumeSync(); };
@@ -380,9 +344,11 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   useEffect(() => {
     if (!firebaseConfigured) {
       setCloudReady(true);
+      setCloudConnected(false);
       setCloudMessage("Cloud sync is not configured. Your records stay on this device.");
       return;
     }
+    setCloudConnected(false);
     let cancelled = false;
     let readyParts = new Set<string>();
     let unsubscribers: Array<() => void> = [];
@@ -394,6 +360,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       }
     };
     const failed = () => {
+      setCloudConnected(false);
       setCloudReady(true);
       setCloudMessage(navigator.onLine
         ? "Cloud sync is temporarily unavailable. Changes are saved on this device and queued for retry."
@@ -404,12 +371,14 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       if (cancelled) return;
       unsubscribers = [
         watchStudentDocument(user.uid, (studentData, fromCache) => {
+          if (!fromCache) setCloudConnected(true);
           if (studentData) void cacheStudentDocument(user.uid, studentData, !fromCache);
           const profileName = (studentData?.profile as Record<string, unknown> | undefined)?.fullName;
           if (typeof profileName === "string" && profileName.trim()) setStudentName(profileName);
           markReady("profile");
         }, failed),
         watchStudentCollection(user.uid, "courses", (records, fromCache) => {
+          if (!fromCache) setCloudConnected(true);
           const normalized = records.map((item) => ({ ...item, code: item.id }));
           // Keep the course code in the cached record as well as using it as its local ID.
           void replaceWithRemoteRecords(user.uid, "courses", normalized, !fromCache);
@@ -424,14 +393,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           markReady("courses");
         }, failed),
         watchStudentCollection(user.uid, "assignments", (records, fromCache) => {
+          if (!fromCache) setCloudConnected(true);
           void replaceWithRemoteRecords(user.uid, "assignments", records, !fromCache);
           markReady("assignments");
         }, failed),
         watchStudentCollection(user.uid, "schedules", (records, fromCache) => {
+          if (!fromCache) setCloudConnected(true);
           void replaceWithRemoteRecords(user.uid, "schedules", records, !fromCache);
           markReady("schedules");
         }, failed),
         watchStudentCollection(user.uid, "exams", (records, fromCache) => {
+          if (!fromCache) setCloudConnected(true);
           void replaceWithRemoteRecords(user.uid, "exams", records, !fromCache);
           markReady("exams");
         }, failed),
@@ -820,7 +792,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             <button className="avatar small-avatar profile-avatar-button" aria-label={`Open ${studentName} profile`} aria-expanded={profileOpen} onClick={() => { setMenuOpen(false); setQuickSearchOpen(false); setQuickSearchQuery(""); setThemeMenuOpen(false); setNotificationsOpen(false); setProfileOpen((open) => !open); }}>{getStudentInitials(studentName)}</button>
           </div>
         </header>
-        {quickSearchOpen && createPortal(<section ref={quickSearchPopoverRef} className="quick-search-popover liquid-glass" data-theme={activeTheme} style={quickSearchPosition} role="dialog" aria-label="Search your CampusOS workspace">
+        {quickSearchOpen && createPortal(<section ref={quickSearchPopoverRef} className="quick-search-popover liquid-glass" data-theme={activeTheme} role="dialog" aria-label="Search your CampusOS workspace">
           <div className="quick-search-input-wrap"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input ref={quickSearchInputRef} type="search" role="searchbox" aria-label="Search your records" value={quickSearchQuery} onChange={(event) => setQuickSearchQuery(event.target.value)} placeholder="Search courses, assignments…" autoComplete="off" /><button className="quick-search-clear" type="button" aria-label="Clear search" title="Clear search" disabled={!quickSearchQuery} onClick={() => { setQuickSearchQuery(""); quickSearchInputRef.current?.focus(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><span>Clear</span></button></div>
           {normalizedSearchQuery ? <div className="quick-search-results" role="listbox" aria-label="Search results">
             {quickSearchMatches.map((result) => <button key={`${result.category}-${result.id}`} type="button" role="option" aria-selected="false" className="quick-search-result" onClick={() => openSearchResult(result)}><span className="quick-search-result-icon">⌕</span><span className="quick-search-result-copy"><strong>{result.title}</strong><small>{result.detail || result.category}</small></span><span className="quick-search-result-type">{result.category}</span></button>)}
@@ -891,15 +863,6 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         )}
 
         <div className="page-content">
-          {(!cloudReady || cloudMessage || queuedWriteCount > 0 || syncFailure) && <div className={`cloud-sync-notice ${cloudReady ? "" : "is-loading"}`} role="status">
-            {!isOnline
-              ? `Offline · Saved on this device${queuedWriteCount ? ` · ${queuedWriteCount} change${queuedWriteCount === 1 ? "" : "s"} queued` : ""}`
-              : queuedWriteCount > 0
-                ? `Saved on this device · Retrying cloud sync in the background (${queuedWriteCount} queued)`
-                : syncFailure
-                  ? "Cloud sync is retrying in the background. Your changes remain saved on this device."
-                  : cloudMessage || "Your records are synced with Firestore."}
-          </div>}
           <section className="welcome-row">
             <div>
               <p className="eyebrow">YOUR ACADEMIC WORKSPACE</p>
@@ -1346,7 +1309,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             page={activePage}
             searchTargetId={activePage === "Notes & Resources" ? searchTargetId : null}
             studentUid={user.uid}
-            connected={cloudReady && isOnline}
+            connected={cloudReady && cloudConnected && isOnline}
             online={isOnline}
             syncPending={queuedWriteCount > 0}
             cloudMessage={cloudMessage}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { firebaseConfigured } from "./firebase";
 import { createRecordId } from "./browser";
-import { cacheStudentDocument, saveStudyRecord, watchStudentDocument } from "./firestore";
+import { saveStudyRecord } from "./firestore";
 import { listLocalRecords, pendingWriteCount, saveLocalRecord, syncPendingWrites, watchLocalRecords } from "./offlineStore";
 
 type Note = { id: string; title: string; category: string; content: string; resourceUrl: string };
@@ -59,10 +59,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     });
     if (!firebaseConfigured) { setDatabaseError("Firebase is not configured. Study records are available only on this device."); return localUnsubscribe; }
     setDatabaseError("");
-    const remoteUnsubscribe = watchStudentDocument(studentUid, (student, fromCache) => {
-      if (student) void cacheStudentDocument(studentUid, student, !fromCache);
-    }, () => setDatabaseError("Cloud sync is unavailable. Study records stay on this device and will retry automatically."));
-    return () => { localUnsubscribe(); remoteUnsubscribe(); };
+    return localUnsubscribe;
   }, [studentUid]);
 
   useEffect(() => {

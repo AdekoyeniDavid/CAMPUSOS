@@ -5,7 +5,7 @@ import { indexedDB } from "fake-indexeddb";
 Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: indexedDB });
 Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: false } });
 
-const { deleteLocalRecord, listLocalRecords, pendingWriteCount, replaceWithRemoteRecords, saveLocalRecord } = await import("../src/offlineStore.ts");
+const { deleteLocalRecord, listLocalRecords, pendingWriteCount, replaceWithRemoteRecords, saveLocalRecord, watchLocalRecords } = await import("../src/offlineStore.ts");
 const { normalizeCourseRecords } = await import("../src/courseRecords.ts");
 
 test("course hydration restores missing course codes from their stable local document IDs", () => {
@@ -25,12 +25,22 @@ test("offline records persist per student and edits coalesce into one queued wri
   assert.equal(await pendingWriteCount(uid), 1);
   assert.deepEqual(await listLocalRecords(`${uid}-other`, "courses"), []);
 
+  const offlineUpdate = new Promise((resolve) => {
+    let stop = () => {};
+    stop = watchLocalRecords(uid, "courses", (records) => {
+      const current = records.find((record) => record.id === "BIO 101");
+      if (current?.name === "Biology III") { stop(); resolve(current.name); }
+    });
+  });
+  await saveLocalRecord(uid, "courses", "BIO 101", { code: "BIO 101", name: "Biology III", color: "blue" });
+  assert.equal(await offlineUpdate, "Biology III");
+
   await replaceWithRemoteRecords(uid, "courses", [
     { id: "BIO 101", code: "BIO 101", name: "Stale cloud value" },
     { id: "REMOTE 1", code: "REMOTE 1", name: "Remote course" },
   ], false);
   assert.deepEqual((await listLocalRecords(uid, "courses")).map(({ id }) => id).sort(), ["BIO 101", "REMOTE 1"]);
-  assert.equal((await listLocalRecords(uid, "courses")).find(({ id }) => id === "BIO 101").name, "Biology II");
+  assert.equal((await listLocalRecords(uid, "courses")).find(({ id }) => id === "BIO 101").name, "Biology III");
   assert.equal(await pendingWriteCount(uid), 1);
 
   const database = await new Promise((resolve, reject) => {

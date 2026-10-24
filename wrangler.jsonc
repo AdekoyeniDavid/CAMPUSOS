@@ -23,6 +23,18 @@
     "run_worker_first": ["/api/d1/*", "/api/reminders/*", "/google.firestore.v1.Firestore/*"]
   },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "redact_query_string": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05,
+      "persist": true
+    }
   }
 }
