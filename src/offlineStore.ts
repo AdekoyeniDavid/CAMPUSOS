@@ -134,15 +134,16 @@ export async function pendingWriteCount(uid: string, collection?: OfflineCollect
 }
 
 export async function syncPendingWrites(uid: string) {
-  if (flushRunning.has(uid) || !navigator.onLine) return;
-  const db = await getFirestoreDb();
-  if (!db) return;
-  const { deleteDoc, doc, FieldPath, serverTimestamp, setDoc, updateDoc } = await import("firebase/firestore");
+  if (!navigator.onLine) return;
+  if (flushRunning.has(uid)) return;
   flushRunning.add(uid);
   let failed = false;
   let failureCode: string | undefined;
   let hasMore = false;
   try {
+    const db = await getFirestoreDb();
+    if (!db) throw new Error("Firestore is not available yet.");
+    const { deleteDoc, doc, FieldPath, serverTimestamp, setDoc, updateDoc } = await import("firebase/firestore");
     const queue = (await readAll<PendingWrite>(outboxStore)).filter((item) => item.uid === uid).sort((a, b) => a.queuedAt - b.queuedAt);
     for (const item of queue) {
       if (!navigator.onLine) break;
@@ -177,9 +178,21 @@ export async function syncPendingWrites(uid: string) {
         break;
       }
     }
-    hasMore = (await readAll<PendingWrite>(outboxStore)).some((item) => item.uid === uid);
+  } catch (error) {
+    failed = true;
+    if (error && typeof error === "object" && "code" in error) {
+      const code = (error as { code?: unknown }).code;
+      if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
+    }
   } finally {
     flushRunning.delete(uid);
+    try {
+      hasMore = (await readAll<PendingWrite>(outboxStore)).some((item) => item.uid === uid);
+    } catch {
+      // If local storage is temporarily unavailable, keep retrying instead of dropping the flush.
+      failed = true;
+      hasMore = true;
+    }
     if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("campusos-sync", {
       detail: { uid, failed, code: failureCode },
     }));

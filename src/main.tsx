@@ -24,8 +24,86 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: bool
 }
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
+  const dirtyForms = new WeakSet<HTMLFormElement>();
+  const refreshStorageKey = "campusos-reconnect-build";
+  let deployedBuild: string | null = null;
+  let refreshTimer = 0;
+  let refreshing = false;
+
+  const formFor = (target: EventTarget | null) => target instanceof HTMLElement ? target.closest("form") : null;
+  const markFormDirty = (event: Event) => {
+    const form = formFor(event.target);
+    if (form) dirtyForms.add(form);
+  };
+  const markFormClean = (event: Event) => {
+    const form = formFor(event.target);
+    if (form) dirtyForms.delete(form);
+    scheduleBackgroundRefresh();
+  };
+  const hasUnsavedForm = () => Array.from(document.forms).some((form) => dirtyForms.has(form));
+  const currentBuild = () => {
+    const script = document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src ?? "";
+    const styles = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')).map((link) => link.href).sort();
+    return { script, styles };
+  };
+  const scheduleBackgroundRefresh = () => {
+    if (!deployedBuild || refreshing || document.visibilityState !== "hidden" || hasUnsavedForm()) return;
+    window.clearTimeout(refreshTimer);
+    refreshTimer = window.setTimeout(() => {
+      if (!deployedBuild || document.visibilityState !== "hidden" || hasUnsavedForm()) return;
+      try { sessionStorage.setItem(refreshStorageKey, deployedBuild); } catch { /* Refresh is still safe without this loop guard. */ }
+      refreshing = true;
+      window.location.reload();
+    }, 900);
+  };
+  const checkForDeployedBuild = async () => {
+    if (!navigator.onLine || refreshing) return;
+    try {
+      const response = await fetch("/", { cache: "no-store", credentials: "same-origin", headers: { Accept: "text/html" } });
+      if (!response.ok || !response.headers.get("content-type")?.includes("text/html")) return;
+      const html = await response.text();
+      const remoteDocument = new DOMParser().parseFromString(html, "text/html");
+      const remoteScriptPath = remoteDocument.querySelector<HTMLScriptElement>('script[type="module"][src]')?.getAttribute("src");
+      if (!remoteScriptPath) return;
+      const remoteScript = new URL(remoteScriptPath, location.origin).href;
+      const remoteStyles = Array.from(remoteDocument.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]'))
+        .map((link) => new URL(link.getAttribute("href") ?? "", location.origin).href).sort();
+      const remoteSignature = JSON.stringify({ script: remoteScript, styles: remoteStyles });
+      const loaded = currentBuild();
+      const loadedSignature = JSON.stringify(loaded);
+      if (remoteSignature === loadedSignature) {
+        deployedBuild = null;
+        try { sessionStorage.removeItem(refreshStorageKey); } catch { /* Session storage is optional. */ }
+        return;
+      }
+      let lastAttemptedBuild: string | null = null;
+      try { lastAttemptedBuild = sessionStorage.getItem(refreshStorageKey); } catch { /* Session storage is optional. */ }
+      if (lastAttemptedBuild === remoteSignature) return;
+      deployedBuild = remoteSignature;
+      if (hasUnsavedForm()) return;
+      scheduleBackgroundRefresh();
+    } catch {
+      // Keep the cached app running; the next online/visible event retries this check.
+    }
+  };
+
+  document.addEventListener("input", markFormDirty, true);
+  document.addEventListener("change", markFormDirty, true);
+  document.addEventListener("reset", markFormClean, true);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") scheduleBackgroundRefresh();
+    else if (navigator.onLine) void checkForDeployedBuild();
+  });
+  new MutationObserver(() => scheduleBackgroundRefresh()).observe(document.documentElement, { childList: true, subtree: true });
+
+  window.addEventListener("online", () => {
+    void checkForDeployedBuild();
+    void navigator.serviceWorker.ready.then((registration) => registration.update()).catch(() => undefined);
+  });
   window.addEventListener("load", () => {
-    void navigator.serviceWorker.register("/service-worker.js").catch(() => undefined);
+    void navigator.serviceWorker.register("/service-worker.js").then((registration) => {
+      if (navigator.onLine) void registration.update().catch(() => undefined);
+    }).catch(() => undefined);
   }, { once: true });
 }
 

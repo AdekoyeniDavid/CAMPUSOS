@@ -25,7 +25,7 @@ function validateBackup(value: unknown, uid: string): value is Backup {
     && candidate.collections[name].every((item) => item && typeof item.id === "string" && item.id.length > 0 && item.id.length <= 150 && !item.id.includes("/") && item.data && typeof item.data === "object" && !Array.isArray(item.data)));
 }
 
-export function StudyTools({ page, studentUid, connected, online, syncPending, cloudMessage, recordCounts }: {
+export function StudyTools({ page, studentUid, connected, online, syncPending, cloudMessage, recordCounts, searchTargetId }: {
   page: string;
   studentUid: string;
   connected: boolean;
@@ -33,6 +33,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
   syncPending: boolean;
   cloudMessage: string;
   recordCounts: Record<string, number>;
+  searchTargetId?: string | null;
 }) {
   const [notes, setNotes] = useState<Note[]>([]);
   const [grades, setGrades] = useState<Grade[]>([]);
@@ -78,6 +79,23 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     checkSync();
     return () => window.removeEventListener("campusos-sync", checkSync);
   }, [studentUid, studySavePending]);
+
+  useEffect(() => {
+    if (page !== "Notes & Resources" || !searchTargetId) return;
+    setSearch("");
+    setNoteFilter("All materials");
+    const timer = window.setTimeout(() => {
+      const target = Array.from(document.querySelectorAll<HTMLElement>(".study-note[data-search-id]"))
+        .find((element) => element.dataset.searchId === searchTargetId);
+      if (!target) return;
+      target.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+      target.tabIndex = -1;
+      target.focus({ preventScroll: true });
+      target.classList.add("search-result-focus");
+      window.setTimeout(() => target.classList.remove("search-result-focus"), 1800);
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [page, searchTargetId, notes]);
 
   const cgpa = useMemo(() => {
     const creditTotal = grades.reduce((sum, item) => sum + item.credits, 0);
@@ -237,7 +255,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
         <div className="study-form-actions"><button className="primary-button" type="submit">{editingNoteId ? "Save changes" : "Save material"}</button>{editingNoteId && <button type="button" className="profile-cancel" onClick={() => { setEditingNoteId(null); setForm(emptyNote); }}>Cancel</button>}</div>
       </form>
       <div className="study-filter-row"><input aria-label="Search study materials" placeholder="Search materials…" value={search} onChange={(event) => setSearch(event.target.value)} /><select aria-label="Filter materials by category" value={noteFilter} onChange={(event) => setNoteFilter(event.target.value)}><option>All materials</option>{categories.map((category) => <option key={category}>{category}</option>)}</select></div>
-      <div className="study-note-list">{matchingNotes.map((note) => <article className="study-note liquid-glass" key={note.id}><div className="study-note-top"><span className="study-category">{note.category}</span><div><button type="button" className="study-action" onClick={() => { setForm({ title: note.title, category: note.category, content: note.content, resourceUrl: note.resourceUrl }); setEditingNoteId(note.id); }}>Edit</button><button type="button" className="study-action destructive" onClick={() => void removeNote(note.id)}>Delete</button></div></div><h3>{note.title}</h3>{note.content && <p>{note.content}</p>}{note.resourceUrl && <a href={note.resourceUrl} target="_blank" rel="noreferrer">Open resource ↗</a>}</article>)}{matchingNotes.length === 0 && <p className="empty-state">No materials match. Add a note or resource to start organizing your study library.</p>}</div>
+      <div className="study-note-list">{matchingNotes.map((note) => <article className="study-note liquid-glass" key={note.id} data-search-id={note.id}><div className="study-note-top"><span className="study-category">{note.category}</span><div><button type="button" className="study-action" onClick={() => { setForm({ title: note.title, category: note.category, content: note.content, resourceUrl: note.resourceUrl }); setEditingNoteId(note.id); }}>Edit</button><button type="button" className="study-action destructive" onClick={() => void removeNote(note.id)}>Delete</button></div></div><h3>{note.title}</h3>{note.content && <p>{note.content}</p>}{note.resourceUrl && <a href={note.resourceUrl} target="_blank" rel="noreferrer">Open resource ↗</a>}</article>)}{matchingNotes.length === 0 && <p className="empty-state">No materials match. Add a note or resource to start organizing your study library.</p>}</div>
     </section>}
 
     {page === "Grade Calculator" && <section className="panel study-panel">

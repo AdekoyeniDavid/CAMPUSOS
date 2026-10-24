@@ -1,4 +1,5 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { EmailAuthProvider, getIdToken, onIdTokenChanged, reauthenticateWithCredential, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
 import { firebaseAuth, firebaseConfigured } from "./firebase";
 import {
@@ -46,9 +47,13 @@ type Assignment = {
   id: string;
   title: string;
   question: string;
+  description?: string;
   course: string;
   due: string;
   completed: boolean;
+  studentId?: string;
+  createdAt?: number | string | { seconds?: number };
+  updatedAt?: number | string | { seconds?: number };
 };
 
 type Exam = {
@@ -60,6 +65,9 @@ type Exam = {
   location: string;
 };
 
+type StudyMaterial = { id: string; title: string; category: string; content: string; resourceUrl: string };
+type QuickSearchResult = { id: string; title: string; detail: string; category: string; page: string; searchable: string };
+
 type ThemeMode = "light" | "dark" | "system";
 
 const initialAssignments: Assignment[] = [];
@@ -69,6 +77,23 @@ const initialSchedules: Schedule[] = [];
 function getStudentInitials(fullName: string) {
   const initials = fullName.trim().split(/\s+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase());
   return initials.length ? initials.join(".") : "S";
+}
+
+function formatAssignmentDate(value: Assignment["createdAt"]) {
+  if (value === undefined || value === null || value === "") return "Not provided";
+  let milliseconds: number;
+  if (typeof value === "number") milliseconds = value;
+  else if (typeof value === "string") milliseconds = new Date(value).getTime();
+  else if (typeof value.seconds === "number") milliseconds = value.seconds * 1000;
+  else return "Not provided";
+  if (!Number.isFinite(milliseconds)) return "Not provided";
+  return new Date(milliseconds).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+function isStudyMaterial(value: unknown): value is StudyMaterial {
+  return typeof value === "object" && value !== null
+    && "id" in value && typeof value.id === "string"
+    && "title" in value && typeof value.title === "string";
 }
 
 function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => Promise<void> }) {
@@ -83,6 +108,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement>(null);
+  const [quickSearchOpen, setQuickSearchOpen] = useState(false);
+  const [quickSearchQuery, setQuickSearchQuery] = useState("");
+  const [quickSearchPosition, setQuickSearchPosition] = useState<{ top: number; left: number; width: number; maxHeight: number }>({ top: 70, left: 8, width: 390, maxHeight: 560 });
+  const [searchMaterials, setSearchMaterials] = useState<StudyMaterial[]>([]);
+  const [searchTargetId, setSearchTargetId] = useState<string | null>(null);
+  const [studentMatriculationNo, setStudentMatriculationNo] = useState("Not provided");
+  const quickSearchRef = useRef<HTMLDivElement>(null);
+  const quickSearchInputRef = useRef<HTMLInputElement>(null);
+  const quickSearchPopoverRef = useRef<HTMLElement>(null);
   const reminderCancelRef = useRef<HTMLButtonElement>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -121,6 +155,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [newQuestion, setNewQuestion] = useState("");
   const [newCourse, setNewCourse] = useState("COS 102");
   const [newDue, setNewDue] = useState("");
+  const [newAssignmentCompleted, setNewAssignmentCompleted] = useState(false);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -161,6 +196,79 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [themeMenuOpen]);
+
+  useEffect(() => {
+    if (!quickSearchOpen) return;
+    const focusTimer = window.setTimeout(() => quickSearchInputRef.current?.focus(), 0);
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (event.target instanceof Node && !quickSearchRef.current?.contains(event.target) && !quickSearchPopoverRef.current?.contains(event.target)) setQuickSearchOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setQuickSearchOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.clearTimeout(focusTimer);
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [quickSearchOpen]);
+
+  useLayoutEffect(() => {
+    if (!quickSearchOpen) return;
+    const positionPopover = () => {
+      const trigger = quickSearchRef.current?.querySelector<HTMLElement>(".quick-search-trigger");
+      const controls = quickSearchRef.current?.parentElement;
+      if (!trigger || !controls) return;
+      const triggerRect = trigger.getBoundingClientRect();
+      const controlsRect = controls.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const viewportWidth = viewport?.width ?? window.innerWidth;
+      const viewportHeight = viewport?.height ?? window.innerHeight;
+      const width = Math.max(0, Math.min(390, viewportWidth - 16));
+      const minLeft = viewportLeft + 8;
+      const maxLeft = Math.max(minLeft, viewportLeft + viewportWidth - width - 8);
+      const left = Math.max(minLeft, Math.min(controlsRect.right - width, maxLeft));
+      const viewportBottom = viewportTop + viewportHeight;
+      const belowTop = triggerRect.bottom + 8;
+      const belowHeight = viewportBottom - belowTop - 8;
+      const top = belowHeight >= 180
+        ? belowTop
+        : Math.max(viewportTop + 8, viewportBottom - Math.min(360, viewportHeight - 16));
+      const maxHeight = Math.max(100, Math.min(560, viewportBottom - top - 8));
+      setQuickSearchPosition({ top, left, width, maxHeight });
+    };
+    positionPopover();
+    window.addEventListener("resize", positionPopover);
+    window.addEventListener("scroll", positionPopover, true);
+    window.visualViewport?.addEventListener("resize", positionPopover);
+    window.visualViewport?.addEventListener("scroll", positionPopover);
+    return () => {
+      window.removeEventListener("resize", positionPopover);
+      window.removeEventListener("scroll", positionPopover, true);
+      window.visualViewport?.removeEventListener("resize", positionPopover);
+      window.visualViewport?.removeEventListener("scroll", positionPopover);
+    };
+  }, [quickSearchOpen]);
+
+  useEffect(() => {
+    const openSearchShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setMenuOpen(false);
+        setThemeMenuOpen(false);
+        setNotificationsOpen(false);
+        setProfileOpen(false);
+        setQuickSearchQuery("");
+        setQuickSearchOpen((open) => !open);
+      }
+    };
+    document.addEventListener("keydown", openSearchShortcut);
+    return () => document.removeEventListener("keydown", openSearchShortcut);
+  }, []);
 
   useEffect(() => {
     const auth = firebaseAuth;
@@ -212,6 +320,12 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       watchLocalRecords(user.uid, "assignments", (records) => setAssignments(records as Assignment[])),
       watchLocalRecords(user.uid, "schedules", (records) => setSchedules(records as Schedule[])),
       watchLocalRecords(user.uid, "exams", (records) => setExams(records as Exam[])),
+      watchLocalRecords(user.uid, "studentSections", (records) => {
+        const value = records.find((record) => record.id === "studyNotes")?.["value"];
+        setSearchMaterials(Array.isArray(value) ? value.filter(isStudyMaterial).map((item) => ({ id: item.id, title: item.title, category: item.category ?? "Study material", content: item.content ?? "", resourceUrl: item.resourceUrl ?? "" })) : []);
+        const profile = records.find((record) => record.id === "profile");
+        setStudentMatriculationNo(typeof profile?.studentId === "string" && profile.studentId.trim() && profile.studentId !== "Not provided" ? profile.studentId.trim() : "Not provided");
+      }),
     ];
     const resumeSync = () => {
       if (!navigator.onLine) return;
@@ -227,6 +341,14 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       refreshPending();
     };
     const resumeWhenVisible = () => { if (document.visibilityState === "visible") resumeSync(); };
+    const retryQueuedWrites = () => {
+      if (!navigator.onLine || !firebaseConfigured) return;
+      void pendingWriteCount(user.uid).then((count) => {
+        setPendingCount(count);
+        if (count > 0) void syncPendingWrites(user.uid).finally(refreshPending);
+      }).catch(() => undefined);
+    };
+    const retryInterval = window.setInterval(retryQueuedWrites, 30_000);
     window.addEventListener("online", updateConnection);
     window.addEventListener("offline", updateConnection);
     window.addEventListener("focus", resumeSync);
@@ -243,6 +365,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       window.removeEventListener("offline", updateConnection);
       window.removeEventListener("focus", resumeSync);
       window.removeEventListener("pageshow", resumeSync);
+      window.clearInterval(retryInterval);
       document.removeEventListener("visibilitychange", resumeWhenVisible);
       window.removeEventListener("campusos-sync", refreshPending);
     };
@@ -394,6 +517,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setNewQuestion("");
     setNewCourse(courses[0]?.code ?? "");
     setNewDue("");
+    setNewAssignmentCompleted(false);
   }
 
   function startNewCourse() {
@@ -492,22 +616,24 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (saved) setOpenCourseMenu(null);
   }
 
-  async function toggleAssignment(id: string) {
+  async function setAssignmentCompletion(id: string, completed: boolean) {
     const assignment = assignments.find((item) => item.id === id);
     if (!assignment) return;
-    await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, { ...assignment, completed: !assignment.completed }, false));
+    await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, { ...assignment, completed, studentId: assignment.studentId ?? studentMatriculationNo }, false));
   }
 
   function beginEditAssignment(assignment: Assignment) {
     setEditingAssignmentId(assignment.id);
-    setAssignmentDraft({ title: assignment.title, question: assignment.question, course: assignment.course, due: assignment.due });
+    setAssignmentDraft({ title: assignment.title, question: assignment.description ?? assignment.question, course: assignment.course, due: assignment.due });
     setOpenCourseMenu(null);
   }
 
   async function saveAssignmentEdit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!editingAssignmentId || !assignmentDraft.title.trim() || !assignmentDraft.question.trim() || !assignmentDraft.due.trim()) return;
-    const assignment = { ...assignmentDraft, title: assignmentDraft.title.trim(), question: assignmentDraft.question.trim(), due: assignmentDraft.due.trim(), completed: assignments.find((item) => item.id === editingAssignmentId)?.completed ?? false };
+    const existing = assignments.find((item) => item.id === editingAssignmentId);
+    const description = assignmentDraft.question.trim();
+    const assignment = { ...assignmentDraft, title: assignmentDraft.title.trim(), question: description, description, due: assignmentDraft.due.trim(), completed: existing?.completed ?? false, studentId: existing?.studentId ?? studentMatriculationNo, ...(existing?.createdAt !== undefined ? { createdAt: existing.createdAt } : {}) };
     const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, editingAssignmentId, assignment, false));
     if (saved) setEditingAssignmentId(null);
   }
@@ -524,7 +650,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
     const id = createRecordId();
     const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, {
-      title: newTitle.trim(), question: newQuestion.trim(), course: newCourse, due: formattedDate, completed: false,
+      title: newTitle.trim(), question: newQuestion.trim(), description: newQuestion.trim(), course: newCourse, due: formattedDate, completed: newAssignmentCompleted,
+      studentId: studentMatriculationNo, createdAt: Date.now(),
     }, true));
     if (!saved) return;
 
@@ -615,14 +742,48 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     { name: "Cloud Database", page: "Cloud Database", icon: "☁" },
     { name: "Backup & Recovery", page: "Backup & Recovery", icon: "↻" },
   ];
+  const quickSearchCatalog: QuickSearchResult[] = [
+    ...courses.map((course) => ({ id: course.code, title: course.code, detail: course.name, category: "Course", page: "My Courses", searchable: `${course.code} ${course.name}` })),
+    ...assignments.map((assignment) => ({ id: assignment.id, title: assignment.title, detail: `${assignment.course} · due ${assignment.due}`, category: "Assignment", page: "Assignments", searchable: `${assignment.title} ${assignment.question} ${assignment.course} ${assignment.due}` })),
+    ...schedules.map((schedule) => {
+      const course = courses.find((item) => item.code === schedule.courseCode);
+      return { id: schedule.id, title: course?.name ?? schedule.courseCode, detail: `${schedule.courseCode} · ${schedule.day} · ${schedule.start}–${schedule.end}`, category: "Timetable", page: "Timetable", searchable: `${course?.name ?? ""} ${schedule.courseCode} ${schedule.day} ${schedule.start} ${schedule.end}` };
+    }),
+    ...exams.map((exam) => ({ id: exam.id, title: exam.title, detail: `${exam.courseCode} · ${exam.date} · ${exam.location}`, category: "Exam timetable", page: "Timetable", searchable: `${exam.title} ${exam.courseCode} ${exam.date} ${exam.location}` })),
+    ...searchMaterials.map((material) => ({ id: material.id, title: material.title, detail: [material.category, material.content, material.resourceUrl].filter(Boolean).join(" · "), category: material.resourceUrl ? "Note & resource" : "Study note", page: "Notes & Resources", searchable: `${material.title} ${material.category} ${material.content} ${material.resourceUrl}` })),
+  ];
+  const normalizedSearchQuery = quickSearchQuery.trim().toLocaleLowerCase();
+  const quickSearchMatches = normalizedSearchQuery
+    ? quickSearchCatalog.filter((item) => `${item.title} ${item.detail} ${item.searchable}`.toLocaleLowerCase().includes(normalizedSearchQuery)).slice(0, 12)
+    : [];
+  function openSearchResult(result: QuickSearchResult) {
+    setActivePage(result.page);
+    setShowForm(false);
+    setMenuOpen(false);
+    setSearchTargetId(result.id);
+    setQuickSearchOpen(false);
+    setQuickSearchQuery("");
+    if (result.page !== "Notes & Resources") {
+      window.setTimeout(() => {
+        const target = Array.from(document.querySelectorAll<HTMLElement>("[data-search-id]"))
+          .find((element) => element.dataset.searchId === result.id);
+        if (!target) return;
+        target.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+        target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+        target.classList.add("search-result-focus");
+        window.setTimeout(() => target.classList.remove("search-result-focus"), 1800);
+      }, 100);
+    }
+  }
   const activeTheme = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
 
   return (
     <div className="app-shell" data-theme={activeTheme}>
       <main className="main-content">
-        <header className="topbar">
+        <header className={`topbar ${quickSearchOpen ? "search-open" : ""}`}>
           <div className="topbar-left">
-            <button className={`menu-trigger ${menuOpen ? "open" : ""}`} aria-label={menuOpen ? "Close navigation menu" : "Open navigation menu"} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>
+            <button className={`menu-trigger ${menuOpen ? "open" : ""}`} aria-label={menuOpen ? "Close navigation menu" : "Open navigation menu"} aria-expanded={menuOpen} onClick={() => { setQuickSearchOpen(false); setQuickSearchQuery(""); setThemeMenuOpen(false); setNotificationsOpen(false); setProfileOpen(false); setMenuOpen((open) => !open); }}>
               <span /><span /><span />
             </button>
             <a className="brand brand-top" href="#dashboard" onClick={() => { setActivePage("Dashboard"); setMenuOpen(false); }}>
@@ -633,8 +794,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           </div>
           <div className="topbar-right">
             <span className="today-label">{new Date().toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}</span>
+            <div className="quick-search-control" ref={quickSearchRef}>
+              <button className="quick-search-trigger" type="button" aria-label="Search courses, assignments, timetable, notes, and resources" aria-expanded={quickSearchOpen} aria-haspopup="dialog" title="Search (⌘K / Ctrl K)" onClick={() => { setMenuOpen(false); setThemeMenuOpen(false); setNotificationsOpen(false); setProfileOpen(false); setQuickSearchQuery(""); setQuickSearchOpen((open) => !open); }}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg>
+              </button>
+            </div>
             <div className="theme-control" ref={themeMenuRef}>
-              <button className="theme-trigger" aria-label={`Appearance: ${themeMode}`} aria-expanded={themeMenuOpen} aria-haspopup="menu" title={`Appearance: ${themeMode}`} onClick={() => setThemeMenuOpen((open) => !open)}>
+              <button className="theme-trigger" aria-label={`Appearance: ${themeMode}`} aria-expanded={themeMenuOpen} aria-haspopup="menu" title={`Appearance: ${themeMode}`} onClick={() => { setMenuOpen(false); setQuickSearchOpen(false); setQuickSearchQuery(""); setNotificationsOpen(false); setProfileOpen(false); setThemeMenuOpen((open) => !open); }}>
                 {activeTheme === "dark" ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2Z" /></svg> : <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>}
               </button>
               {themeMenuOpen && <div className="theme-menu liquid-glass" role="menu" aria-label="Choose appearance">
@@ -649,11 +815,19 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />{!soundEnabled && <path d="m4 4 16 16" />}</svg>
                 {pendingCount > 0 && <span className="notification-count">{pendingCount}</span>}
               </button>
-              <button className="notification-open-button" aria-label={notificationsOpen ? "Close assignment reminders" : "Open assignment reminders"} aria-expanded={notificationsOpen} onClick={() => { setNotificationsOpen((open) => !open); setReminderMessage(""); }}>⌄</button>
+              <button className="notification-open-button" aria-label={notificationsOpen ? "Close assignment reminders" : "Open assignment reminders"} aria-expanded={notificationsOpen} onClick={() => { setMenuOpen(false); setQuickSearchOpen(false); setQuickSearchQuery(""); setThemeMenuOpen(false); setProfileOpen(false); setNotificationsOpen((open) => !open); setReminderMessage(""); }}>⌄</button>
             </div>
-            <button className="avatar small-avatar profile-avatar-button" aria-label={`Open ${studentName} profile`} aria-expanded={profileOpen} onClick={() => { setNotificationsOpen(false); setProfileOpen((open) => !open); }}>{getStudentInitials(studentName)}</button>
+            <button className="avatar small-avatar profile-avatar-button" aria-label={`Open ${studentName} profile`} aria-expanded={profileOpen} onClick={() => { setMenuOpen(false); setQuickSearchOpen(false); setQuickSearchQuery(""); setThemeMenuOpen(false); setNotificationsOpen(false); setProfileOpen((open) => !open); }}>{getStudentInitials(studentName)}</button>
           </div>
         </header>
+        {quickSearchOpen && createPortal(<section ref={quickSearchPopoverRef} className="quick-search-popover liquid-glass" data-theme={activeTheme} style={quickSearchPosition} role="dialog" aria-label="Search your CampusOS workspace">
+          <div className="quick-search-input-wrap"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input ref={quickSearchInputRef} type="search" role="searchbox" aria-label="Search your records" value={quickSearchQuery} onChange={(event) => setQuickSearchQuery(event.target.value)} placeholder="Search courses, assignments…" autoComplete="off" /><button className="quick-search-clear" type="button" aria-label="Clear search" title="Clear search" disabled={!quickSearchQuery} onClick={() => { setQuickSearchQuery(""); quickSearchInputRef.current?.focus(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg><span>Clear</span></button></div>
+          {normalizedSearchQuery ? <div className="quick-search-results" role="listbox" aria-label="Search results">
+            {quickSearchMatches.map((result) => <button key={`${result.category}-${result.id}`} type="button" role="option" aria-selected="false" className="quick-search-result" onClick={() => openSearchResult(result)}><span className="quick-search-result-icon">⌕</span><span className="quick-search-result-copy"><strong>{result.title}</strong><small>{result.detail || result.category}</small></span><span className="quick-search-result-type">{result.category}</span></button>)}
+            {quickSearchMatches.length === 0 && <p className="quick-search-empty">No matching courses, tasks, timetable entries, or study materials.</p>}
+          </div> : <div className="quick-search-shortcuts"><p>QUICK ACCESS</p>{navigation.filter((item) => ["My Courses", "Assignments", "Timetable", "Notes & Resources"].includes(item.page)).map((item) => <button type="button" key={item.page} onClick={() => { setActivePage(item.page); setQuickSearchOpen(false); setQuickSearchQuery(""); }}><span>{item.icon}</span>{item.name}<span aria-hidden="true">↗</span></button>)}</div>}
+          <p className="quick-search-hint">Search is private and uses records saved for your account.</p>
+        </section>, document.body)}
         {notificationsOpen && (
           <>
             <button className="reminder-backdrop" aria-label="Close assignment reminders" onClick={() => setNotificationsOpen(false)} />
@@ -721,8 +895,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             {!isOnline
               ? `Offline · Saved on this device${queuedWriteCount ? ` · ${queuedWriteCount} change${queuedWriteCount === 1 ? "" : "s"} queued` : ""}`
               : queuedWriteCount > 0
-                ? `Saved on this device · Syncing ${queuedWriteCount} queued change${queuedWriteCount === 1 ? "" : "s"}${syncFailure ? ` · ${syncFailure}` : ""}`
-                : syncFailure || cloudMessage || "Your records are synced with Firestore."}
+                ? `Saved on this device · Retrying cloud sync in the background (${queuedWriteCount} queued)`
+                : syncFailure
+                  ? "Cloud sync is retrying in the background. Your changes remain saved on this device."
+                  : cloudMessage || "Your records are synced with Firestore."}
           </div>}
           <section className="welcome-row">
             <div>
@@ -747,7 +923,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           </section>
 
           {showForm && (
-            <section className="panel form-panel">
+            <section className="panel form-panel liquid-glass assignment-entry-panel">
               <div className="section-heading">
                 <div>
                   <h2>New assignment</h2>
@@ -774,7 +950,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 </label>
 
                 <label>
-                  Assignment question
+                  Assignment description
                   <textarea
                     value={newQuestion}
                     onChange={(event) => setNewQuestion(event.target.value)}
@@ -807,6 +983,21 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     required
                   />
                 </label>
+
+                <label>
+                  Student ID / matriculation number
+                  <input value={studentMatriculationNo} readOnly aria-readonly="true" />
+                </label>
+
+                <label>
+                  Completion status
+                  <select value={newAssignmentCompleted ? "completed" : "not-completed"} onChange={(event) => setNewAssignmentCompleted(event.target.value === "completed")}>
+                    <option value="not-completed">Not completed</option>
+                    <option value="completed">Completed</option>
+                  </select>
+                </label>
+
+                <p className="assignment-id-note">A unique assignment ID and creation date are added automatically when you save.</p>
 
                 <button className="primary-button" type="submit">
                   Save assignment
@@ -865,10 +1056,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
                   <div className="assignment-list">
                     {assignments.slice(0, 4).map((assignment) => (
-                      <div className="assignment-row" key={assignment.id}>
+                      <div className="assignment-row" key={assignment.id} data-search-id={assignment.id}>
                         <button
-                          className={`; checkbox; $; { assignment.completed ? 'checked' : '' } `}
-                          onClick={() => toggleAssignment(assignment.id)}
+                          className={`checkbox ${assignment.completed ? "checked" : ""}`}
+                          onClick={() => void setAssignmentCompletion(assignment.id, !assignment.completed)}
                           aria-label={
                             assignment.completed
                               ? "Mark incomplete"
@@ -956,7 +1147,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               )}
               <div className="course-grid">
                 {courses.map((course) => (
-                  <article className="course-card" key={course.code}>
+                  <article className="course-card" key={course.code} data-search-id={course.code}>
                     <div className="course-card-top">
                       <div className={`course-icon ${course.color}`}>
                         {course.code.slice(0, 3)}
@@ -1018,30 +1209,23 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               </div>
               <div className="assignment-list">
                 {assignments.map((assignment) => editingAssignmentId === assignment.id ? (
-                  <form className="assignment-form assignment-edit-form" key={assignment.id} onSubmit={saveAssignmentEdit}>
+                  <form className="assignment-form assignment-edit-form liquid-glass" key={assignment.id} onSubmit={saveAssignmentEdit}>
                     <label>Assignment title<input value={assignmentDraft.title} onChange={(event) => setAssignmentDraft((current) => ({ ...current, title: event.target.value }))} required /></label>
-                    <label>Assignment question<textarea value={assignmentDraft.question} onChange={(event) => setAssignmentDraft((current) => ({ ...current, question: event.target.value }))} rows={4} required /></label>
+                    <label>Assignment description<textarea value={assignmentDraft.question} onChange={(event) => setAssignmentDraft((current) => ({ ...current, question: event.target.value }))} rows={4} required /></label>
                     <label>Course<select value={assignmentDraft.course} onChange={(event) => setAssignmentDraft((current) => ({ ...current, course: event.target.value }))} required>{courses.map((course) => <option key={course.code} value={course.code}>{course.code} — {course.name}</option>)}</select></label>
                     <label>Due date<input value={assignmentDraft.due} onChange={(event) => setAssignmentDraft((current) => ({ ...current, due: event.target.value }))} placeholder="e.g. 18 May" required /></label>
+                    <label>Student ID / matriculation number<input value={assignment.studentId || studentMatriculationNo} readOnly aria-readonly="true" /></label>
                     <div className="assignment-edit-actions"><button className="primary-button" type="submit">Save changes</button><button className="profile-cancel" type="button" onClick={() => setEditingAssignmentId(null)}>Cancel</button></div>
                   </form>
                 ) : (
-                  <div className="assignment-row" key={assignment.id}>
-                    <button
-                      className={`checkbox ${assignment.completed ? "checked" : ""}`}
-                      onClick={() => toggleAssignment(assignment.id)}
-                      aria-label={assignment.completed ? "Mark incomplete" : "Mark complete"}
-                    >
-                      {assignment.completed ? "✓" : ""}
-                    </button>
+                  <div className="assignment-row" key={assignment.id} data-search-id={assignment.id}>
                     <div className="assignment-info">
                       <strong className={assignment.completed ? "completed-title" : ""}>{assignment.title}</strong>
-                      <span>{assignment.course}</span>
-                      {assignment.question && <p className="assignment-question">{assignment.question}</p>}
+                      <span>Course: {assignment.course} · Assignment ID: {assignment.id}</span>
+                      {(assignment.description || assignment.question) && <p className="assignment-question">{assignment.description || assignment.question}</p>}
+                      <div className="assignment-record-details"><span>Student ID: {assignment.studentId || "Not provided"}</span><span>Created: {formatAssignmentDate(assignment.createdAt)}</span></div>
                     </div>
-                    <span className={`due-badge ${assignment.completed ? "done-badge" : ""}`}>
-                      {assignment.completed ? "Completed" : assignment.due}
-                    </span>
+                    <div className="assignment-status-column"><span className="assignment-deadline">Due {assignment.due}</span><label className={`assignment-status-select ${assignment.completed ? "is-complete" : ""}`}><span className="sr-only">Completion status for {assignment.title}</span><select value={assignment.completed ? "completed" : "not-completed"} onChange={(event) => void setAssignmentCompletion(assignment.id, event.target.value === "completed")}><option value="not-completed">Not completed</option><option value="completed">Completed</option></select></label></div>
                     <div className="course-menu-wrap task-menu-wrap">
                       <button className="course-menu-button" aria-label={`Options for ${assignment.title}`} aria-expanded={openCourseMenu === `assignment-${assignment.id}`} onClick={() => setOpenCourseMenu((current) => current === `assignment-${assignment.id}` ? null : `assignment-${assignment.id}`)}>⋯</button>
                       {openCourseMenu === `assignment-${assignment.id}` && <div className="course-menu task-menu"><button type="button" onClick={() => beginEditAssignment(assignment)}>Edit task</button><button type="button" onClick={() => void removeAssignment(assignment.id)}>Delete task</button></div>}
@@ -1104,7 +1288,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 {schedules.map((schedule) => {
                   const course = courses.find((item) => item.code === schedule.courseCode);
                   return (
-                    <div className="lecture-row" key={schedule.id}>
+                    <div className="lecture-row" key={schedule.id} data-search-id={schedule.id}>
                       <span className="lecture-day">{schedule.day.slice(0, 3).toUpperCase()}</span>
                       <div className="lecture-info">
                         <strong>{course?.name ?? schedule.courseCode}</strong>
@@ -1143,7 +1327,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                   const examDate = new Date(`${exam.date}T00:00:00`);
                   const daysAway = Math.ceil((examDate.getTime() - new Date(new Date().toDateString()).getTime()) / 86400000);
                   const dateLabel = Number.isNaN(examDate.getTime()) ? exam.date : examDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
-                  return <article className="exam-row" key={exam.id}>
+                  return <article className="exam-row" key={exam.id} data-search-id={exam.id}>
                     <div className="exam-date-tile"><strong>{Number.isNaN(examDate.getTime()) ? "—" : examDate.getDate()}</strong><span>{Number.isNaN(examDate.getTime()) ? "" : examDate.toLocaleDateString("en-GB", { month: "short" })}</span></div>
                     <div className="exam-info"><strong>{exam.title}</strong><span>{exam.courseCode} · {dateLabel} · {exam.start}</span><span className="exam-location">{exam.location}</span></div>
                     <span className={`exam-countdown ${daysAway < 0 ? "exam-past" : ""}`}>{daysAway < 0 ? "Past" : daysAway === 0 ? "Today" : daysAway === 1 ? "Tomorrow" : `${daysAway} days`}</span>
@@ -1160,6 +1344,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
           {["Notes & Resources", "Grade Calculator", "Cloud Database", "Backup & Recovery"].includes(activePage) && <Suspense fallback={<section className="panel study-loading" role="status">Loading study tools…</section>}><StudyTools
             page={activePage}
+            searchTargetId={activePage === "Notes & Resources" ? searchTargetId : null}
             studentUid={user.uid}
             connected={cloudReady && isOnline}
             online={isOnline}
