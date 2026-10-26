@@ -153,8 +153,12 @@ export async function renameCourse(uid: string, oldCode: string, newCode: string
 }
 
 export async function deleteCourse(uid: string, code: string) {
-  const schedules = await listLocalRecords(uid, "schedules");
-  for (const schedule of schedules.filter((item) => item["courseCode"] === code)) await deleteAndQueue(uid, "schedules", schedule.id);
+  const [schedules, exams] = await Promise.all([
+    listLocalRecords(uid, "schedules"), listLocalRecords(uid, "exams"),
+  ]);
+  const matchesCourse = (item: Record<string, unknown>) => typeof item["courseCode"] === "string" && item["courseCode"].trim().toUpperCase() === code.trim().toUpperCase();
+  for (const schedule of schedules.filter(matchesCourse)) await deleteAndQueue(uid, "schedules", schedule.id);
+  for (const exam of exams.filter(matchesCourse)) await deleteAndQueue(uid, "exams", exam.id);
   await deleteAndQueue(uid, "courses", code);
 }
 

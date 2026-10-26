@@ -36,6 +36,8 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
   const [attachmentDeleteBusy, setAttachmentDeleteBusy] = useState(false);
   const [noteDeleteRequest, setNoteDeleteRequest] = useState<Note | null>(null);
   const [noteDeleteBusy, setNoteDeleteBusy] = useState(false);
+  const [gradeDeleteRequest, setGradeDeleteRequest] = useState<Grade | null>(null);
+  const [gradeDeleteBusy, setGradeDeleteBusy] = useState(false);
   const [noteFilter, setNoteFilter] = useState("All materials");
   const [search, setSearch] = useState("");
   const [gradeDraft, setGradeDraft] = useState({ course: "", credits: "", letter: "A", term: "" });
@@ -87,6 +89,13 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [noteDeleteRequest, noteDeleteBusy]);
+
+  useEffect(() => {
+    if (!gradeDeleteRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape" && !gradeDeleteBusy) setGradeDeleteRequest(null); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [gradeDeleteRequest, gradeDeleteBusy]);
 
   useEffect(() => {
     if (page !== "Notes & Resources" || !searchTargetId) return;
@@ -254,8 +263,27 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     catch { setStudySavePending(false); setDatabaseError("The grade record could not be saved locally. Check available device storage and try again."); }
   }
 
-  async function removeGrade(id: string) {
-    try { const next = grades.filter((item) => item.id !== id); await saveGrades(next); setGrades(next); setDatabaseError(""); } catch { setStudySavePending(false); setDatabaseError("The grade record could not be saved locally. Check available device storage and try again."); }
+  function removeGrade(id: string) {
+    const grade = grades.find((item) => item.id === id);
+    if (grade) setGradeDeleteRequest(grade);
+  }
+
+  async function confirmGradeDelete() {
+    const request = gradeDeleteRequest;
+    if (!request || gradeDeleteBusy) return;
+    setGradeDeleteBusy(true);
+    try {
+      const next = grades.filter((item) => item.id !== request.id);
+      await saveGrades(next);
+      setGrades(next);
+      setDatabaseError("");
+      setGradeDeleteRequest(null);
+    } catch {
+      setStudySavePending(false);
+      setDatabaseError("The grade record could not be saved locally. Check available device storage and try again.");
+    } finally {
+      setGradeDeleteBusy(false);
+    }
   }
 
   async function collectBackup(): Promise<Backup> {
@@ -327,6 +355,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     && `${note.title} ${note.content} ${note.category}`.toLowerCase().includes(search.toLowerCase()));
 
   return <section className="study-tools-page">
+    {gradeDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!gradeDeleteBusy && event.target === event.currentTarget) setGradeDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="grade-delete-title" aria-describedby="grade-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">GRADE RECORD REMOVAL</p><h2 id="grade-delete-title">Delete this grade?</h2><p id="grade-delete-description">Remove the <strong>{gradeDeleteRequest.course}</strong> record ({gradeDeleteRequest.letter}, {gradeDeleteRequest.credits} credit {gradeDeleteRequest.credits === 1 ? "unit" : "units"}) from your grade calculator? This cannot be undone.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={gradeDeleteBusy} onClick={() => setGradeDeleteRequest(null)}>Keep grade</button><button type="button" className="attachment-delete-confirm" disabled={gradeDeleteBusy} onClick={() => void confirmGradeDelete()}>{gradeDeleteBusy ? "Deleting…" : "Delete grade"}</button></div></section></div>}
     {noteDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!noteDeleteBusy && event.target === event.currentTarget) setNoteDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="study-delete-title" aria-describedby="study-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">STUDY MATERIAL REMOVAL</p><h2 id="study-delete-title">Delete this study material?</h2><p id="study-delete-description"><strong>{noteDeleteRequest.title}</strong> will be deleted from this device and account. This action cannot be undone.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={noteDeleteBusy} onClick={() => setNoteDeleteRequest(null)}>Keep material</button><button type="button" className="attachment-delete-confirm" disabled={noteDeleteBusy} onClick={() => void confirmNoteDelete()}>{noteDeleteBusy ? "Deleting…" : "Delete material"}</button></div></section></div>}
     {attachmentDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!attachmentDeleteBusy && event.target === event.currentTarget) setAttachmentDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="attachment-delete-title" aria-describedby="attachment-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">DOCUMENT REMOVAL</p><h2 id="attachment-delete-title">Delete this PDF or document?</h2><p id="attachment-delete-description"><strong>{attachmentDeleteRequest.attachment.name}</strong>{attachmentDeleteRequest.source === "note" ? " and its study material will be deleted from this device and account." : attachmentDeleteRequest.source === "draft" && editingNoteId ? " will be removed from this material when you save your changes." : attachmentDeleteRequest.source === "draft" ? " will be removed from this new material." : " will be deleted from this device and removed from the material."}</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={attachmentDeleteBusy} onClick={() => setAttachmentDeleteRequest(null)}>Keep document</button><button type="button" className="attachment-delete-confirm" disabled={attachmentDeleteBusy} onClick={() => void confirmAttachmentDelete()}>{attachmentDeleteBusy ? "Deleting…" : attachmentDeleteRequest.source === "note" ? "Delete material and file" : "Delete document"}</button></div></section></div>}
     {databaseError && <p className="study-feedback study-error" role="alert">{databaseError}</p>}

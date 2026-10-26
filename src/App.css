@@ -947,7 +947,7 @@ h1 {
     gap: 0;
   }
 
-  .assignment-row {
+  .assignment-manager-row {
     gap: 8px;
     flex-wrap: wrap;
     align-items: flex-start;
@@ -1732,7 +1732,8 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 
 @media (hover: none) {
   .stat-card:hover, .course-card:hover, .primary-button:hover,
-  .menu-trigger:hover, .profile-avatar-button:hover, .course-menu-button:hover { transform: none; }
+  .menu-trigger:hover, .profile-avatar-button:hover, .course-menu-button:hover,
+  .exam-row:hover { transform: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1852,4 +1853,129 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
     .quick-search-popover,
     .popup-navigation { max-height: calc(100dvh - 82px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
   }
+}
+
+/* Prevent iOS input zoom and keep frequently used actions comfortable to tap. */
+@media (pointer: coarse) {
+  .assignment-form :is(input, select, textarea),
+  .auth-form input,
+  .profile-edit-form :is(input, select, textarea),
+  .study-form :is(input, select, textarea),
+  .study-filter-row :is(input, select),
+  .quick-search-input-wrap input,
+  .backup-file-label input,
+  .assignment-status-select select { font-size: 16px; }
+
+  .nav-item,
+  .study-action,
+  .course-menu-button,
+  .notification-panel-close,
+  .attachment-delete-actions button,
+  .reminder-confirm-actions button { min-height: 44px; }
+}
+
+.task-menu-portal {
+  position: fixed;
+  top: auto;
+  right: auto;
+  z-index: 1001;
+  width: max-content;
+  min-width: 160px;
+  max-width: calc(100vw - 16px);
+  max-height: min(220px, calc(100dvh - 16px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+@media (max-width: 700px) {
+  .assignment-manager-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 44px;
+    align-items: start;
+    gap: 10px 8px;
+  }
+
+  .assignment-manager-row > .assignment-info { grid-column: 1; grid-row: 1; flex: initial; min-width: 0; }
+  .assignment-manager-row > .task-menu-wrap { grid-column: 2; grid-row: 1; justify-self: end; align-self: start; }
+  .assignment-manager-row > .assignment-status-column {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(150px, 180px);
+    align-items: center;
+    justify-items: stretch;
+    gap: 8px;
+    width: 100%;
+    margin: 0;
+  }
+  .assignment-manager-row .assignment-deadline { white-space: normal; overflow-wrap: anywhere; }
+  .assignment-manager-row .assignment-status-select,
+  .assignment-manager-row .assignment-status-select select { width: 100%; min-width: 0; max-width: none; }
+}
+
+@media (max-width: 360px) {
+  .assignment-manager-row > .assignment-status-column { grid-template-columns: minmax(0, 1fr); justify-items: start; }
+  .assignment-manager-row .assignment-status-select { width: min(100%, 200px); }
+}
+
+/* Make short landscape phone and tablet viewports easier to navigate. */
+@media (max-width: 700px) and (max-height: 520px) and (orientation: landscape) {
+  .topbar {
+    grid-template-rows: 44px;
+    min-height: 0;
+    padding-top: max(4px, env(safe-area-inset-top));
+    padding-bottom: 4px;
+  }
+  .topbar-left .breadcrumb { display: none; }
+  .page-content { padding-top: 14px; }
+  .welcome-row { flex-direction: row; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .welcome-row .primary-button { width: auto; flex: 0 0 auto; }
+  .stats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }
+  .stat-card { min-height: 0; padding: 11px; }
+  .stat-number { font-size: 20px; }
+  .panel { padding: 14px; margin-bottom: 14px; }
+  .popup-navigation,
+  .profile-panel,
+  .notification-panel,
+  .quick-search-popover { top: calc(56px + env(safe-area-inset-top)); max-height: calc(100dvh - 64px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+}
+
+/* Keep timetable rows readable when phones and portrait tablets have limited width. */
+@media (max-width: 700px) {
+  .lecture-row {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr) 44px;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 0;
+  }
+
+  .lecture-row > .lecture-info { grid-column: 2; min-width: 0; }
+  .lecture-row > .course-menu-wrap { grid-column: 3; justify-self: end; }
+  .lecture-info strong,
+  .lecture-info span { overflow-wrap: anywhere; }
+
+  .exam-row {
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr) auto 44px;
+    align-items: start;
+    gap: 10px 8px;
+    padding-inline: 0;
+  }
+
+  .exam-row > .exam-date-tile { grid-column: 1; }
+  .exam-row > .exam-info { grid-column: 2; min-width: 0; }
+  .exam-info strong,
+  .exam-info span { overflow-wrap: anywhere; }
+  .exam-row > .exam-countdown { grid-column: 3; align-self: center; white-space: nowrap; }
+  .exam-row > .course-menu-wrap { grid-column: 4; justify-self: end; align-self: start; }
+}
+
+@media (max-width: 380px) {
+  .exam-row { grid-template-columns: 42px minmax(0, 1fr) 44px; gap: 8px; }
+  .exam-row > .exam-date-tile { grid-column: 1; grid-row: 1 / span 2; }
+  .exam-row > .exam-info { grid-column: 2; grid-row: 1; }
+  .exam-row > .exam-countdown { grid-column: 2; grid-row: 2; justify-self: start; margin-top: 1px; }
+  .exam-row > .course-menu-wrap { grid-column: 3; grid-row: 1; }
+  .section-heading > .primary-button { flex: 1 1 100%; width: 100%; justify-content: center; white-space: normal; }
 }

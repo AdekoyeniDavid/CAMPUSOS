@@ -128,6 +128,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [courses, setCourses] = useState(initialCourses);
   const [recentCourseCodes, setRecentCourseCodes] = useState<string[]>([]);
   const [openCourseMenu, setOpenCourseMenu] = useState<string | null>(null);
+  const [assignmentMenuPosition, setAssignmentMenuPosition] = useState<{ top: number; left: number } | null>(null);
+  const [courseDeleteRequest, setCourseDeleteRequest] = useState<Course | null>(null);
+  const [courseDeleteBusy, setCourseDeleteBusy] = useState(false);
+  const [assignmentDeleteRequest, setAssignmentDeleteRequest] = useState<Assignment | null>(null);
+  const [assignmentDeleteBusy, setAssignmentDeleteBusy] = useState(false);
+  const [timetableDeleteRequest, setTimetableDeleteRequest] = useState<{ type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam } | null>(null);
+  const [timetableDeleteBusy, setTimetableDeleteBusy] = useState(false);
   const [schedules, setSchedules] = useState(initialSchedules);
   const [exams, setExams] = useState<Exam[]>([]);
   const [examFormOpen, setExamFormOpen] = useState(false);
@@ -472,12 +479,59 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (!openCourseMenu) return;
     const closeMenuOnOutsideClick = (event: PointerEvent) => {
       const target = event.target;
-      if (target instanceof Element && target.closest(".course-menu-wrap")) return;
+      if (target instanceof Element && target.closest(".course-menu-wrap, .task-menu-portal")) return;
       setOpenCourseMenu(null);
+      setAssignmentMenuPosition(null);
     };
     document.addEventListener("pointerdown", closeMenuOnOutsideClick);
     return () => document.removeEventListener("pointerdown", closeMenuOnOutsideClick);
   }, [openCourseMenu]);
+
+  useEffect(() => {
+    if (!courseDeleteRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !courseDeleteBusy) setCourseDeleteRequest(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [courseDeleteRequest, courseDeleteBusy]);
+
+  useEffect(() => {
+    if (!assignmentDeleteRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !assignmentDeleteBusy) setAssignmentDeleteRequest(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [assignmentDeleteRequest, assignmentDeleteBusy]);
+
+  useEffect(() => {
+    if (!timetableDeleteRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !timetableDeleteBusy) setTimetableDeleteRequest(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [timetableDeleteRequest, timetableDeleteBusy]);
+
+  function toggleAssignmentMenu(event: React.MouseEvent<HTMLButtonElement>, recordId: string, menuId = `assignment-${recordId}`, menuHeight?: number) {
+    if (openCourseMenu === menuId) {
+      setOpenCourseMenu(null);
+      setAssignmentMenuPosition(null);
+      return;
+    }
+    const trigger = event.currentTarget.getBoundingClientRect();
+    const menuWidth = Math.min(190, window.innerWidth - 16);
+    const resolvedMenuHeight = menuHeight ?? (window.matchMedia("(pointer: coarse)").matches ? 108 : 82);
+    const left = Math.max(8, Math.min(trigger.right - menuWidth, window.innerWidth - menuWidth - 8));
+    const below = trigger.bottom + 8;
+    const maxTop = Math.max(8, window.innerHeight - resolvedMenuHeight - 8);
+    const top = below + resolvedMenuHeight <= window.innerHeight - 8
+      ? below
+      : Math.max(8, Math.min(trigger.top - resolvedMenuHeight - 8, maxTop));
+    setAssignmentMenuPosition({ top, left });
+    setOpenCourseMenu(menuId);
+  }
 
   async function saveCourse(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -515,11 +569,11 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }
 
   function beginEditCourse(code: string) {
-    const course = courses.find((item) => item.code === code);
-    if (!course) return;
-    setEditingCourseCode(code);
-    setNewCourseCode(course.code);
-    setNewCourseName(course.name);
+    const normalizedCode = code.trim().toUpperCase();
+    const course = courses.find((item) => item.code.trim().toUpperCase() === normalizedCode);
+    setEditingCourseCode(course?.code ?? null);
+    setNewCourseCode(course?.code ?? normalizedCode);
+    setNewCourseName(course?.name ?? normalizedCode);
     setShowCourseForm(true);
     setActivePage("My Courses");
     setOpenCourseMenu(null);
@@ -555,14 +609,44 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setOpenCourseMenu(null);
   }
 
-  async function removeCourse(code: string) {
-    const saved = await persistCloudRecord(() => deleteCourseRecord(user.uid, code));
-    if (saved) setOpenCourseMenu(null);
+  function removeCourse(code: string) {
+    const normalizedCode = code.trim().toUpperCase();
+    const course = courses.find((item) => item.code.trim().toUpperCase() === normalizedCode) ?? { code: normalizedCode, name: normalizedCode, color: "leather" };
+    setOpenCourseMenu(null);
+    setCourseDeleteRequest(course);
   }
 
-  async function removeSchedule(id: string) {
-    const saved = await persistCloudRecord(() => deleteScheduleRecord(user.uid, id));
-    if (saved) setOpenCourseMenu(null);
+  async function confirmCourseDelete() {
+    const request = courseDeleteRequest;
+    if (!request || courseDeleteBusy) return;
+    setCourseDeleteBusy(true);
+    try {
+      const saved = await persistCloudRecord(() => deleteCourseRecord(user.uid, request.code));
+      if (saved) setCourseDeleteRequest(null);
+    } finally {
+      setCourseDeleteBusy(false);
+    }
+  }
+
+  function removeSchedule(id: string) {
+    const entry = schedules.find((schedule) => schedule.id === id);
+    if (!entry) return;
+    setOpenCourseMenu(null);
+    setTimetableDeleteRequest({ type: "weekly", entry });
+  }
+
+  async function confirmTimetableDelete() {
+    const request = timetableDeleteRequest;
+    if (!request || timetableDeleteBusy) return;
+    setTimetableDeleteBusy(true);
+    try {
+      const saved = await persistCloudRecord(() => request.type === "weekly"
+        ? deleteScheduleRecord(user.uid, request.entry.id)
+        : deleteExamRecord(user.uid, request.entry.id));
+      if (saved) setTimetableDeleteRequest(null);
+    } finally {
+      setTimetableDeleteBusy(false);
+    }
   }
 
   async function saveExam(event: React.FormEvent<HTMLFormElement>) {
@@ -589,14 +673,31 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setOpenCourseMenu(null);
   }
 
-  async function removeExam(id: string) {
-    const saved = await persistCloudRecord(() => deleteExamRecord(user.uid, id));
-    if (saved) setOpenCourseMenu(null);
+  function removeExam(id: string) {
+    const entry = exams.find((exam) => exam.id === id);
+    if (!entry) return;
+    setOpenCourseMenu(null);
+    setTimetableDeleteRequest({ type: "exam", entry });
   }
 
-  async function removeAssignment(id: string) {
-    const saved = await persistCloudRecord(() => deleteAssignmentRecord(user.uid, id));
-    if (saved) setOpenCourseMenu(null);
+  function removeAssignment(id: string) {
+    const assignment = assignments.find((item) => item.id === id);
+    if (!assignment) return;
+    setAssignmentMenuPosition(null);
+    setOpenCourseMenu(null);
+    setAssignmentDeleteRequest(assignment);
+  }
+
+  async function confirmAssignmentDelete() {
+    const request = assignmentDeleteRequest;
+    if (!request || assignmentDeleteBusy) return;
+    setAssignmentDeleteBusy(true);
+    try {
+      const saved = await persistCloudRecord(() => deleteAssignmentRecord(user.uid, request.id));
+      if (saved) setAssignmentDeleteRequest(null);
+    } finally {
+      setAssignmentDeleteBusy(false);
+    }
   }
 
   async function setAssignmentCompletion(id: string, completed: boolean) {
@@ -857,6 +958,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             </section>
           </div>
         )}
+        {courseDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!courseDeleteBusy && event.target === event.currentTarget) setCourseDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="course-delete-title" aria-describedby="course-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">COURSE REMOVAL</p><h2 id="course-delete-title">Delete this course?</h2><p id="course-delete-description"><strong>{courseDeleteRequest.code} · {courseDeleteRequest.name}</strong> and its linked weekly and exam timetable entries will be removed. Assignment records will remain in your list.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={courseDeleteBusy} onClick={() => setCourseDeleteRequest(null)}>Keep course</button><button type="button" className="attachment-delete-confirm" disabled={courseDeleteBusy} onClick={() => void confirmCourseDelete()}>{courseDeleteBusy ? "Deleting…" : "Delete course"}</button></div></section></div>}
+        {assignmentDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!assignmentDeleteBusy && event.target === event.currentTarget) setAssignmentDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="assignment-delete-title" aria-describedby="assignment-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">ASSIGNMENT REMOVAL</p><h2 id="assignment-delete-title">Delete this assignment?</h2><p id="assignment-delete-description"><strong>{assignmentDeleteRequest.title}</strong> will be removed from your assignment list and deleted from this device and account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={assignmentDeleteBusy} onClick={() => setAssignmentDeleteRequest(null)}>Keep assignment</button><button type="button" className="attachment-delete-confirm" disabled={assignmentDeleteBusy} onClick={() => void confirmAssignmentDelete()}>{assignmentDeleteBusy ? "Deleting…" : "Delete assignment"}</button></div></section></div>}
+        {timetableDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!timetableDeleteBusy && event.target === event.currentTarget) setTimetableDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="timetable-delete-title" aria-describedby="timetable-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">TIMETABLE REMOVAL</p><h2 id="timetable-delete-title">Delete this timetable entry?</h2><p id="timetable-delete-description">{timetableDeleteRequest.type === "weekly" ? <><strong>{timetableDeleteRequest.entry.courseCode}</strong> · {timetableDeleteRequest.entry.day}, {timetableDeleteRequest.entry.start}–{timetableDeleteRequest.entry.end} will be removed from your weekly timetable.</> : <><strong>{timetableDeleteRequest.entry.title}</strong> · {timetableDeleteRequest.entry.courseCode}, {timetableDeleteRequest.entry.date} at {timetableDeleteRequest.entry.start} will be removed from your exam timetable.</>}</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={timetableDeleteBusy} onClick={() => setTimetableDeleteRequest(null)}>Keep entry</button><button type="button" className="attachment-delete-confirm" disabled={timetableDeleteBusy} onClick={() => void confirmTimetableDelete()}>{timetableDeleteBusy ? "Deleting…" : "Delete timetable"}</button></div></section></div>}
         {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
         {menuOpen && (
           <>
@@ -1192,7 +1296,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <div className="assignment-edit-actions"><button className="primary-button" type="submit">Save changes</button><button className="profile-cancel" type="button" onClick={() => setEditingAssignmentId(null)}>Cancel</button></div>
                   </form>
                 ) : (
-                  <div className="assignment-row" key={assignment.id} data-search-id={assignment.id}>
+                  <div className="assignment-row assignment-manager-row" key={assignment.id} data-search-id={assignment.id}>
                     <div className="assignment-info">
                       <strong className={assignment.completed ? "completed-title" : ""}>{assignment.title}</strong>
                       <span>Course: {assignment.course} · Assignment ID: {assignment.id}</span>
@@ -1201,8 +1305,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     </div>
                     <div className="assignment-status-column"><span className="assignment-deadline">Due {assignment.due}</span><label className={`assignment-status-select ${assignment.completed ? "is-complete" : ""}`}><span className="sr-only">Completion status for {assignment.title}</span><select value={assignment.completed ? "completed" : "not-completed"} onChange={(event) => void setAssignmentCompletion(assignment.id, event.target.value === "completed")}><option value="not-completed">Not completed</option><option value="completed">Completed</option></select></label></div>
                     <div className="course-menu-wrap task-menu-wrap">
-                      <button className="course-menu-button" aria-label={`Options for ${assignment.title}`} aria-expanded={openCourseMenu === `assignment-${assignment.id}`} onClick={() => setOpenCourseMenu((current) => current === `assignment-${assignment.id}` ? null : `assignment-${assignment.id}`)}>⋯</button>
-                      {openCourseMenu === `assignment-${assignment.id}` && <div className="course-menu task-menu"><button type="button" onClick={() => beginEditAssignment(assignment)}>Edit task</button><button type="button" onClick={() => void removeAssignment(assignment.id)}>Delete task</button></div>}
+                      <button className="course-menu-button" aria-label={`Options for ${assignment.title}`} aria-expanded={openCourseMenu === `assignment-${assignment.id}`} onClick={(event) => toggleAssignmentMenu(event, assignment.id)}>⋯</button>
+                      {openCourseMenu === `assignment-${assignment.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditAssignment(assignment); }}>Edit task</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeAssignment(assignment.id); }}>Delete task</button></div>, document.body)}
                     </div>
                   </div>
                 ))}
@@ -1305,8 +1409,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <div className="exam-date-tile"><strong>{Number.isNaN(examDate.getTime()) ? "—" : examDate.getDate()}</strong><span>{Number.isNaN(examDate.getTime()) ? "" : examDate.toLocaleDateString("en-GB", { month: "short" })}</span></div>
                     <div className="exam-info"><strong>{exam.title}</strong><span>{exam.courseCode} · {dateLabel} · {exam.start}</span><span className="exam-location">{exam.location}</span></div>
                     <span className={`exam-countdown ${daysAway < 0 ? "exam-past" : ""}`}>{daysAway < 0 ? "Past" : daysAway === 0 ? "Today" : daysAway === 1 ? "Tomorrow" : `${daysAway} days`}</span>
-                    <div className="course-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={() => setOpenCourseMenu((current) => current === `exam-${exam.id}` ? null : `exam-${exam.id}`)}>⋯</button>
-                      {openCourseMenu === `exam-${exam.id}` && <div className="course-menu"><button type="button" onClick={() => beginEditExam(exam)}>Edit schedule</button><button type="button" onClick={() => void removeExam(exam.id)}>Delete schedule</button><button type="button" onClick={() => beginEditCourse(exam.courseCode)}>Edit course</button><button type="button" onClick={() => void removeCourse(exam.courseCode)}>Delete course</button></div>}
+                    <div className="course-menu-wrap task-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={(event) => toggleAssignmentMenu(event, exam.id, `exam-${exam.id}`, window.matchMedia("(pointer: coarse)").matches ? 196 : 170)}>⋯</button>
+                      {openCourseMenu === `exam-${exam.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditExam(exam); }}>Edit schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeExam(exam.id); }}>Delete schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditCourse(exam.courseCode); }}>Edit course</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeCourse(exam.courseCode); }}>Delete course</button></div>, document.body)}
                     </div>
                   </article>;
                 })}
