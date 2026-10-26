@@ -1804,3 +1804,52 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 
   .topbar-right { gap: 1px; }
 }
+
+/* Fluid spacing and viewport sizing across compact phones, tablets, and desktop. */
+.app-shell,
+.main-content,
+.page-content { width: 100%; min-width: 0; }
+
+@media (min-width: 1101px) {
+  .topbar { padding-inline: clamp(28px, 3vw, 56px); }
+  .page-content { padding-inline: clamp(28px, 3vw, 56px); }
+}
+
+@media (max-width: 700px) {
+  .topbar { padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right)); }
+  .page-content { padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right)); }
+  .section-heading { flex-wrap: wrap; }
+  .section-heading > * { min-width: 0; }
+  .footer > * { min-width: 0; overflow-wrap: anywhere; }
+  .course-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); }
+}
+
+@media (max-width: 380px) {
+  .topbar { grid-template-columns: 40px minmax(0, 1fr); column-gap: 5px; }
+  .topbar-left .menu-trigger { width: 40px; height: 40px; }
+  .topbar-right { min-width: 0; gap: 0; }
+  .topbar-right > * { min-width: 0; }
+  .quick-search-trigger,
+  .theme-trigger,
+  .profile-avatar-button { flex: 0 0 40px; width: 40px; min-width: 40px; }
+  .notification-controls { flex: 0 0 auto; }
+  .notification-toggle { width: 38px; min-width: 38px; }
+  .notification-open-button { width: 20px; min-width: 20px; }
+  .page-content { padding-top: 20px; }
+  .panel { padding: 13px; }
+  .course-grid { grid-template-columns: minmax(0, 1fr); }
+  .reminder-confirm-actions { grid-template-columns: minmax(0, 1fr); }
+}
+
+@supports (height: 100dvh) {
+  .profile-panel,
+  .notification-panel,
+  .quick-search-popover,
+  .popup-navigation { max-height: calc(100dvh - 112px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+  @media (max-width: 700px) {
+    .profile-panel { max-height: calc(100dvh - 76px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+    .notification-panel,
+    .quick-search-popover,
+    .popup-navigation { max-height: calc(100dvh - 82px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+  }
+}
