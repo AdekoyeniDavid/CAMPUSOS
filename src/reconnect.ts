@@ -16,8 +16,8 @@ export function watchWithReconnect<T>(
   onError: (error: unknown) => void,
   options: ReconnectOptions<T> = {},
 ) {
-  const initialDelayMs = Math.max(100, options.initialDelayMs ?? 1_000);
-  const maxDelayMs = Math.max(initialDelayMs, options.maxDelayMs ?? 60_000);
+  const initialDelayMs = Math.max(100, options.initialDelayMs ?? 500);
+  const maxDelayMs = Math.max(initialDelayMs, options.maxDelayMs ?? 30_000);
   let retryDelayMs = initialDelayMs;
   let stopped = false;
   let connecting = false;
@@ -32,7 +32,8 @@ export function watchWithReconnect<T>(
   };
   const scheduleRetry = (attemptEpoch: number) => {
     if (stopped || !isOnline() || timer !== undefined) return;
-    const delay = retryDelayMs;
+    // Small jitter spreads reconnects from multiple listeners after a shared outage.
+    const delay = Math.max(100, Math.round(retryDelayMs * (0.8 + Math.random() * 0.2)));
     retryDelayMs = Math.min(retryDelayMs * 2, maxDelayMs);
     timer = setTimeout(() => {
       timer = undefined;

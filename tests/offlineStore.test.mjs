@@ -5,7 +5,7 @@ import { indexedDB } from "fake-indexeddb";
 Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: indexedDB });
 Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: false } });
 
-const { deleteLocalRecord, listLocalRecords, pendingWriteCount, replaceWithRemoteRecords, saveLocalRecord, watchLocalRecords } = await import("../src/offlineStore.ts");
+const { deleteLocalAttachment, deleteLocalRecord, getLocalAttachment, listLocalRecords, pendingWriteCount, replaceWithRemoteRecords, restoreLocalRecords, saveLocalAttachment, saveLocalRecord, watchLocalRecords } = await import("../src/offlineStore.ts");
 const { normalizeCourseRecords } = await import("../src/courseRecords.ts");
 
 test("course hydration restores missing course codes from their stable local document IDs", () => {
@@ -44,7 +44,7 @@ test("offline records persist per student and edits coalesce into one queued wri
   assert.equal(await pendingWriteCount(uid), 1);
 
   const database = await new Promise((resolve, reject) => {
-    const request = indexedDB.open("campusos-local-v1", 1);
+    const request = indexedDB.open("campusos-local-v1", 2);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
@@ -80,4 +80,34 @@ test("student sections, notes, and grades stay local and pending cloud data cann
   assert.equal(records.find(({ id }) => id === "gradeRecords").value[0].course, "BIO 101");
   assert.equal(await pendingWriteCount(uid, "studentSections"), 3);
   assert.equal(await pendingWriteCount(uid, "courses"), 0);
+});
+
+test("backup records are restored atomically to local storage and queued for sync", async () => {
+  const uid = `restore-test-${crypto.randomUUID()}`;
+  await restoreLocalRecords(uid, [
+    { collection: "courses", id: "BIO 101", data: { code: "BIO 101", name: "Biology" } },
+    { collection: "studentSections", id: "personal", data: { nationality: "Nigerian" } },
+  ]);
+  assert.equal((await listLocalRecords(uid, "courses"))[0].name, "Biology");
+  assert.equal((await listLocalRecords(uid, "studentSections"))[0].nationality, "Nigerian");
+  assert.equal(await pendingWriteCount(uid), 2);
+
+  await assert.rejects(restoreLocalRecords(uid, [
+    { collection: "courses", id: "CHEM 1", data: { code: "CHEM 1", name: "Chemistry" } },
+    { collection: "wrong", id: "invalid", data: {} },
+  ]));
+  assert.deepEqual((await listLocalRecords(uid, "courses")).map(({ id }) => id), ["BIO 101"]);
+  assert.equal(await pendingWriteCount(uid), 2);
+});
+
+test("study attachments persist privately per student and can be removed", async () => {
+  const uid = `attachment-test-${crypto.randomUUID()}`;
+  const content = new Blob(["private course reading"], { type: "application/pdf" });
+  await saveLocalAttachment(uid, "attachment-1", content);
+  const stored = await getLocalAttachment(uid, "attachment-1");
+  assert.equal(stored.type, "application/pdf");
+  assert.equal(await stored.text(), "private course reading");
+  assert.equal(await getLocalAttachment(`${uid}-other`, "attachment-1"), undefined);
+  await deleteLocalAttachment(uid, "attachment-1");
+  assert.equal(await getLocalAttachment(uid, "attachment-1"), undefined);
 });

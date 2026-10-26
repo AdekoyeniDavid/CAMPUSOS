@@ -3,27 +3,18 @@ import type { ChangeEvent, FormEvent } from "react";
 import { firebaseConfigured } from "./firebase";
 import { createRecordId } from "./browser";
 import { saveStudyRecord } from "./firestore";
-import { listLocalRecords, pendingWriteCount, saveLocalRecord, syncPendingWrites, watchLocalRecords } from "./offlineStore";
+import { deleteLocalAttachment, getLocalAttachment, listLocalRecords, pendingWriteCount, restoreLocalRecords, saveLocalAttachment, syncPendingWrites, watchLocalRecords } from "./offlineStore";
+import { recordsFromBackup, studyCollectionNames, validateBackup } from "./backup";
+import type { Backup } from "./backup";
+import { createBackupPdf } from "./backupPdf";
 
-type Note = { id: string; title: string; category: string; content: string; resourceUrl: string };
+type StudyAttachment = { id: string; name: string; size: number; type: string };
+type Note = { id: string; title: string; category: string; content: string; resourceUrl: string; attachment?: StudyAttachment };
+type AttachmentDeleteRequest = { attachment: StudyAttachment; source: "draft" } | { attachment: StudyAttachment; source: "saved" | "note"; noteId: string };
 type Grade = { id: string; course: string; credits: number; letter: string; term: string };
-type BackupCollection = "courses" | "assignments" | "schedules" | "exams";
-type Backup = { app: "CampusOS"; version: 1; studentUid: string; createdAt: string; student: Record<string, unknown>; collections: Record<BackupCollection, Array<{ id: string; data: Record<string, unknown> }>> };
-
 const categories = ["Lecture notes", "Reading", "Research", "Resource link", "Other"];
 const gradePoints: Record<string, number> = { A: 5, B: 4, C: 3, D: 2, E: 1, F: 0 };
-const studyCollectionNames: BackupCollection[] = ["courses", "assignments", "schedules", "exams"];
 const emptyNote = { title: "", category: categories[0], content: "", resourceUrl: "" };
-
-function validateBackup(value: unknown, uid: string): value is Backup {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<Backup>;
-  if (candidate.app !== "CampusOS" || candidate.version !== 1 || candidate.studentUid !== uid || !candidate.student || !candidate.collections) return false;
-  if (typeof candidate.student !== "object" || Array.isArray(candidate.student)) return false;
-  return studyCollectionNames.every((name) => Array.isArray(candidate.collections?.[name])
-    && candidate.collections[name].length <= 1000
-    && candidate.collections[name].every((item) => item && typeof item.id === "string" && item.id.length > 0 && item.id.length <= 150 && !item.id.includes("/") && item.data && typeof item.data === "object" && !Array.isArray(item.data)));
-}
 
 export function StudyTools({ page, studentUid, connected, online, syncPending, cloudMessage, recordCounts, searchTargetId }: {
   page: string;
@@ -39,6 +30,10 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
   const [grades, setGrades] = useState<Grade[]>([]);
   const [form, setForm] = useState(emptyNote);
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [draftAttachment, setDraftAttachment] = useState<StudyAttachment | null>(null);
+  const [attachmentFile, setAttachmentFile] = useState<File | null>(null);
+  const [attachmentDeleteRequest, setAttachmentDeleteRequest] = useState<AttachmentDeleteRequest | null>(null);
+  const [attachmentDeleteBusy, setAttachmentDeleteBusy] = useState(false);
   const [noteFilter, setNoteFilter] = useState("All materials");
   const [search, setSearch] = useState("");
   const [gradeDraft, setGradeDraft] = useState({ course: "", credits: "", letter: "A", term: "" });
@@ -76,6 +71,13 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     checkSync();
     return () => window.removeEventListener("campusos-sync", checkSync);
   }, [studentUid, studySavePending]);
+
+  useEffect(() => {
+    if (!attachmentDeleteRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape" && !attachmentDeleteBusy) setAttachmentDeleteRequest(null); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [attachmentDeleteRequest, attachmentDeleteBusy]);
 
   useEffect(() => {
     if (page !== "Notes & Resources" || !searchTargetId) return;
@@ -132,17 +134,87 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
         return;
       }
     }
-    const nextNote: Note = { id: editingNoteId ?? createRecordId(), ...form };
+    const noteId = editingNoteId ?? createRecordId();
+    const previousAttachment = editingNoteId ? notes.find((item) => item.id === editingNoteId)?.attachment : undefined;
+    let attachmentStored = false;
     try {
+      if (attachmentFile && draftAttachment) {
+        await saveLocalAttachment(studentUid, draftAttachment.id, attachmentFile);
+        attachmentStored = true;
+      }
+      const nextNote: Note = { id: noteId, ...form, ...(draftAttachment ? { attachment: draftAttachment } : {}) };
       const next = editingNoteId ? notes.map((item) => item.id === editingNoteId ? nextNote : item) : [nextNote, ...notes];
-      await saveNotes(next);
+      try { await saveNotes(next); }
+      catch (error) {
+        if (attachmentStored && draftAttachment) await deleteLocalAttachment(studentUid, draftAttachment.id).catch(() => undefined);
+        throw error;
+      }
+      if (previousAttachment && previousAttachment.id !== draftAttachment?.id) void deleteLocalAttachment(studentUid, previousAttachment.id).catch(() => undefined);
       setNotes(next);
-      setForm(emptyNote); setEditingNoteId(null);
+      setForm(emptyNote); setEditingNoteId(null); setDraftAttachment(null); setAttachmentFile(null);
       setDatabaseError("");
     } catch (error) { setStudySavePending(false); setDatabaseError(error instanceof Error ? error.message : "The note could not be saved locally. Check available device storage and try again."); }
   }
 
+  function selectStudyAttachment(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+    const allowedExtensions = new Set(["pdf", "doc", "docx", "odt", "rtf", "txt", "pages"]);
+    if (!allowedExtensions.has(extension)) { setDatabaseError("Choose a PDF or document file (PDF, DOC, DOCX, ODT, RTF, TXT, or Pages)."); return; }
+    if (!file.size || file.size > 20 * 1024 * 1024) { setDatabaseError("Documents must be smaller than 20 MB."); return; }
+    setAttachmentFile(file);
+    setDraftAttachment({ id: createRecordId(), name: file.name, size: file.size, type: file.type });
+    setDatabaseError("");
+  }
+
+  async function downloadStudyAttachment(attachment: StudyAttachment) {
+    try {
+      const blob = await getLocalAttachment(studentUid, attachment.id);
+      if (!blob) throw new Error("This attachment is saved on the device where it was added and is not available in this browser.");
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a"); link.href = url; link.download = attachment.name; link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    } catch (error) { setDatabaseError(error instanceof Error ? error.message : "The saved document could not be opened."); }
+  }
+
+  async function confirmAttachmentDelete() {
+    const request = attachmentDeleteRequest;
+    if (!request || attachmentDeleteBusy) return;
+    setAttachmentDeleteBusy(true);
+    try {
+    if (request.source === "draft") {
+      setDraftAttachment(null);
+      setAttachmentFile(null);
+      setAttachmentDeleteRequest(null);
+      return;
+    }
+    const current = notes.find((note) => note.id === request.noteId);
+    if (!current || current.attachment?.id !== request.attachment.id) { setAttachmentDeleteRequest(null); return; }
+    const next: Note[] = request.source === "note"
+      ? notes.filter((note) => note.id !== request.noteId)
+      : notes.map((note) => note.id === request.noteId ? { ...note, attachment: undefined } : note);
+    try {
+      await saveNotes(next);
+      setNotes(next);
+      if (editingNoteId === request.noteId && draftAttachment?.id === request.attachment.id) { setDraftAttachment(null); setAttachmentFile(null); }
+      await deleteLocalAttachment(studentUid, request.attachment.id);
+      if (request.source === "note" && editingNoteId === request.noteId) { setEditingNoteId(null); setForm(emptyNote); setDraftAttachment(null); setAttachmentFile(null); }
+      setDatabaseError("");
+      setAttachmentDeleteRequest(null);
+    } catch (error) {
+      setDatabaseError(error instanceof Error ? error.message : "The document could not be deleted. Try again.");
+    }
+    } finally { setAttachmentDeleteBusy(false); }
+  }
+
   async function removeNote(id: string) {
+    const noteWithAttachment = notes.find((item) => item.id === id);
+    if (noteWithAttachment?.attachment) {
+      setAttachmentDeleteRequest({ source: "note", noteId: noteWithAttachment.id, attachment: noteWithAttachment.attachment });
+      return;
+    }
     if (!window.confirm("Delete this study material? This cannot be undone.")) return;
     try { const next = notes.filter((item) => item.id !== id); await saveNotes(next); setNotes(next); setDatabaseError(""); } catch { setStudySavePending(false); setDatabaseError("The study material could not be saved locally. Check available device storage and try again."); }
   }
@@ -159,36 +231,44 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     try { const next = grades.filter((item) => item.id !== id); await saveGrades(next); setGrades(next); setDatabaseError(""); } catch { setStudySavePending(false); setDatabaseError("The grade record could not be saved locally. Check available device storage and try again."); }
   }
 
+  async function collectBackup(): Promise<Backup> {
+    const [sectionRecords, ...collections] = await Promise.all([
+      listLocalRecords(studentUid, "studentSections"),
+      ...studyCollectionNames.map((name) => listLocalRecords(studentUid, name)),
+    ]);
+    const student: Record<string, unknown> = {};
+    for (const { id, ...data } of sectionRecords) {
+      if (id !== "studyNotes" && id !== "gradeRecords") student[id] = data;
+    }
+    const progress = student.progress && typeof student.progress === "object" ? { ...(student.progress as Record<string, unknown>) } : {};
+    const notes = sectionRecords.find(({ id }) => id === "studyNotes")?.["value"];
+    const grades = sectionRecords.find(({ id }) => id === "gradeRecords")?.["value"];
+    if (Array.isArray(notes)) progress.studyNotes = notes;
+    if (Array.isArray(grades)) progress.gradeRecords = grades;
+    if (Object.keys(progress).length) student.progress = progress;
+    if (!Object.keys(student).length) throw new Error("No student records are saved on this device yet. Connect once to load your account data, then try again.");
+    return {
+      app: "CampusOS", version: 1, studentUid, createdAt: new Date().toISOString(),
+      student: Object.fromEntries(Object.entries(student).filter(([key]) => key !== "authorizedStaffUids" && key !== "createdAt")),
+      collections: Object.fromEntries(studyCollectionNames.map((name, index) => [
+        name,
+        collections[index].map(({ id, ...data }) => ({ id, data })),
+      ])) as Backup["collections"],
+    };
+  }
+
+  function downloadBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a"); link.href = url; link.download = filename; link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+
   async function downloadBackup() {
-    setBackupMessage("Preparing a backup from this device…");
+    setBackupMessage("Preparing your PDF backup from this device…");
     try {
-      const [sectionRecords, ...collections] = await Promise.all([
-        listLocalRecords(studentUid, "studentSections"),
-        ...studyCollectionNames.map((name) => listLocalRecords(studentUid, name)),
-      ]);
-      const student: Record<string, unknown> = {};
-      for (const { id, ...data } of sectionRecords) {
-        if (id !== "studyNotes" && id !== "gradeRecords") student[id] = data;
-      }
-      const progress = student.progress && typeof student.progress === "object" ? { ...(student.progress as Record<string, unknown>) } : {};
-      const notes = sectionRecords.find(({ id }) => id === "studyNotes")?.["value"];
-      const grades = sectionRecords.find(({ id }) => id === "gradeRecords")?.["value"];
-      if (Array.isArray(notes)) progress.studyNotes = notes;
-      if (Array.isArray(grades)) progress.gradeRecords = grades;
-      if (Object.keys(progress).length) student.progress = progress;
-      if (!Object.keys(student).length) throw new Error("No student records are saved on this device yet. Connect once to load your account data, then try again.");
-      const backup: Backup = {
-        app: "CampusOS", version: 1, studentUid, createdAt: new Date().toISOString(),
-        student: Object.fromEntries(Object.entries(student).filter(([key]) => key !== "authorizedStaffUids" && key !== "createdAt")),
-        collections: Object.fromEntries(studyCollectionNames.map((name, index) => [
-          name,
-          collections[index].map(({ id, ...data }) => ({ id, data })),
-        ])) as Backup["collections"],
-      };
-      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a"); link.href = url; link.download = `campusos-backup-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(url);
-      setBackupMessage("Backup downloaded. Store the file somewhere safe; it contains private academic data.");
+      const backup = await collectBackup();
+      downloadBlob(createBackupPdf(backup), `campusos-backup-${new Date().toISOString().slice(0, 10)}.pdf`);
+      setBackupMessage("PDF backup downloaded.");
     } catch (error) { setBackupMessage(error instanceof Error ? error.message : "The backup could not be created. Check your connection and try again."); }
   }
 
@@ -200,7 +280,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     try {
       const parsed: unknown = JSON.parse(await file.text());
       if (!validateBackup(parsed, studentUid)) throw new Error("Choose a valid CampusOS backup made for this signed-in account.");
-      setRestoreData(parsed); setBackupMessage(`Backup ready: ${Object.values(parsed.collections).reduce((sum, records) => sum + records.length, 0)} saved records can be restored.`);
+      setRestoreData(parsed); setBackupMessage(`Backup ready: ${recordsFromBackup(parsed).length} saved records can be restored.`);
     } catch (error) { setBackupMessage(error instanceof Error ? error.message : "This backup file could not be read."); }
   }
 
@@ -208,28 +288,8 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     if (!restoreData) return;
     setRestoringBusy(true); setBackupMessage("");
     try {
-      const studentFields = ["profile", "institution", "personal", "contact", "academic", "enrolment", "courses", "progress"];
-      for (const field of studentFields) {
-        const value = restoreData.student[field];
-        if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-        const sectionData = { ...(value as Record<string, unknown>) };
-        if (field === "progress") {
-          delete sectionData.studyNotes;
-          delete sectionData.gradeRecords;
-        }
-        await saveLocalRecord(studentUid, "studentSections", field, sectionData);
-      }
-      const progress = restoreData.student.progress && typeof restoreData.student.progress === "object"
-        ? restoreData.student.progress as Record<string, unknown>
-        : {};
-      for (const field of ["studyNotes", "gradeRecords"] as const) {
-        if (Array.isArray(progress[field])) await saveLocalRecord(studentUid, "studentSections", field, { value: progress[field] });
-      }
-      for (const name of studyCollectionNames) {
-        for (const { id, data } of restoreData.collections[name]) {
-          await saveLocalRecord(studentUid, name, id, { ...data, updatedAt: Date.now() });
-        }
-      }
+      const records = recordsFromBackup(restoreData);
+      await restoreLocalRecords(studentUid, records);
       if (navigator.onLine) void syncPendingWrites(studentUid);
       setRestoreData(null); setRestoring(false); setBackupMessage("Recovery saved on this device. Existing records were kept, and changes will sync to Firestore when connected.");
     } catch (error) { setBackupMessage(error instanceof Error ? `Recovery could not be saved locally: ${error.message}` : "Recovery could not be saved locally. Check device storage and retry."); }
@@ -240,6 +300,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     && `${note.title} ${note.content} ${note.category}`.toLowerCase().includes(search.toLowerCase()));
 
   return <section className="study-tools-page">
+    {attachmentDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!attachmentDeleteBusy && event.target === event.currentTarget) setAttachmentDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="attachment-delete-title" aria-describedby="attachment-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">DOCUMENT REMOVAL</p><h2 id="attachment-delete-title">Delete this PDF or document?</h2><p id="attachment-delete-description"><strong>{attachmentDeleteRequest.attachment.name}</strong>{attachmentDeleteRequest.source === "note" ? " and its study material will be deleted from this device and account." : attachmentDeleteRequest.source === "draft" && editingNoteId ? " will be removed from this material when you save your changes." : attachmentDeleteRequest.source === "draft" ? " will be removed from this new material." : " will be deleted from this device and removed from the material."}</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={attachmentDeleteBusy} onClick={() => setAttachmentDeleteRequest(null)}>Keep document</button><button type="button" className="attachment-delete-confirm" disabled={attachmentDeleteBusy} onClick={() => void confirmAttachmentDelete()}>{attachmentDeleteBusy ? "Deleting…" : attachmentDeleteRequest.source === "note" ? "Delete material and file" : "Delete document"}</button></div></section></div>}
     {databaseError && <p className="study-feedback study-error" role="alert">{databaseError}</p>}
     {saveMessage && <p className="study-feedback" role="status">{saveMessage}</p>}
     {page === "Notes & Resources" && <section className="panel study-panel">
@@ -249,10 +310,11 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
         <label>Organize as<select value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))}>{categories.map((category) => <option key={category}>{category}</option>)}</select></label>
         <label className="study-wide">Notes or resource description<textarea value={form.content} onChange={(event) => setForm((current) => ({ ...current, content: event.target.value }))} placeholder="Write a summary, key concepts, or study instructions…" rows={4} maxLength={15000} /></label>
         <label className="study-wide">Resource link (optional)<input type="url" value={form.resourceUrl} onChange={(event) => setForm((current) => ({ ...current, resourceUrl: event.target.value }))} placeholder="https://…" maxLength={1000} /></label>
-        <div className="study-form-actions"><button className="primary-button" type="submit">{editingNoteId ? "Save changes" : "Save material"}</button>{editingNoteId && <button type="button" className="profile-cancel" onClick={() => { setEditingNoteId(null); setForm(emptyNote); }}>Cancel</button>}</div>
+        <div className="study-attachment-field study-wide"><span>Document attachment <small>PDF or document · up to 20 MB · saved on this device</small></span><label className="study-attachment-picker liquid-glass"><span aria-hidden="true">↥</span>{draftAttachment ? "Replace document" : "Upload PDF or document"}<input type="file" accept=".pdf,.doc,.docx,.odt,.rtf,.txt,.pages,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={selectStudyAttachment} aria-label="Upload a PDF or document" /></label>{draftAttachment && <div className="study-attachment-preview liquid-glass"><span aria-hidden="true">▤</span><span className="study-attachment-name">{draftAttachment.name}<small>{(draftAttachment.size / (1024 * 1024)).toFixed(2)} MB · saved when you save this material</small></span><button type="button" className="study-action destructive" aria-label="Remove attached document" onClick={() => setAttachmentDeleteRequest({ source: "draft", attachment: draftAttachment })}>Remove</button></div>}</div>
+        <div className="study-form-actions"><button className="primary-button" type="submit">{editingNoteId ? "Save changes" : "Save material"}</button>{editingNoteId && <button type="button" className="profile-cancel" onClick={() => { setEditingNoteId(null); setForm(emptyNote); setDraftAttachment(null); setAttachmentFile(null); }}>Cancel</button>}</div>
       </form>
       <div className="study-filter-row"><input aria-label="Search study materials" placeholder="Search materials…" value={search} onChange={(event) => setSearch(event.target.value)} /><select aria-label="Filter materials by category" value={noteFilter} onChange={(event) => setNoteFilter(event.target.value)}><option>All materials</option>{categories.map((category) => <option key={category}>{category}</option>)}</select></div>
-      <div className="study-note-list">{matchingNotes.map((note) => <article className="study-note liquid-glass" key={note.id} data-search-id={note.id}><div className="study-note-top"><span className="study-category">{note.category}</span><div><button type="button" className="study-action" onClick={() => { setForm({ title: note.title, category: note.category, content: note.content, resourceUrl: note.resourceUrl }); setEditingNoteId(note.id); }}>Edit</button><button type="button" className="study-action destructive" onClick={() => void removeNote(note.id)}>Delete</button></div></div><h3>{note.title}</h3>{note.content && <p>{note.content}</p>}{note.resourceUrl && <a href={note.resourceUrl} target="_blank" rel="noreferrer">Open resource ↗</a>}</article>)}{matchingNotes.length === 0 && <p className="empty-state">No materials match. Add a note or resource to start organizing your study library.</p>}</div>
+      <div className="study-note-list">{matchingNotes.map((note) => <article className="study-note liquid-glass" key={note.id} data-search-id={note.id}><div className="study-note-top"><span className="study-category">{note.category}</span><div><button type="button" className="study-action" onClick={() => { setForm({ title: note.title, category: note.category, content: note.content, resourceUrl: note.resourceUrl }); setDraftAttachment(note.attachment ?? null); setAttachmentFile(null); setEditingNoteId(note.id); }}>Edit</button><button type="button" className="study-action destructive" onClick={() => void removeNote(note.id)}>Delete</button></div></div><h3>{note.title}</h3>{note.content && <p>{note.content}</p>}{note.resourceUrl && <a href={note.resourceUrl} target="_blank" rel="noreferrer">Open resource ↗</a>}{note.attachment && <div className="study-attached-document-row"><button type="button" className="study-attached-document liquid-glass" onClick={() => void downloadStudyAttachment(note.attachment!)}><span aria-hidden="true">▤</span><span>{note.attachment.name}<small>Download · {(note.attachment.size / (1024 * 1024)).toFixed(2)} MB</small></span><span aria-hidden="true">↓</span></button><button type="button" className="study-action destructive study-attachment-delete" onClick={() => setAttachmentDeleteRequest({ source: "saved", noteId: note.id, attachment: note.attachment! })}>Delete document</button></div>}</article>)}{matchingNotes.length === 0 && <p className="empty-state">No materials match. Add a note or resource to start organizing your study library.</p>}</div>
     </section>}
 
     {page === "Grade Calculator" && <section className="panel study-panel">
@@ -277,7 +339,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
 
     {page === "Backup & Recovery" && <section className="panel study-panel">
       <div className="section-heading"><div><h2>Backup &amp; recovery</h2><p>Download a portable copy or restore a backup to your cloud account.</p></div><span className="study-count-pill">Your account only</span></div>
-      <div className="backup-card liquid-glass"><div className="backup-symbol">⇩</div><div><h3>Download your academic backup</h3><p>Includes your profile, courses, assignments, timetable, exams, notes, resources, and grades.</p><button className="primary-button" type="button" onClick={() => void downloadBackup()}>Download backup</button></div></div>
+      <div className="backup-card liquid-glass"><div className="backup-symbol">⇩</div><div><h3>Download your academic data</h3><p>Get a readable PDF of your profile, courses, assignments, timetable, exams, notes, resources, and grades. Attached file contents remain on this device.</p><div className="backup-download-actions"><button className="primary-button" type="button" onClick={() => void downloadBackup()}>Download PDF</button></div><small className="backup-format-note">PDF is formatted for viewing and printing.</small></div></div>
       <div className="backup-card liquid-glass"><div className="backup-symbol recovery">↥</div><div><h3>Recover from a backup</h3><p>Choose a CampusOS backup for this signed-in account. Restoring merges saved information; it does not remove current records.</p><label className="backup-file-label">Choose backup file<input type="file" accept="application/json,.json" onChange={(event) => void readBackup(event)} /></label>{restoreData && <div className="restore-confirm"><span>Ready to restore the backup for this account.</span><button className="primary-button" type="button" disabled={restoringBusy} onClick={() => setRestoring(true)}>{restoringBusy ? "Restoring…" : "Restore backup"}</button><button className="profile-cancel" type="button" onClick={() => { setRestoreData(null); setRestoring(false); }}>Cancel</button>{restoring && <div className="restore-confirm-warning"><p>Confirm recovery? Saved profile and academic records will be merged from this file.</p><button type="button" className="primary-button" disabled={restoringBusy} onClick={() => void restoreBackup()}>Confirm recovery</button><button type="button" className="profile-cancel" onClick={() => setRestoring(false)}>Go back</button></div>}</div>}</div></div>
       {backupMessage && <p className="study-feedback" role="status">{backupMessage}</p>}
       <p className="study-footnote">Backups contain private academic information. Keep downloaded files in a secure location and do not share them.</p>

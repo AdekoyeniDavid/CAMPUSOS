@@ -3,17 +3,20 @@ import { getFirestoreDb } from "./firebase.ts";
 export type OfflineCollection = "courses" | "assignments" | "schedules" | "exams" | "studentSections";
 type StoredRecord = { key: string; uid: string; collection: OfflineCollection; id: string; data: Record<string, unknown> };
 type PendingWrite = StoredRecord & { deleted: boolean; queuedAt: number; token: string };
+export type LocalRestoreRecord = { collection: OfflineCollection; id: string; data: Record<string, unknown> };
 type StoreDatabase = IDBDatabase;
 
 const databaseName = "campusos-local-v1";
 const recordStore = "records";
 const outboxStore = "outbox";
+const attachmentStore = "attachments";
 const watchers = new Map<string, Set<(records: Array<Record<string, unknown> & { id: string }>) => void>>();
 let databasePromise: Promise<StoreDatabase> | undefined;
 const flushRunning = new Set<string>();
 const retryDelayMs = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const maxRetryDelayMs = 15_000;
+const initialRetryDelayMs = 750;
+const maxRetryDelayMs = 10_000;
 const localChangeChannel = (() => {
   if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") return undefined;
   try { return new BroadcastChannel("campusos-local-record-changes-v1"); } catch { return undefined; }
@@ -23,11 +26,12 @@ function openDatabase(): Promise<StoreDatabase> {
   if (typeof indexedDB === "undefined") return Promise.reject(new Error("This browser does not support local data storage."));
   if (databasePromise) return databasePromise;
   databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(databaseName, 1);
+    const request = indexedDB.open(databaseName, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(recordStore)) db.createObjectStore(recordStore, { keyPath: "key" });
       if (!db.objectStoreNames.contains(outboxStore)) db.createObjectStore(outboxStore, { keyPath: "key" });
+      if (!db.objectStoreNames.contains(attachmentStore)) db.createObjectStore(attachmentStore, { keyPath: "key" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => { databasePromise = undefined; reject(request.error ?? new Error("Could not open local storage.")); };
@@ -37,7 +41,41 @@ function openDatabase(): Promise<StoreDatabase> {
 }
 
 function makeKey(uid: string, collection: OfflineCollection, id: string) { return `${uid}/${collection}/${id}`; }
+function makeAttachmentKey(uid: string, id: string) { return `${uid}/attachments/${id}`; }
 function watcherKey(uid: string, collection: OfflineCollection) { return `${uid}/${collection}`; }
+
+export async function saveLocalAttachment(uid: string, id: string, file: Blob) {
+  if (!uid || !id || id.includes("/") || file.size <= 0) throw new Error("This document cannot be saved.");
+  const db = await openDatabase();
+  const key = makeAttachmentKey(uid, id);
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(attachmentStore, "readwrite");
+    tx.objectStore(attachmentStore).put({ key, uid, id, blob: file, size: file.size, type: file.type, savedAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("Could not save the document on this device."));
+    tx.onabort = () => reject(tx.error ?? new Error("Could not save the document on this device."));
+  });
+}
+
+export async function getLocalAttachment(uid: string, id: string): Promise<Blob | undefined> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(attachmentStore, "readonly").objectStore(attachmentStore).get(makeAttachmentKey(uid, id));
+    request.onsuccess = () => resolve((request.result as { blob?: Blob } | undefined)?.blob);
+    request.onerror = () => reject(request.error ?? new Error("Could not open the saved document."));
+  });
+}
+
+export async function deleteLocalAttachment(uid: string, id: string) {
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(attachmentStore, "readwrite");
+    tx.objectStore(attachmentStore).delete(makeAttachmentKey(uid, id));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
 
 function normalizeLocalValue(value: unknown): unknown {
   if (value instanceof Date) return value.getTime();
@@ -118,6 +156,34 @@ export async function saveLocalRecord(uid: string, collection: OfflineCollection
   commit(uid, collection);
 }
 
+/** Apply an imported backup and enqueue its cloud writes in one IndexedDB transaction. */
+export async function restoreLocalRecords(uid: string, records: LocalRestoreRecord[]) {
+  if (!uid || !Array.isArray(records) || records.length > 5000) throw new Error("This backup contains too many records to restore safely.");
+  const allowed: OfflineCollection[] = ["courses", "assignments", "schedules", "exams", "studentSections"];
+  const seen = new Set<string>();
+  const prepared = records.map(({ collection, id, data }) => {
+    if (!allowed.includes(collection) || typeof id !== "string" || !id || id.length > 150 || id.includes("/")
+      || !data || typeof data !== "object" || Array.isArray(data)) throw new Error("This backup contains an invalid record.");
+    const key = makeKey(uid, collection, id);
+    if (seen.has(key)) throw new Error("This backup contains duplicate records.");
+    seen.add(key);
+    return { key, uid, collection, id, data: normalizeLocalValue(data) as Record<string, unknown> } satisfies StoredRecord;
+  });
+  const db = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction([recordStore, outboxStore], "readwrite");
+    const now = Date.now();
+    for (const record of prepared) {
+      tx.objectStore(recordStore).put(record);
+      tx.objectStore(outboxStore).put({ ...record, deleted: false, queuedAt: now, token: crypto.randomUUID() } satisfies PendingWrite);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("Could not restore the backup."));
+    tx.onabort = () => reject(tx.error ?? new Error("Could not restore the backup."));
+  });
+  for (const collection of new Set(prepared.map((record) => record.collection))) commit(uid, collection);
+}
+
 export async function deleteLocalRecord(uid: string, collection: OfflineCollection, id: string) {
   const db = await openDatabase();
   const key = makeKey(uid, collection, id);
@@ -176,7 +242,7 @@ export async function syncPendingWrites(uid: string) {
   try {
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firestore is not available yet.");
-    const { deleteDoc, doc, FieldPath, serverTimestamp, setDoc, updateDoc } = await import("firebase/firestore");
+    const { deleteDoc, doc, serverTimestamp, setDoc } = await import("firebase/firestore");
     const queue = (await readAll<PendingWrite>(outboxStore)).filter((item) => item.uid === uid).sort((a, b) => a.queuedAt - b.queuedAt);
     for (const item of queue) {
       if (!navigator.onLine) break;
@@ -186,7 +252,7 @@ export async function syncPendingWrites(uid: string) {
       try {
         if (item.collection === "studentSections") {
           if (item.id === "studyNotes" || item.id === "gradeRecords") {
-            await updateDoc(ref, new FieldPath("progress", item.id), item.data.value, "updatedAt", serverTimestamp());
+            await setDoc(ref, { progress: { [item.id]: item.data.value }, updatedAt: serverTimestamp() }, { merge: true });
           } else if (!item.deleted) {
             await setDoc(ref, { [item.id]: item.data, updatedAt: serverTimestamp() }, { merge: true });
           }
@@ -230,15 +296,16 @@ export async function syncPendingWrites(uid: string) {
       detail: { uid, failed, code: failureCode },
     }));
     if ((failed || hasMore) && navigator.onLine && !retryTimers.has(uid)) {
-      const delay = failed ? retryDelayMs.get(uid) ?? 1_000 : 0;
+      const baseDelay = retryDelayMs.get(uid) ?? initialRetryDelayMs;
+      const delay = failed ? Math.max(100, Math.round(baseDelay * (0.8 + Math.random() * 0.2))) : 0;
       const timer = setTimeout(() => {
         retryTimers.delete(uid);
         void syncPendingWrites(uid);
       }, delay);
       retryTimers.set(uid, timer);
-      if (failed) retryDelayMs.set(uid, Math.min((retryDelayMs.get(uid) ?? 1_000) * 2, maxRetryDelayMs));
+      if (failed) retryDelayMs.set(uid, Math.min(baseDelay * 2, maxRetryDelayMs));
     } else if (!failed && !hasMore) {
-      retryDelayMs.set(uid, 1_000);
+      retryDelayMs.set(uid, initialRetryDelayMs);
       const timer = retryTimers.get(uid);
       if (timer) { clearTimeout(timer); retryTimers.delete(uid); }
     }

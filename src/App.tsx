@@ -265,16 +265,21 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       if (event instanceof CustomEvent && event.detail?.uid === user.uid) {
         if (event.detail.failed) {
           const code = event.detail.code as string | undefined;
-          setSyncFailure(code === "permission-denied"
-            ? "Firestore rejected the queued changes. Check the account and Firestore rules."
+          const reason = code === "permission-denied"
+            ? "Firestore rejected the sync. Check account access and database rules."
             : code === "unauthenticated"
               ? "Your sign-in expired. Sign in again to sync saved changes."
-              : "Cloud sync failed and will retry automatically.");
+              : "The cloud request failed.";
+          setSyncFailure(reason);
+          setCloudMessage(`${reason} Your changes are backed up on this device and remain queued; CampusOS will retry automatically.`);
         } else {
           setSyncFailure("");
         }
       }
-      void pendingWriteCount(user.uid).then(setPendingCount).catch(() => undefined);
+      void pendingWriteCount(user.uid).then((count) => {
+        setPendingCount(count);
+        if (count === 0 && event instanceof CustomEvent && event.detail?.uid === user.uid && !event.detail.failed) setCloudMessage("");
+      }).catch(() => undefined);
     };
     const unsubscribe = [
       watchLocalRecords(user.uid, "courses", (records) => setCourses(normalizeCourseRecords(records))),
@@ -300,7 +305,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       if (online) resumeSync();
       else {
         setCloudConnected(false);
-        setCloudMessage("You’re offline. Your courses, assignments, and timetable are saved on this device.");
+        setCloudMessage("You’re offline. Your courses, assignments, and timetable are backed up on this device and will sync when you reconnect.");
       }
       refreshPending();
     };
@@ -322,7 +327,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     refreshPending();
     if (navigator.onLine) resumeSync();
     setCloudReady(true);
-    if (!navigator.onLine) setCloudMessage("You’re offline. Your courses, assignments, and timetable are saved on this device.");
+    if (!navigator.onLine) setCloudMessage("You’re offline. Your courses, assignments, and timetable are backed up on this device and will sync when you reconnect.");
     return () => {
       unsubscribe.forEach((stop) => stop());
       window.removeEventListener("online", updateConnection);
@@ -349,36 +354,44 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       return;
     }
     setCloudConnected(false);
-    let cancelled = false;
     let readyParts = new Set<string>();
+    let liveParts = new Set<string>();
     let unsubscribers: Array<() => void> = [];
-    const markReady = (key: string) => {
+    const markReady = (key: string, fromCache: boolean) => {
       readyParts.add(key);
       if (readyParts.size === 5) {
         setCloudReady(true);
-        setCloudMessage("");
+        setCloudMessage((message) => message.startsWith("Loading your saved student data") ? "" : message);
       }
+      if (fromCache) liveParts.delete(key);
+      else liveParts.add(key);
+      // One server-confirmed snapshot is enough to establish database connectivity.
+      // Keep all five listeners active and let each hydrate independently.
+      setCloudConnected(liveParts.size > 0 && navigator.onLine);
     };
-    const failed = () => {
-      setCloudConnected(false);
+    const failed = (key?: string) => {
+      if (key) liveParts.delete(key);
+      setCloudConnected(liveParts.size > 0 && navigator.onLine);
       setCloudReady(true);
       setCloudMessage(navigator.onLine
         ? "Cloud sync is temporarily unavailable. Changes are saved on this device and queued for retry."
-        : "You’re offline. Changes are saved on this device and queued for sync.");
+        : "You’re offline. Changes are backed up on this device and queued to sync when you reconnect.");
     };
-    void (async () => {
-      try { if (navigator.onLine) await ensureStudentRecord(user); } catch { failed(); }
-      if (cancelled) return;
-      unsubscribers = [
+    const clearLiveStatusWhenOffline = () => {
+      if (!navigator.onLine) {
+        liveParts.clear();
+        setCloudConnected(false);
+      }
+    };
+    window.addEventListener("offline", clearLiveStatusWhenOffline);
+    unsubscribers = [
         watchStudentDocument(user.uid, (studentData, fromCache) => {
-          if (!fromCache) setCloudConnected(true);
           if (studentData) void cacheStudentDocument(user.uid, studentData, !fromCache);
           const profileName = (studentData?.profile as Record<string, unknown> | undefined)?.fullName;
           if (typeof profileName === "string" && profileName.trim()) setStudentName(profileName);
-          markReady("profile");
-        }, failed),
+          markReady("profile", fromCache);
+        }, () => failed("profile")),
         watchStudentCollection(user.uid, "courses", (records, fromCache) => {
-          if (!fromCache) setCloudConnected(true);
           const normalized = records.map((item) => ({ ...item, code: item.id }));
           // Keep the course code in the cached record as well as using it as its local ID.
           void replaceWithRemoteRecords(user.uid, "courses", normalized, !fromCache);
@@ -390,29 +403,27 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             })
             .map((item) => item.id)
             .slice(0, 6));
-          markReady("courses");
-        }, failed),
+          markReady("courses", fromCache);
+        }, () => failed("courses")),
         watchStudentCollection(user.uid, "assignments", (records, fromCache) => {
-          if (!fromCache) setCloudConnected(true);
           void replaceWithRemoteRecords(user.uid, "assignments", records, !fromCache);
-          markReady("assignments");
-        }, failed),
+          markReady("assignments", fromCache);
+        }, () => failed("assignments")),
         watchStudentCollection(user.uid, "schedules", (records, fromCache) => {
-          if (!fromCache) setCloudConnected(true);
           void replaceWithRemoteRecords(user.uid, "schedules", records, !fromCache);
-          markReady("schedules");
-        }, failed),
+          markReady("schedules", fromCache);
+        }, () => failed("schedules")),
         watchStudentCollection(user.uid, "exams", (records, fromCache) => {
-          if (!fromCache) setCloudConnected(true);
           void replaceWithRemoteRecords(user.uid, "exams", records, !fromCache);
-          markReady("exams");
-        }, failed),
-      ];
-      if (navigator.onLine) void syncPendingWrites(user.uid);
-    })();
+          markReady("exams", fromCache);
+        }, () => failed("exams")),
+    ];
+    // Do not hold up live subscriptions on the optional first-login profile write.
+    if (navigator.onLine) void ensureStudentRecord(user).catch(() => failed());
+    if (navigator.onLine) void syncPendingWrites(user.uid);
     return () => {
-      cancelled = true;
       unsubscribers.forEach((unsubscribe) => unsubscribe());
+      window.removeEventListener("offline", clearLiveStatusWhenOffline);
     };
   }, [user.uid]);
 
@@ -1309,7 +1320,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             page={activePage}
             searchTargetId={activePage === "Notes & Resources" ? searchTargetId : null}
             studentUid={user.uid}
-            connected={cloudReady && cloudConnected && isOnline}
+            connected={cloudConnected && isOnline}
             online={isOnline}
             syncPending={queuedWriteCount > 0}
             cloudMessage={cloudMessage}
