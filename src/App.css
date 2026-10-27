@@ -2116,3 +2116,111 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .page-content { padding-inline: clamp(18px, 3vw, 28px); }
   .content-grid { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Shared responsive guardrails for phone, tablet, desktop, and installed PWA layouts. */
+.app-shell {
+  min-height: 100vh;
+  min-height: 100svh;
+  min-height: 100dvh;
+  overflow-x: clip;
+}
+
+.main-content,
+.page-content,
+.content-grid > *,
+.stats-grid > *,
+.course-grid > *,
+.profile-grid > * {
+  min-width: 0;
+}
+
+.page-content {
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+}
+
+.panel,
+.course-card,
+.stat-card,
+.profile-card,
+.study-card {
+  max-width: 100%;
+}
+
+@media (max-width: 700px) {
+  .page-content {
+    padding-top: clamp(18px, 5vw, 28px);
+  }
+
+  .content-grid,
+  .profile-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .course-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr));
+  }
+
+  .panel,
+  .course-card,
+  .profile-card {
+    border-radius: clamp(16px, 4vw, 22px);
+  }
+
+  .section-heading,
+  .profile-panel-header,
+  .welcome-row {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .section-heading > *,
+  .profile-panel-header > *,
+  .welcome-row > * {
+    min-width: 0;
+  }
+
+  :where(.assignment-form, .study-form, .grade-form, .profile-edit-form) {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+  }
+
+  :where(.assignment-form, .study-form, .grade-form, .profile-edit-form) :is(input, select, textarea, button) {
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 380px) {
+  .course-grid,
+  :where(.assignment-form, .study-form, .grade-form, .profile-edit-form) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .section-heading h2,
+  .panel h2,
+  .panel h3 {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (min-width: 1440px) {
+  .content-grid {
+    gap: clamp(20px, 2vw, 32px);
+  }
+}
+
+@media (pointer: coarse) {
+  :where(button, [role="button"], select, input[type="checkbox"], input[type="radio"]) {
+    touch-action: manipulation;
+  }
+
+  :where(button, [role="button"]) {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+  }
+}
