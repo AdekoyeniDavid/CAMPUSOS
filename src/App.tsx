@@ -2005,6 +2005,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
+  const [verifiedUserUid, setVerifiedUserUid] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(!firebaseConfigured);
   const [authError, setAuthError] = useState("");
 
@@ -2016,6 +2017,7 @@ function App() {
     }
     return onIdTokenChanged(auth, (currentUser) => {
       setUser(currentUser);
+      setVerifiedUserUid(currentUser?.emailVerified ? currentUser.uid : null);
       setAuthReady(true);
     }, () => {
       setAuthError("We could not check your sign-in session. Please try again.");
@@ -2026,7 +2028,7 @@ function App() {
   if (!authReady) return <main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Checking your secure session…</section></main>;
   if (authError) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening sign in…</section></main>}><AuthScreen initialError={authError} /></Suspense>;
   if (!user) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening sign in…</section></main>}><AuthScreen /></Suspense>;
-  if (!user.emailVerified) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Loading verification…</section></main>}><VerificationScreen user={user} /></Suspense>;
+  if (!user.emailVerified && verifiedUserUid !== user.uid) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Loading verification…</section></main>}><VerificationScreen user={user} onVerified={setVerifiedUserUid} /></Suspense>;
   return <CampusOSWorkspace key={user.uid} user={user} onSignOut={() => firebaseAuth ? signOut(firebaseAuth) : Promise.resolve()} />;
 }
 

@@ -14,10 +14,57 @@ import {
   type User,
   updateProfile,
 } from "firebase/auth";
-import { firebaseAuth } from "./firebase";
+import { firebaseAuth, getFirestoreDb } from "./firebase";
 import { readStoredValue, removeStoredValue, writeStoredValue } from "./browser";
 
 type Mode = "signin" | "register" | "reset";
+const pendingVerificationStorageKey = "campusos-pending-email-verification";
+const verificationEmailRequests = new Map<string, Promise<boolean>>();
+
+/** Send a verified action link that returns the user to the same CampusOS origin. */
+function sendVerificationLink(user: User): Promise<boolean> {
+  const existing = verificationEmailRequests.get(user.uid);
+  if (existing) return existing;
+
+  const request = (async () => {
+    if (firebaseAuth && typeof navigator !== "undefined" && navigator.language) {
+      firebaseAuth.languageCode = navigator.language;
+    }
+    const actionCodeSettings = {
+      url: new URL("/?campusosVerify=1", window.location.origin).toString(),
+      handleCodeInApp: false,
+    };
+    try {
+      await sendEmailVerification(user, actionCodeSettings);
+      return true;
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "";
+      // Keep verification available if the app's domain has not yet been authorized in Firebase.
+      if (!code.includes("unauthorized-continue-uri") && !code.includes("invalid-continue-uri")) throw error;
+      await sendEmailVerification(user);
+      return false;
+    }
+  })();
+  verificationEmailRequests.set(user.uid, request);
+  void request.then(
+    () => { if (verificationEmailRequests.get(user.uid) === request) verificationEmailRequests.delete(user.uid); },
+    () => { if (verificationEmailRequests.get(user.uid) === request) verificationEmailRequests.delete(user.uid); },
+  );
+  return request;
+}
+
+function verificationSendError(error: unknown) {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : "";
+  if (code.includes("operation-not-allowed")) return "Email verification is disabled in Firebase Authentication. Enable Email/Password sign-in in the Firebase console, then try again.";
+  if (code.includes("too-many-requests")) return "Firebase temporarily limited verification emails. Wait a few minutes, then choose Resend verification email.";
+  if (code.includes("network-request-failed")) return "The verification email could not be reached. Check your internet connection and try again.";
+  if (code.includes("unauthorized-continue-uri") || code.includes("invalid-continue-uri")) return "Firebase could not create the verification link. Add this site's domain to Firebase Authentication's authorized domains, then resend.";
+  return "We could not send the verification email. Check your connection and use Resend verification email to try again.";
+}
 
 function readableAuthError(error: unknown) {
   const code = typeof error === "object" && error !== null && "code" in error
@@ -39,6 +86,8 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
   const [rememberMe, setRememberMe] = useState(() => readStoredValue("campusos-remember-me") === "true");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState(initialError);
@@ -51,6 +100,8 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
     setBusy(true);
     setError("");
     setMessage("");
+    // Load Firestore's client bundle while Firebase signs the user in.
+    void getFirestoreDb().catch(() => null);
     try {
       await setPersistence(firebaseAuth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
       await signInWithEmailAndPassword(firebaseAuth, emailValue.trim(), passwordValue);
@@ -120,11 +171,19 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
     setBusy(true);
     try {
       if (mode === "register") {
-        const credential = await createUserWithEmailAndPassword(firebaseAuth, email.trim(), password);
-        await updateProfile(credential.user, { displayName: fullName.trim() });
-        await sendEmailVerification(credential.user);
-        setMessage("Account created. Check your email for a verification link before continuing.");
+        // Mark the account creation before Firebase signs the user in and switches screens.
+        writeStoredValue(pendingVerificationStorageKey, "pending");
+        let credential;
+        try {
+          credential = await createUserWithEmailAndPassword(firebaseAuth, email.trim(), password);
+        } catch (caught) {
+          removeStoredValue(pendingVerificationStorageKey);
+          throw caught;
+        }
+        await updateProfile(credential.user, { displayName: fullName.trim() }).catch(() => undefined);
       } else if (mode === "signin") {
+        // Warm the database client during auth so the workspace can attach its live listeners immediately.
+        void getFirestoreDb().catch(() => null);
         await setPersistence(firebaseAuth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
         await signInWithEmailAndPassword(firebaseAuth, email.trim(), password);
         if (rememberMe) {
@@ -163,9 +222,9 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
       <form className="auth-form" onSubmit={submit}>
         {mode === "register" && <label>Full name<input type="text" autoComplete="name" value={fullName} onChange={(event) => setFullName(event.target.value)} required disabled={busy} /></label>}
         <label>Email address<input ref={emailInput} type="email" autoComplete="email" value={email} onFocus={() => window.setTimeout(tryAutofillSignIn, 120)} onInput={tryAutofillSignIn} onAnimationStart={tryAutofillSignIn} onChange={(event) => setEmail(event.target.value)} required disabled={busy} /></label>
-        {mode !== "reset" && <label>Password<input ref={mode === "signin" ? passwordInput : undefined} type="password" autoComplete={mode === "register" ? "new-password" : "current-password"} minLength={8} value={password} onFocus={() => window.setTimeout(tryAutofillSignIn, 120)} onInput={tryAutofillSignIn} onAnimationStart={tryAutofillSignIn} onChange={(event) => setPassword(event.target.value)} required disabled={busy} /></label>}
+        {mode !== "reset" && <label>Password<div className="auth-password-wrap"><input ref={mode === "signin" ? passwordInput : undefined} type={showPassword ? "text" : "password"} autoComplete={mode === "register" ? "new-password" : "current-password"} minLength={8} value={password} onFocus={() => window.setTimeout(tryAutofillSignIn, 120)} onInput={tryAutofillSignIn} onAnimationStart={tryAutofillSignIn} onChange={(event) => setPassword(event.target.value)} required disabled={busy} /><button className="password-visibility-toggle liquid-glass" type="button" onClick={() => setShowPassword((visible) => !visible)} aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} disabled={busy}>{showPassword ? "Hide" : "Show"}</button></div></label>}
         {mode === "signin" && <label className="remember-me-option"><input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} disabled={busy} /><span>Remember me</span></label>}
-        {mode === "register" && <label>Confirm password<input type="password" autoComplete="new-password" minLength={8} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required disabled={busy} /></label>}
+        {mode === "register" && <label>Confirm password<div className="auth-password-wrap"><input type={showConfirmPassword ? "text" : "password"} autoComplete="new-password" minLength={8} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required disabled={busy} /><button className="password-visibility-toggle liquid-glass" type="button" onClick={() => setShowConfirmPassword((visible) => !visible)} aria-label={showConfirmPassword ? "Hide confirmation password" : "Show confirmation password"} aria-pressed={showConfirmPassword} disabled={busy}>{showConfirmPassword ? "Hide" : "Show"}</button></div></label>}
         <button className="primary-button auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "register" ? "Create account" : mode === "reset" ? "Send reset link" : "Sign in"}</button>
       </form>
       <div className="auth-links">
@@ -181,34 +240,96 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
 export { readableAuthError };
 
 
-export function VerificationScreen({ user }: { user: User }) {
-  const [message, setMessage] = useState("");
+export function VerificationScreen({ user, onVerified }: { user: User; onVerified: (uid: string) => void }) {
+  const [message, setMessage] = useState(() => readStoredValue(pendingVerificationStorageKey) === "pending" ? "Sending a verification link to your email…" : "");
   const [busy, setBusy] = useState(false);
+  const verificationCheckInFlight = useRef(false);
+  const appWasAway = useRef(false);
+
+  useEffect(() => {
+    if (readStoredValue(pendingVerificationStorageKey) !== "pending") return;
+    let active = true;
+    setBusy(true);
+    void sendVerificationLink(user).then((hasAppReturnLink) => {
+      removeStoredValue(pendingVerificationStorageKey);
+      if (!active) return;
+      setMessage(hasAppReturnLink
+        ? "Verification link sent. Open it from your email to verify your account and return to CampusOS."
+        : "Verification email sent. Firebase has not authorized this site's return link yet, so after verifying, come back here and choose “I’ve verified my email”.");
+    }).catch((error: unknown) => {
+      removeStoredValue(pendingVerificationStorageKey);
+      if (active) setMessage(verificationSendError(error));
+    }).finally(() => { if (active) setBusy(false); });
+    return () => { active = false; };
+  }, [user.uid]);
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("campusosVerify") !== "1") return;
+    url.searchParams.delete("campusosVerify");
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    void checkVerified();
+  }, [user.uid]);
+
+  useEffect(() => {
+    const checkWhenReturning = () => {
+      if (document.visibilityState === "hidden") {
+        appWasAway.current = true;
+        return;
+      }
+      if (!appWasAway.current) return;
+      appWasAway.current = false;
+      void checkVerified();
+    };
+    document.addEventListener("visibilitychange", checkWhenReturning);
+    window.addEventListener("focus", checkWhenReturning);
+    window.addEventListener("pageshow", checkWhenReturning);
+    return () => {
+      document.removeEventListener("visibilitychange", checkWhenReturning);
+      window.removeEventListener("focus", checkWhenReturning);
+      window.removeEventListener("pageshow", checkWhenReturning);
+    };
+  }, [user.uid]);
 
   async function resend() {
     if (!firebaseAuth) return;
     setBusy(true);
     setMessage("");
     try {
-      await sendEmailVerification(user);
-      setMessage("A new verification link has been sent. Check your inbox and spam folder.");
-    } catch {
-      setMessage("We could not send the verification email. Check your connection and try again.");
+      const hasAppReturnLink = await sendVerificationLink(user);
+      setMessage(hasAppReturnLink
+        ? "A new verification link has been sent. Check your inbox and spam folder."
+        : "A new verification email has been sent. Firebase has not authorized this site's return link yet; after verifying, come back here and choose “I’ve verified my email”.");
+    } catch (error) {
+      setMessage(verificationSendError(error));
     } finally {
       setBusy(false);
     }
   }
 
   async function checkVerified() {
+    if (verificationCheckInFlight.current) return;
+    verificationCheckInFlight.current = true;
     setBusy(true);
     setMessage("");
     try {
-      await reload(user);
-      await getIdToken(user, true);
-      if (!user.emailVerified) setMessage("Your email is not verified yet. Open the link in your inbox, then check again.");
+      const currentUser = firebaseAuth?.currentUser;
+      if (!currentUser || currentUser.uid !== user.uid) {
+        setMessage("Your sign-in session changed. Sign in again to continue.");
+        return;
+      }
+      await reload(currentUser);
+      if (!currentUser.emailVerified) {
+        setMessage("Your email is not verified yet. Open the link in your inbox, then check again.");
+        return;
+      }
+      // Refresh the token so Firestore rules and the workspace see the verified claim too.
+      await getIdToken(currentUser, true);
+      onVerified(currentUser.uid);
     } catch {
       setMessage("We could not check verification status. Check your connection and try again.");
     } finally {
+      verificationCheckInFlight.current = false;
       setBusy(false);
     }
   }
@@ -222,7 +343,7 @@ export function VerificationScreen({ user }: { user: User }) {
     <section className="auth-card liquid-glass">
       <p className="profile-kicker">VERIFY YOUR EMAIL</p>
       <h1>Check your inbox</h1>
-      <p className="auth-subtitle">We sent a verification link to <strong>{user.email}</strong>. Verify your email to open your student workspace.</p>
+      <p className="auth-subtitle">Verify <strong>{user.email}</strong> using the link in your inbox to open your student workspace. Check your spam folder if it does not arrive.</p>
       {message && <div className="auth-notice" role="status">{message}</div>}
       <button className="primary-button auth-submit" onClick={() => void checkVerified()} disabled={busy}>{busy ? "Checking…" : "I’ve verified my email"}</button>
       <div className="auth-links verification-links"><button onClick={() => void resend()} disabled={busy}>Resend verification email</button><button onClick={() => void leaveAccount()}>Sign out</button></div>

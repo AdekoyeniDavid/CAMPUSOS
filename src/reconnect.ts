@@ -16,7 +16,7 @@ export function watchWithReconnect<T>(
   onError: (error: unknown) => void,
   options: ReconnectOptions<T> = {},
 ) {
-  const initialDelayMs = Math.max(100, options.initialDelayMs ?? 500);
+  const initialDelayMs = Math.max(100, options.initialDelayMs ?? 250);
   const maxDelayMs = Math.max(initialDelayMs, options.maxDelayMs ?? 30_000);
   let retryDelayMs = initialDelayMs;
   let stopped = false;
