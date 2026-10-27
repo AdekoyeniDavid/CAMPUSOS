@@ -1395,6 +1395,10 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .timetable-reminder-dialog > p:not(.profile-kicker) { margin: 12px 0 0; color: #747687; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .timetable-reminder-lead { display: grid; gap: 8px; margin-top: 18px; color: #635341; text-align: left; font-size: 11px; font-weight: 750; }
 .timetable-reminder-lead :is(select, input) { width: 100%; min-height: 44px; padding: 9px 12px; border: 1px solid rgba(185,149,112,.24); border-radius: 13px; color: #4f473e; background: rgba(255,255,255,.68); font: inherit; font-size: 14px; }
+.timetable-removal-icon { color: #9e3939; background: linear-gradient(145deg,rgba(255,235,232,.82),rgba(255,255,255,.58)); box-shadow: inset 0 1px rgba(255,255,255,.85),0 7px 18px rgba(125,48,48,.1); }
+.timetable-reminder-remove-confirm { min-height: 44px; padding: 10px 14px; border: 1px solid rgba(181,65,65,.25); border-radius: 13px; color: #fff; background: linear-gradient(145deg,rgba(181,65,65,.94),rgba(148,48,48,.94)); box-shadow: 0 7px 17px rgba(125,48,48,.18),inset 0 1px 0 rgba(255,255,255,.35); font: inherit; font-size: 12px; font-weight: 750; cursor: pointer; transition: transform .2s ease, filter .2s ease; }
+.timetable-reminder-remove-confirm:hover { transform: translateY(-1px); filter: brightness(1.05); }
+.timetable-reminder-remove-confirm:disabled { opacity: .58; cursor: wait; transform: none; }
 .app-shell[data-theme="dark"] .timetable-reminder-dialog h2 { color: #eee9e2; }
 .app-shell[data-theme="dark"] .timetable-reminder-dialog > p:not(.profile-kicker) { color: #c0b8ae; }
 .app-shell[data-theme="dark"] .timetable-reminder-lead { color: #e7dac9; }
@@ -1529,6 +1533,7 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .attachment-delete-confirm { border: 1px solid rgba(181,65,65,.25); background: linear-gradient(145deg,rgba(181,65,65,.94),rgba(148,48,48,.94)); color: white; box-shadow: 0 7px 17px rgba(125,48,48,.18),inset 0 1px 0 rgba(255,255,255,.35); }
 .attachment-delete-confirm:hover { transform: translateY(-1px); }
 .attachment-delete-actions button:disabled { opacity: .58; cursor: wait; transform: none; }
+.assignment-reminder-removal-dialog { max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; }
 .cgpa-summary { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin-bottom: 15px; padding: 16px; border-radius: 16px; }
 .cgpa-summary > div { display: grid; gap: 4px; text-align: center; }
 .cgpa-summary span, .cgpa-summary small { color: #777584; font-size: 10px; }
@@ -2030,6 +2035,10 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .topbar { gap: 16px; padding-inline: 24px; }
   .topbar-right { gap: 12px; }
   .page-content { padding-inline: 24px; }
+}
+
+@media (min-width: 980px) and (max-width: 1100px) {
+  .content-grid { grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr); gap: 16px; }
 }
 
 @media (max-width: 700px) {

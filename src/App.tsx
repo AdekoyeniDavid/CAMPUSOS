@@ -80,6 +80,12 @@ type QuickSearchResult = { id: string; title: string; detail: string; category: 
 
 type ThemeMode = "light" | "dark" | "system";
 
+function isInstalledHomeScreenApp() {
+  const standaloneDisplay = typeof window.matchMedia === "function" && window.matchMedia("(display-mode: standalone)").matches;
+  const iosStandalone = (navigator as Navigator & { standalone?: boolean }).standalone === true;
+  return standaloneDisplay || iosStandalone;
+}
+
 const initialAssignments: Assignment[] = [];
 const initialCourses: Course[] = [];
 const initialSchedules: Schedule[] = [];
@@ -123,6 +129,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [menuOpen, setMenuOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    if (isInstalledHomeScreenApp()) return "system";
     const saved = readStoredValue("campusos-theme");
     return saved === "light" || saved === "dark" ? saved : "system";
   });
@@ -155,6 +162,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [assignmentDeleteRequest, setAssignmentDeleteRequest] = useState<Assignment | null>(null);
   const [assignmentDeleteBusy, setAssignmentDeleteBusy] = useState(false);
   const [assignmentReminderRequest, setAssignmentReminderRequest] = useState<Assignment | null>(null);
+  const [assignmentReminderRemovalRequest, setAssignmentReminderRemovalRequest] = useState<Assignment | null>(null);
+  const [assignmentReminderRemovalBusy, setAssignmentReminderRemovalBusy] = useState(false);
   const [assignmentReminderDate, setAssignmentReminderDate] = useState("");
   const [assignmentReminderTime, setAssignmentReminderTime] = useState("09:00");
   const [assignmentReminderLead, setAssignmentReminderLead] = useState(60);
@@ -163,8 +172,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [timetableDeleteRequest, setTimetableDeleteRequest] = useState<{ type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam } | null>(null);
   const [timetableDeleteBusy, setTimetableDeleteBusy] = useState(false);
   const [timetableReminderRequest, setTimetableReminderRequest] = useState<{ type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam } | null>(null);
+  const [timetableReminderRemovalRequest, setTimetableReminderRemovalRequest] = useState<{ type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam } | null>(null);
   const [timetableReminderLead, setTimetableReminderLead] = useState(15);
   const [timetableReminderBusy, setTimetableReminderBusy] = useState(false);
+  const [timetableReminderRemovalBusy, setTimetableReminderRemovalBusy] = useState(false);
   const [timetableReminders, setTimetableReminders] = useState<SavedTimetableReminder[]>([]);
   const [timetableQueueVersion, setTimetableQueueVersion] = useState(0);
   const [schedules, setSchedules] = useState(initialSchedules);
@@ -290,8 +301,37 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const updatePreference = () => setSystemPrefersDark(media.matches);
-    media.addEventListener("change", updatePreference);
-    return () => media.removeEventListener("change", updatePreference);
+    let preferencePoll: number | undefined;
+    const stopPreferencePoll = () => {
+      if (preferencePoll !== undefined) {
+        window.clearInterval(preferencePoll);
+        preferencePoll = undefined;
+      }
+    };
+    const syncPreference = () => {
+      updatePreference();
+      if (preferencePoll === undefined && isInstalledHomeScreenApp() && document.visibilityState === "visible") {
+        preferencePoll = window.setInterval(updatePreference, 1000);
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") syncPreference();
+      else stopPreferencePoll();
+    };
+    syncPreference();
+    if (typeof media.addEventListener === "function") media.addEventListener("change", updatePreference);
+    else media.addListener(updatePreference);
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", syncPreference);
+    window.addEventListener("pageshow", syncPreference);
+    return () => {
+      if (typeof media.removeEventListener === "function") media.removeEventListener("change", updatePreference);
+      else media.removeListener(updatePreference);
+      stopPreferencePoll();
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", syncPreference);
+      window.removeEventListener("pageshow", syncPreference);
+    };
   }, []);
 
   useEffect(() => {
@@ -313,6 +353,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       window.clearTimeout(focusTimer);
     };
   }, [reminderConfirmation, timetableReminderRequest, timetableReminderBusy]);
+
+  useEffect(() => {
+    if (!timetableReminderRemovalRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !timetableReminderRemovalBusy) setTimetableReminderRemovalRequest(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [timetableReminderRemovalRequest, timetableReminderRemovalBusy]);
 
   useEffect(() => {
     if (!themeMenuOpen) return;
@@ -632,6 +681,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }, [assignmentDeleteRequest, assignmentDeleteBusy]);
 
   useEffect(() => {
+    if (!assignmentReminderRemovalRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !assignmentReminderRemovalBusy) setAssignmentReminderRemovalRequest(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [assignmentReminderRemovalRequest, assignmentReminderRemovalBusy]);
+
+  useEffect(() => {
     if (!timetableDeleteRequest) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !timetableDeleteBusy) setTimetableDeleteRequest(null);
@@ -948,6 +1006,23 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     }
   }
 
+  async function confirmTimetableReminderRemoval() {
+    const request = timetableReminderRemovalRequest;
+    if (!request || timetableReminderRemovalBusy) return;
+    setTimetableReminderRemovalBusy(true);
+    try {
+      if (await removeTimetableReminder(request)) setTimetableReminderRemovalRequest(null);
+    } finally {
+      setTimetableReminderRemovalBusy(false);
+    }
+  }
+
+  function requestTimetableReminderRemoval(request: { type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam }) {
+    setAssignmentMenuPosition(null);
+    setOpenCourseMenu(null);
+    setTimetableReminderRemovalRequest(request);
+  }
+
   function removeAssignment(id: string) {
     const assignment = assignments.find((item) => item.id === id);
     if (!assignment) return;
@@ -995,6 +1070,28 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     }
     setAssignmentReminders((current) => current.filter((item) => item.assignmentId !== assignmentId));
     if (showMessage) { setReminderMessage("Assignment notification reminder removed."); setNotificationsOpen(true); }
+  }
+
+  async function confirmAssignmentReminderRemoval() {
+    const assignment = assignmentReminderRemovalRequest;
+    if (!assignment || assignmentReminderRemovalBusy) return;
+    setAssignmentReminderRemovalBusy(true);
+    try {
+      await removeAssignmentReminder(assignment.id, false);
+      setAssignmentReminderRemovalRequest(null);
+      setReminderMessage(navigator.onLine
+        ? `Notification reminder removed for ${assignment.title}.`
+        : `Reminder removal for ${assignment.title} is saved and will sync when you reconnect.`);
+      setNotificationsOpen(true);
+    } finally {
+      setAssignmentReminderRemovalBusy(false);
+    }
+  }
+
+  function requestAssignmentReminderRemoval(assignment: Assignment) {
+    setAssignmentMenuPosition(null);
+    setOpenCourseMenu(null);
+    setAssignmentReminderRemovalRequest(assignment);
   }
 
   function openAssignmentReminder(assignment: Assignment) {
@@ -1235,6 +1332,11 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }
   const activeTheme = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
 
+  useEffect(() => {
+    const color = activeTheme === "dark" ? "#1d2024" : "#f7f8fc";
+    document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]').forEach((meta) => { meta.content = color; });
+  }, [activeTheme]);
+
   return (
     <div className="app-shell" data-theme={activeTheme}>
       <main className="main-content">
@@ -1350,6 +1452,20 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             </section>
           </div>
         )}
+        {timetableReminderRemovalRequest && (
+          <div className="timetable-reminder-backdrop" onMouseDown={(event) => { if (!timetableReminderRemovalBusy && event.target === event.currentTarget) setTimetableReminderRemovalRequest(null); }}>
+            <section className="timetable-reminder-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="timetable-reminder-removal-title" aria-describedby="timetable-reminder-removal-description">
+              <span className="reminder-confirm-icon timetable-removal-icon" aria-hidden="true">◷</span>
+              <p className="profile-kicker">TIMETABLE REMINDER</p>
+              <h2 id="timetable-reminder-removal-title">Remove this notification reminder?</h2>
+              <p id="timetable-reminder-removal-description">{timetableReminderRemovalRequest.type === "weekly" ? <><strong>{courses.find((course) => course.code === timetableReminderRemovalRequest.entry.courseCode)?.name ?? timetableReminderRemovalRequest.entry.courseCode}</strong> · Every {timetableReminderRemovalRequest.entry.day} at {timetableReminderRemovalRequest.entry.start}</> : <><strong>{timetableReminderRemovalRequest.entry.title}</strong> · {timetableReminderRemovalRequest.entry.courseCode} · {timetableReminderRemovalRequest.entry.date} at {timetableReminderRemovalRequest.entry.start}{timetableReminderRemovalRequest.entry.location ? ` · ${timetableReminderRemovalRequest.entry.location}` : ""}</>}<br />The notification reminder for this timetable entry will be removed from your subscribed devices.</p>
+              <div className="reminder-confirm-actions">
+                <button type="button" className="reminder-confirm-cancel" disabled={timetableReminderRemovalBusy} onClick={() => setTimetableReminderRemovalRequest(null)}>Keep reminder</button>
+                <button type="button" className="timetable-reminder-remove-confirm" disabled={timetableReminderRemovalBusy} onClick={() => void confirmTimetableReminderRemoval()}>{timetableReminderRemovalBusy ? "Removing…" : "Remove reminder"}</button>
+              </div>
+            </section>
+          </div>
+        )}
         {assignmentReminderRequest && (
           <div className="timetable-reminder-backdrop" onMouseDown={(event) => { if (!assignmentReminderBusy && event.target === event.currentTarget) setAssignmentReminderRequest(null); }}>
             <section className="timetable-reminder-dialog assignment-reminder-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="assignment-reminder-title" aria-describedby="assignment-reminder-description">
@@ -1372,6 +1488,20 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               <div className="reminder-confirm-actions">
                 <button type="button" className="reminder-confirm-cancel" disabled={assignmentReminderBusy} onClick={() => setAssignmentReminderRequest(null)}>Cancel</button>
                 <button type="button" className="primary-button reminder-confirm-send" disabled={assignmentReminderBusy || !assignmentReminderDate} onClick={() => void confirmAssignmentReminder()}>{assignmentReminderBusy ? "Saving reminder…" : "Confirm reminder"}</button>
+              </div>
+            </section>
+          </div>
+        )}
+        {assignmentReminderRemovalRequest && (
+          <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!assignmentReminderRemovalBusy && event.target === event.currentTarget) setAssignmentReminderRemovalRequest(null); }}>
+            <section className="attachment-delete-dialog liquid-glass assignment-reminder-removal-dialog" role="alertdialog" aria-modal="true" aria-labelledby="assignment-reminder-removal-title" aria-describedby="assignment-reminder-removal-description">
+              <div className="attachment-delete-icon" aria-hidden="true">◷</div>
+              <p className="profile-kicker">ASSIGNMENT REMINDER</p>
+              <h2 id="assignment-reminder-removal-title">Remove this notification reminder?</h2>
+              <p id="assignment-reminder-removal-description">The reminder for <strong>{assignmentReminderRemovalRequest.title}</strong> · {assignmentReminderRemovalRequest.course} will stop being sent to your subscribed devices.</p>
+              <div className="attachment-delete-actions">
+                <button type="button" className="attachment-delete-cancel" disabled={assignmentReminderRemovalBusy} onClick={() => setAssignmentReminderRemovalRequest(null)}>Keep reminder</button>
+                <button type="button" className="attachment-delete-confirm" disabled={assignmentReminderRemovalBusy} onClick={() => void confirmAssignmentReminderRemoval()}>{assignmentReminderRemovalBusy ? "Removing…" : "Remove reminder"}</button>
               </div>
             </section>
           </div>
@@ -1730,7 +1860,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                       }}>⋯</button>
                       {openCourseMenu === `assignment-${assignment.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}>
                         <button type="button" role="menuitem" onClick={() => openAssignmentReminder(assignment)}>{assignmentReminders.some((item) => item.assignmentId === assignment.id) ? "Update notification reminder" : "Add to notification reminder"}</button>
-                        {assignmentReminders.some((item) => item.assignmentId === assignment.id) && <button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeAssignmentReminder(assignment.id); }}>Remove notification reminder</button>}
+                        {assignmentReminders.some((item) => item.assignmentId === assignment.id) && <button type="button" role="menuitem" onClick={() => requestAssignmentReminderRemoval(assignment)}>Remove notification reminder</button>}
                         <button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditAssignment(assignment); }}>Edit task</button>
                         <button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeAssignment(assignment.id); }}>Delete task</button>
                       </div>, document.body)}
@@ -1802,7 +1932,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                       </div>
                       <div className="course-menu-wrap">
                         <button className="course-menu-button" aria-label={`Options for ${schedule.courseCode} schedule`} aria-expanded={openCourseMenu === `schedule-${schedule.id}`} onClick={() => setOpenCourseMenu((current) => current === `schedule-${schedule.id}` ? null : `schedule-${schedule.id}`)}>⋯</button>
-                        {openCourseMenu === `schedule-${schedule.id}` && <div className="course-menu"><button onClick={() => openTimetableReminder({ type: "weekly", entry: schedule })}>{hasReminder ? "Edit notification reminder" : "Add to notification reminder"}</button>{hasReminder && <button onClick={() => void removeTimetableReminder({ type: "weekly", entry: schedule })}>Remove notification reminder</button>}<button onClick={() => beginEditSchedule(schedule)}>Edit schedule</button><button onClick={() => void removeSchedule(schedule.id)}>Delete schedule</button><button onClick={() => beginEditCourse(schedule.courseCode)}>Edit course</button><button onClick={() => void removeCourse(schedule.courseCode)}>Delete course</button></div>}
+                        {openCourseMenu === `schedule-${schedule.id}` && <div className="course-menu"><button onClick={() => openTimetableReminder({ type: "weekly", entry: schedule })}>{hasReminder ? "Edit notification reminder" : "Add to notification reminder"}</button>{hasReminder && <button onClick={() => requestTimetableReminderRemoval({ type: "weekly", entry: schedule })}>Remove notification reminder</button>}<button onClick={() => beginEditSchedule(schedule)}>Edit schedule</button><button onClick={() => void removeSchedule(schedule.id)}>Delete schedule</button><button onClick={() => beginEditCourse(schedule.courseCode)}>Edit course</button><button onClick={() => void removeCourse(schedule.courseCode)}>Delete course</button></div>}
                       </div>
                     </div>
                   );
@@ -1839,7 +1969,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <div className="exam-info"><strong>{exam.title}</strong><span>{exam.courseCode} · {dateLabel} · {exam.start}</span><span className="exam-location">{exam.location}</span></div>
                     <span className={`exam-countdown ${daysAway < 0 ? "exam-past" : ""}`}>{daysAway < 0 ? "Past" : daysAway === 0 ? "Today" : daysAway === 1 ? "Tomorrow" : `${daysAway} days`}</span>
                     <div className="course-menu-wrap task-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={(event) => toggleAssignmentMenu(event, exam.id, `exam-${exam.id}`, window.matchMedia("(pointer: coarse)").matches ? (hasReminder ? 280 : 240) : (hasReminder ? 248 : 208))}>⋯</button>
-                      {openCourseMenu === `exam-${exam.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => openTimetableReminder({ type: "exam", entry: exam })}>{hasReminder ? "Edit notification reminder" : "Add to notification reminder"}</button>{hasReminder && <button type="button" role="menuitem" onClick={() => void removeTimetableReminder({ type: "exam", entry: exam })}>Remove notification reminder</button>}<button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditExam(exam); }}>Edit schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeExam(exam.id); }}>Delete schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditCourse(exam.courseCode); }}>Edit course</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeCourse(exam.courseCode); }}>Delete course</button></div>, document.body)}
+                      {openCourseMenu === `exam-${exam.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => openTimetableReminder({ type: "exam", entry: exam })}>{hasReminder ? "Edit notification reminder" : "Add to notification reminder"}</button>{hasReminder && <button type="button" role="menuitem" onClick={() => requestTimetableReminderRemoval({ type: "exam", entry: exam })}>Remove notification reminder</button>}<button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditExam(exam); }}>Edit schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeExam(exam.id); }}>Delete schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditCourse(exam.courseCode); }}>Edit course</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeCourse(exam.courseCode); }}>Delete course</button></div>, document.body)}
                     </div>
                   </article>;
                 })}
