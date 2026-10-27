@@ -546,7 +546,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         setCloudMessage((message) => message.startsWith("Loading your saved student data") ? "" : message);
       }
       if (fromCache) liveParts.delete(key);
-      else liveParts.add(key);
+      else {
+        liveParts.add(key);
+        setCloudMessage((message) => message.startsWith("Cloud sync is temporarily unavailable") || message.startsWith("You’re offline") ? "" : message);
+      }
       // One server-confirmed snapshot is enough to establish database connectivity.
       // Keep all five listeners active and let each hydrate independently.
       setCloudConnected(liveParts.size > 0 && navigator.onLine);

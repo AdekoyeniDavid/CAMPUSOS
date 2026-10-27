@@ -58,7 +58,7 @@ export function watchStudentDocument(
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { doc, onSnapshot } = await import("firebase/firestore");
-    return onSnapshot(doc(db, "students", uid), (snapshot) => {
+    return onSnapshot(doc(db, "students", uid), { includeMetadataChanges: true }, (snapshot) => {
       next([snapshot.exists() ? snapshot.data() : undefined, snapshot.metadata.fromCache]);
     }, error);
   }, ([student, fromCache]) => listener(student, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
@@ -74,7 +74,7 @@ export function watchStudentCollection(
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { collection, onSnapshot } = await import("firebase/firestore");
-    return onSnapshot(collection(db, "students", uid, collectionName), (snapshot) => {
+    return onSnapshot(collection(db, "students", uid, collectionName), { includeMetadataChanges: true }, (snapshot) => {
       next([snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache]);
     }, error);
   }, ([records, fromCache]) => listener(records, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
