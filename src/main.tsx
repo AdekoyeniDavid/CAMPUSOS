@@ -38,7 +38,7 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
   const markFormClean = (event: Event) => {
     const form = formFor(event.target);
     if (form) dirtyForms.delete(form);
-    scheduleBackgroundRefresh();
+    scheduleAutomaticRefresh();
   };
   const hasUnsavedForm = () => Array.from(document.forms).some((form) => dirtyForms.has(form));
   const currentBuild = () => {
@@ -46,15 +46,15 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
     const styles = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')).map((link) => link.href).sort();
     return { script, styles };
   };
-  const scheduleBackgroundRefresh = () => {
-    if (!deployedBuild || refreshing || document.visibilityState !== "hidden" || hasUnsavedForm()) return;
+  const scheduleAutomaticRefresh = () => {
+    if (!deployedBuild || refreshing || hasUnsavedForm()) return;
     window.clearTimeout(refreshTimer);
     refreshTimer = window.setTimeout(() => {
-      if (!deployedBuild || document.visibilityState !== "hidden" || hasUnsavedForm()) return;
+      if (!deployedBuild || hasUnsavedForm()) return;
       try { sessionStorage.setItem(refreshStorageKey, deployedBuild); } catch { /* Refresh is still safe without this loop guard. */ }
       refreshing = true;
       window.location.reload();
-    }, 900);
+    }, document.visibilityState === "hidden" ? 250 : 100);
   };
   const checkForDeployedBuild = async () => {
     if (!navigator.onLine || refreshing) return;
@@ -81,7 +81,7 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
       if (lastAttemptedBuild === remoteSignature) return;
       deployedBuild = remoteSignature;
       if (hasUnsavedForm()) return;
-      scheduleBackgroundRefresh();
+      scheduleAutomaticRefresh();
     } catch {
       // Keep the cached app running; the next online/visible event retries this check.
     }
@@ -91,18 +91,39 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
   document.addEventListener("change", markFormDirty, true);
   document.addEventListener("reset", markFormClean, true);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") scheduleBackgroundRefresh();
-    else if (navigator.onLine) void checkForDeployedBuild();
+    if (document.visibilityState === "hidden") scheduleAutomaticRefresh();
+    else if (navigator.onLine) {
+      void checkForDeployedBuild();
+      void navigator.serviceWorker.ready.then((registration) => registration.update()).catch(() => undefined);
+    }
   });
-  new MutationObserver(() => scheduleBackgroundRefresh()).observe(document.documentElement, { childList: true, subtree: true });
+  new MutationObserver(() => scheduleAutomaticRefresh()).observe(document.documentElement, { childList: true, subtree: true });
+
+  navigator.serviceWorker.addEventListener("message", (event: MessageEvent) => {
+    if (event.data?.type === "campusos:refresh") {
+      void checkForDeployedBuild();
+      void navigator.serviceWorker.ready.then((registration) => registration.update()).catch(() => undefined);
+    }
+  });
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (navigator.onLine) void checkForDeployedBuild();
+  });
 
   window.addEventListener("online", () => {
     void checkForDeployedBuild();
     void navigator.serviceWorker.ready.then((registration) => registration.update()).catch(() => undefined);
   });
+  window.setInterval(() => {
+    if (document.visibilityState !== "visible" || !navigator.onLine) return;
+    void checkForDeployedBuild();
+    void navigator.serviceWorker.ready.then((registration) => registration.update()).catch(() => undefined);
+  }, 60_000);
   window.addEventListener("load", () => {
     void navigator.serviceWorker.register("/service-worker.js").then((registration) => {
-      if (navigator.onLine) void registration.update().catch(() => undefined);
+      if (navigator.onLine) {
+        void registration.update().catch(() => undefined);
+        void checkForDeployedBuild();
+      }
     }).catch(() => undefined);
   }, { once: true });
 }

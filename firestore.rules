@@ -83,7 +83,7 @@ service cloud.firestore {
     function validAssignment(assignmentId) {
       return request.resource.data.keys().hasOnly([
           'id', 'title', 'question', 'description', 'studentId', 'course', 'due',
-          'completed', 'createdAt', 'updatedAt'
+          'completed', 'createdAt', 'updatedAt', 'dueDate'
         ])
         && (!('id' in request.resource.data)
           || request.resource.data.id == assignmentId)
@@ -103,6 +103,9 @@ service cloud.firestore {
         && request.resource.data.due is string
         && request.resource.data.due.size() > 0
         && request.resource.data.due.size() <= 80
+        && (!('dueDate' in request.resource.data)
+          || (request.resource.data.dueDate is string
+            && request.resource.data.dueDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')))
         && request.resource.data.completed is bool;
     }
 
@@ -184,6 +187,28 @@ service cloud.firestore {
         allow read: if canReadStudent(studentUid);
         allow create, update: if (ownsStudent(studentUid) && validExam()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
+      }
+
+      match /notificationReminders/{reminderId} {
+        allow read: if ownsStudent(studentUid);
+        allow create, update: if ownsStudent(studentUid)
+          && request.resource.data.keys().hasOnly(['sourceType', 'sourceId', 'courseCode', 'leadMinutes', 'dueDate', 'dueTime'])
+          && request.resource.data.sourceType in ['weekly', 'exam', 'assignment']
+          && request.resource.data.sourceId is string
+          && request.resource.data.sourceId.size() > 0
+          && request.resource.data.sourceId.size() <= 128
+          && request.resource.data.courseCode is string
+          && request.resource.data.courseCode.size() > 0
+          && request.resource.data.courseCode.size() <= 100
+          && ((request.resource.data.sourceType == 'assignment' && request.resource.data.leadMinutes in [5, 15, 30, 60, 1440])
+            || (request.resource.data.sourceType != 'assignment' && request.resource.data.leadMinutes in [5, 15, 30, 60]))
+          && (request.resource.data.sourceType != 'assignment'
+            || (request.resource.data.keys().hasAll(['dueDate', 'dueTime'])
+              && request.resource.data.dueDate is string
+              && request.resource.data.dueDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+              && request.resource.data.dueTime is string
+              && request.resource.data.dueTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')));
+        allow delete: if ownsStudent(studentUid);
       }
     }
   }

@@ -6,9 +6,11 @@ import { watchWithReconnect } from "./reconnect";
 
 export type StudentSection = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress";
 export type CourseRecord = { code: string; name: string; color: string };
-export type AssignmentRecord = { title: string; question: string; description?: string; course: string; due: string; completed: boolean; studentId?: string; createdAt?: number | string | { seconds?: number }; updatedAt?: number | string | { seconds?: number } };
+export type AssignmentRecord = { title: string; question: string; description?: string; course: string; due: string; dueDate?: string; completed: boolean; studentId?: string; createdAt?: number | string | { seconds?: number }; updatedAt?: number | string | { seconds?: number } };
 export type ScheduleRecord = { courseCode: string; day: string; start: string; end: string };
 export type ExamRecord = { title: string; courseCode: string; date: string; start: string; location: string };
+export type TimetableReminderPreference = { sourceType: "weekly" | "exam"; sourceId: string; courseCode: string; leadMinutes: number };
+export type AssignmentReminderPreference = { sourceType: "assignment"; sourceId: string; courseCode: string; dueDate: string; dueTime: string; leadMinutes: number };
 const studentSections: StudentSection[] = ["profile", "institution", "personal", "contact", "academic", "enrolment", "courses", "progress"];
 
 export async function ensureStudentRecord(user: User) {
@@ -76,6 +78,85 @@ export function watchStudentCollection(
       next([snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache]);
     }, error);
   }, ([records, fromCache]) => listener(records, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
+}
+
+export function watchTimetableReminderPreferences(
+  uid: string,
+  listener: (records: TimetableReminderPreference[], fromCache: boolean) => void,
+  onError: (error: unknown) => void,
+) {
+  return watchWithReconnect<[TimetableReminderPreference[], boolean]>(async (next, error) => {
+    const db = await getFirestoreDb();
+    if (!db) throw new Error("Firebase is not configured.");
+    const { collection, onSnapshot } = await import("firebase/firestore");
+    return onSnapshot(collection(db, "students", uid, "notificationReminders"), (snapshot) => {
+      const records = snapshot.docs.flatMap((item) => {
+        const data = item.data();
+        if ((data.sourceType !== "weekly" && data.sourceType !== "exam") || typeof data.sourceId !== "string" || typeof data.courseCode !== "string" || ![5, 15, 30, 60].includes(data.leadMinutes)) return [];
+        return [{ sourceType: data.sourceType, sourceId: data.sourceId, courseCode: data.courseCode, leadMinutes: data.leadMinutes } as TimetableReminderPreference];
+      });
+      next([records, snapshot.metadata.fromCache]);
+    }, error);
+  }, ([records, fromCache]) => listener(records, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
+}
+
+export async function saveTimetableReminderPreference(uid: string, preference: TimetableReminderPreference) {
+  const db = await getFirestoreDb();
+  if (!db) throw new Error("Firebase is not configured.");
+  const { doc, setDoc } = await import("firebase/firestore");
+  await setDoc(doc(db, "students", uid, "notificationReminders", `${preference.sourceType}_${preference.sourceId}`), preference);
+}
+
+export async function removeTimetableReminderPreference(uid: string, sourceType: "weekly" | "exam", sourceId: string) {
+  const db = await getFirestoreDb();
+  if (!db) throw new Error("Firebase is not configured.");
+  const { deleteDoc, doc } = await import("firebase/firestore");
+  await deleteDoc(doc(db, "students", uid, "notificationReminders", `${sourceType}_${sourceId}`));
+}
+
+export async function removeCourseTimetableReminderPreferences(uid: string, courseCode: string) {
+  const db = await getFirestoreDb();
+  if (!db) throw new Error("Firebase is not configured.");
+  const { collection, getDocs, query, where, writeBatch } = await import("firebase/firestore");
+  const reminders = await getDocs(query(collection(db, "students", uid, "notificationReminders"), where("courseCode", "==", courseCode.toUpperCase())));
+  if (!reminders.size) return;
+  const batch = writeBatch(db);
+  reminders.docs.forEach((reminder) => batch.delete(reminder.ref));
+  await batch.commit();
+}
+
+export function watchAssignmentReminderPreferences(
+  uid: string,
+  listener: (records: AssignmentReminderPreference[], fromCache: boolean) => void,
+  onError: (error: unknown) => void,
+) {
+  return watchWithReconnect<[AssignmentReminderPreference[], boolean]>(async (next, error) => {
+    const db = await getFirestoreDb();
+    if (!db) throw new Error("Firebase is not configured.");
+    const { collection, onSnapshot } = await import("firebase/firestore");
+    return onSnapshot(collection(db, "students", uid, "notificationReminders"), (snapshot) => {
+      const records = snapshot.docs.flatMap((item) => {
+        const data = item.data();
+        if (data.sourceType !== "assignment" || typeof data.sourceId !== "string" || typeof data.courseCode !== "string" || typeof data.dueDate !== "string" || typeof data.dueTime !== "string" || ![5, 15, 30, 60, 1440].includes(data.leadMinutes)) return [];
+        return [{ sourceType: "assignment", sourceId: data.sourceId, courseCode: data.courseCode, dueDate: data.dueDate, dueTime: data.dueTime, leadMinutes: data.leadMinutes } as AssignmentReminderPreference];
+      });
+      next([records, snapshot.metadata.fromCache]);
+    }, error);
+  }, ([records, fromCache]) => listener(records, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
+}
+
+export async function saveAssignmentReminderPreference(uid: string, preference: AssignmentReminderPreference) {
+  const db = await getFirestoreDb();
+  if (!db) throw new Error("Firebase is not configured.");
+  const { doc, setDoc } = await import("firebase/firestore");
+  await setDoc(doc(db, "students", uid, "notificationReminders", `assignment_${preference.sourceId}`), preference);
+}
+
+export async function removeAssignmentReminderPreference(uid: string, assignmentId: string) {
+  const db = await getFirestoreDb();
+  if (!db) throw new Error("Firebase is not configured.");
+  const { deleteDoc, doc } = await import("firebase/firestore");
+  await deleteDoc(doc(db, "students", uid, "notificationReminders", `assignment_${assignmentId}`));
 }
 
 export function watchSessionRevocation(

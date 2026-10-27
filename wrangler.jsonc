@@ -4,10 +4,15 @@
   "main": "workers/index.js",
   "compatibility_date": "2026-10-23",
   "vars": {
-    "FIREBASE_PROJECT_ID": "campusos-f5cfc"
+    "FIREBASE_PROJECT_ID": "campusos-f5cfc",
+    "PUSH_VAPID_PUBLIC_KEY": "BGSK413LaNQpIqFT3ALR8nvUrDeDvV-d3UHwZd8wyMW_RSD0JWXhfpZ4uTbPHe8FlbsyEntczix4fQdf2Jy1InY",
+    "PUSH_VAPID_SUBJECT": "https://campusos.campusos-app.workers.dev/"
   },
   "placement": {
     "mode": "smart"
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
   },
   "d1_databases": [
     {

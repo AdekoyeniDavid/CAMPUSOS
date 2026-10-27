@@ -132,6 +132,32 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
   const [revokingOtherSessions, setRevokingOtherSessions] = useState(false);
   const [signOutConfirmation, setSignOutConfirmation] = useState<"current" | "others" | null>(null);
   const [passwordFields, setPasswordFields] = useState({ current: "", next: "", confirm: "" });
+  const [installPrompt, setInstallPrompt] = useState<{ prompt: () => Promise<{ outcome: "accepted" | "dismissed" }>; } | null>(null);
+  const [installMessage, setInstallMessage] = useState("");
+  const [isInstalled, setIsInstalled] = useState(() => typeof window !== "undefined" && (window.matchMedia?.("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true));
+
+  useEffect(() => {
+    const captureInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as Event & { prompt: () => Promise<{ outcome: "accepted" | "dismissed" }> });
+    };
+    const installed = () => { setIsInstalled(true); setInstallPrompt(null); setInstallMessage("CampusOS is installed on this device."); };
+    window.addEventListener("beforeinstallprompt", captureInstallPrompt);
+    window.addEventListener("appinstalled", installed);
+    return () => { window.removeEventListener("beforeinstallprompt", captureInstallPrompt); window.removeEventListener("appinstalled", installed); };
+  }, []);
+
+  async function installCampusOS() {
+    if (installPrompt) {
+      const result = await installPrompt.prompt();
+      setInstallPrompt(null);
+      if (result.outcome === "accepted") { setIsInstalled(true); setInstallMessage("CampusOS was added to your device."); }
+      else setInstallMessage("Installation was cancelled. You can install CampusOS later from your browser menu.");
+      return;
+    }
+    const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    setInstallMessage(isAppleMobile ? "In Safari, tap Share, then Add to Home Screen. Open the installed CampusOS app to enable web push notifications." : "Use your browser’s Install app or Add to Home Screen option to install CampusOS.");
+  }
 
   useEffect(() => {
     setData((current) => ({ ...current, contact: { ...current.contact, email: registeredEmail }, courses: { registeredCourses: courses.length ? courses.map((course) => `${course.code} — ${course.name} · credit units not provided`).join("\n") : "No courses registered yet." } }));
@@ -257,6 +283,7 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
         <section className="profile-card liquid-glass profile-section-security">
           <header className="profile-card-heading"><h3>Account &amp; Security</h3><div className="profile-menu-wrap"><button className="profile-menu-trigger" aria-label="Account security options" aria-expanded={openMenu === "security"} onClick={() => setOpenMenu((current) => current === "security" ? null : "security")}>⋯</button>{openMenu === "security" && <div className="profile-section-menu"><button onClick={() => { setSecurityFormOpen(true); setOpenMenu(null); }}>Edit security</button></div>}</div></header>
           <dl className="profile-fields"><div><dt>Active sessions</dt><dd>This device stays signed in when you revoke other sessions.</dd></div><div><dt>Security settings</dt><dd>Managed by your campus account</dd></div></dl>
+          <div className="profile-install-card liquid-glass"><div><strong>CampusOS on this device</strong><p>Install CampusOS for a home screen shortcut and eligible background reminders.</p></div><button className="primary-button" type="button" onClick={() => void installCampusOS()} disabled={isInstalled}>{isInstalled ? "Installed" : "Install CampusOS"}</button>{installMessage && <p className="profile-install-message" role="status">{installMessage}</p>}</div>
           <button className="profile-session-revoke" type="button" onClick={() => setSignOutConfirmation("others")} disabled={revokingOtherSessions}>{revokingOtherSessions ? "Signing out other devices…" : "Sign out of all other sessions"}</button>
           <button className="profile-signout-button" onClick={() => setSignOutConfirmation("current")}>Sign out of this session</button>
           {securityFormOpen && <form className="profile-edit-form" onSubmit={savePassword}><label>Current password<input type="password" autoComplete="current-password" value={passwordFields.current} onChange={(event) => setPasswordFields((current) => ({ ...current, current: event.target.value }))} required /></label><label>New password<input type="password" autoComplete="new-password" value={passwordFields.next} onChange={(event) => setPasswordFields((current) => ({ ...current, next: event.target.value }))} required minLength={8} /></label><label>Confirm new password<input type="password" autoComplete="new-password" value={passwordFields.confirm} onChange={(event) => setPasswordFields((current) => ({ ...current, confirm: event.target.value }))} required /></label><div className="profile-form-actions"><button className="primary-button" type="submit">Update password</button><button className="profile-cancel" type="button" onClick={() => setSecurityFormOpen(false)}>Cancel</button></div></form>}

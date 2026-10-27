@@ -14,10 +14,17 @@ import {
   saveCourse as saveCourseRecord,
   saveExam as saveExamRecord,
   saveSchedule as saveScheduleRecord,
+  removeAssignmentReminderPreference,
+  saveAssignmentReminderPreference,
+  removeCourseTimetableReminderPreferences,
+  removeTimetableReminderPreference,
+  saveTimetableReminderPreference,
   revokeOtherSessions as revokeOtherSessionsRecord,
   watchSessionRevocation,
   watchStudentCollection,
   watchStudentDocument,
+  watchTimetableReminderPreferences,
+  watchAssignmentReminderPreferences,
 } from "./firestore";
 import { pendingWriteCount, replaceWithRemoteRecords, syncPendingWrites, watchLocalRecords } from "./offlineStore";
 import "./App.css";
@@ -50,6 +57,7 @@ type Assignment = {
   description?: string;
   course: string;
   due: string;
+  dueDate?: string;
   completed: boolean;
   studentId?: string;
   createdAt?: number | string | { seconds?: number };
@@ -64,6 +72,8 @@ type Exam = {
   start: string;
   location: string;
 };
+type SavedTimetableReminder = { sourceType: "weekly" | "exam"; sourceId: string; leadMinutes: number };
+type SavedAssignmentReminder = { assignmentId: string; dueDate: string; dueTime: string; leadMinutes: number };
 
 type StudyMaterial = { id: string; title: string; category: string; content: string; resourceUrl: string };
 type QuickSearchResult = { id: string; title: string; detail: string; category: string; page: string; searchable: string };
@@ -79,6 +89,12 @@ function getStudentInitials(fullName: string) {
   return initials.length ? initials.join(".") : "S";
 }
 
+function base64UrlToBytes(value: string) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
 function formatAssignmentDate(value: Assignment["createdAt"]) {
   if (value === undefined || value === null || value === "") return "Not provided";
   let milliseconds: number;
@@ -88,6 +104,11 @@ function formatAssignmentDate(value: Assignment["createdAt"]) {
   else return "Not provided";
   if (!Number.isFinite(milliseconds)) return "Not provided";
   return new Date(milliseconds).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+function formatAssignmentDueDate(value: string) {
+  const date = new Date(`${value}T12:00:00`);
+  return Number.isFinite(date.getTime()) ? date.toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : value;
 }
 
 function isStudyMaterial(value: unknown): value is StudyMaterial {
@@ -133,8 +154,19 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [courseDeleteBusy, setCourseDeleteBusy] = useState(false);
   const [assignmentDeleteRequest, setAssignmentDeleteRequest] = useState<Assignment | null>(null);
   const [assignmentDeleteBusy, setAssignmentDeleteBusy] = useState(false);
+  const [assignmentReminderRequest, setAssignmentReminderRequest] = useState<Assignment | null>(null);
+  const [assignmentReminderDate, setAssignmentReminderDate] = useState("");
+  const [assignmentReminderTime, setAssignmentReminderTime] = useState("09:00");
+  const [assignmentReminderLead, setAssignmentReminderLead] = useState(60);
+  const [assignmentReminderBusy, setAssignmentReminderBusy] = useState(false);
+  const [assignmentReminders, setAssignmentReminders] = useState<SavedAssignmentReminder[]>([]);
   const [timetableDeleteRequest, setTimetableDeleteRequest] = useState<{ type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam } | null>(null);
   const [timetableDeleteBusy, setTimetableDeleteBusy] = useState(false);
+  const [timetableReminderRequest, setTimetableReminderRequest] = useState<{ type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam } | null>(null);
+  const [timetableReminderLead, setTimetableReminderLead] = useState(15);
+  const [timetableReminderBusy, setTimetableReminderBusy] = useState(false);
+  const [timetableReminders, setTimetableReminders] = useState<SavedTimetableReminder[]>([]);
+  const [timetableQueueVersion, setTimetableQueueVersion] = useState(0);
   const [schedules, setSchedules] = useState(initialSchedules);
   const [exams, setExams] = useState<Exam[]>([]);
   const [examFormOpen, setExamFormOpen] = useState(false);
@@ -165,6 +197,97 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [newAssignmentCompleted, setNewAssignmentCompleted] = useState(false);
 
   useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const token = await getIdToken(user);
+        const response = await fetch("/api/reminders/push/timetable", { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+        if (!response.ok) return;
+        const result = await response.json();
+        if (active && Array.isArray(result.reminders)) setTimetableReminders(result.reminders);
+      } catch { /* Timetable reminders load again when the signed-in workspace is reopened. */ }
+    })();
+    return () => { active = false; };
+  }, [user]);
+
+  useEffect(() => watchTimetableReminderPreferences(user.uid, (records) => {
+    setTimetableReminders(records.map(({ sourceType, sourceId, leadMinutes }) => ({ sourceType, sourceId, leadMinutes })));
+  }, () => undefined), [user.uid]);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const token = await getIdToken(user);
+        const response = await fetch("/api/reminders/push/assignment", { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+        if (!response.ok) return;
+        const result = await response.json();
+        if (active && Array.isArray(result.reminders)) setAssignmentReminders(result.reminders);
+      } catch { /* Assignment reminder state is refreshed when the workspace reopens. */ }
+    })();
+    return () => { active = false; };
+  }, [user]);
+
+  useEffect(() => watchAssignmentReminderPreferences(user.uid, (records) => {
+    setAssignmentReminders(records.map(({ sourceId, dueDate, dueTime, leadMinutes }) => ({ assignmentId: sourceId, dueDate, dueTime, leadMinutes })));
+  }, () => undefined), [user.uid]);
+
+  async function syncTimetableReminderMirror(operation: Record<string, unknown>) {
+    if (typeof operation.assignmentId === "string") {
+      if (operation.action === "remove") await removeAssignmentReminderPreference(user.uid, operation.assignmentId);
+      else if (operation.action === "add" && typeof operation.courseCode === "string" && typeof operation.dueDate === "string" && typeof operation.dueTime === "string" && typeof operation.leadMinutes === "number") {
+        await saveAssignmentReminderPreference(user.uid, { sourceType: "assignment", sourceId: operation.assignmentId, courseCode: operation.courseCode, dueDate: operation.dueDate, dueTime: operation.dueTime, leadMinutes: operation.leadMinutes });
+      }
+    } else if (operation.action === "removeCourse" && typeof operation.courseCode === "string") {
+      await removeCourseTimetableReminderPreferences(user.uid, operation.courseCode);
+    } else if (operation.action === "remove" && (operation.sourceType === "weekly" || operation.sourceType === "exam") && typeof operation.sourceId === "string") {
+      await removeTimetableReminderPreference(user.uid, operation.sourceType, operation.sourceId);
+    } else if (operation.action === "add" && (operation.sourceType === "weekly" || operation.sourceType === "exam") && typeof operation.sourceId === "string" && typeof operation.courseCode === "string" && typeof operation.leadMinutes === "number") {
+      await saveTimetableReminderPreference(user.uid, { sourceType: operation.sourceType, sourceId: operation.sourceId, courseCode: operation.courseCode.toUpperCase(), leadMinutes: operation.leadMinutes });
+    }
+  }
+
+  useEffect(() => {
+    if (!isOnline) return;
+    const key = `campusos-timetable-reminder-sync:${user.uid}`;
+    let active = true;
+    let retryTimer: number | undefined;
+    const retrySoon = () => {
+      if (active && retryTimer === undefined) retryTimer = window.setTimeout(() => {
+        retryTimer = undefined;
+        if (active) setTimetableQueueVersion((version) => version + 1);
+      }, 5000);
+    };
+    void (async () => {
+      let queue: Array<Record<string, unknown>>;
+      try { queue = JSON.parse(readStoredValue(key) ?? "[]"); } catch { queue = []; }
+      if (!Array.isArray(queue) || !queue.length) return;
+      try {
+        const token = await getIdToken(user);
+        while (active && queue.length) {
+          const endpoint = typeof queue[0].assignmentId === "string" ? "/api/reminders/push/assignment" : "/api/reminders/push/timetable";
+          const response = await fetch(endpoint, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(queue[0]) });
+          if (!response.ok) { retrySoon(); break; }
+          try { await syncTimetableReminderMirror(queue[0]); } catch { retrySoon(); break; }
+          queue.shift();
+          writeStoredValue(key, JSON.stringify(queue));
+        }
+      } catch { /* Keep queued timetable reminder changes for the next connection event. */ }
+    })();
+    return () => { active = false; if (retryTimer !== undefined) window.clearTimeout(retryTimer); };
+  }, [isOnline, user, timetableQueueVersion]);
+
+  function queueTimetableReminderSync(operation: Record<string, unknown>) {
+    const key = `campusos-timetable-reminder-sync:${user.uid}`;
+    let queue: Array<Record<string, unknown>>;
+    try { queue = JSON.parse(readStoredValue(key) ?? "[]"); } catch { queue = []; }
+    if (!Array.isArray(queue)) queue = [];
+    queue.push(operation);
+    writeStoredValue(key, JSON.stringify(queue));
+    setTimetableQueueVersion((version) => version + 1);
+  }
+
+  useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const updatePreference = () => setSystemPrefersDark(media.matches);
     media.addEventListener("change", updatePreference);
@@ -176,9 +299,12 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }, [themeMode]);
 
   useEffect(() => {
-    if (!reminderConfirmation) return;
+    if (!reminderConfirmation && !timetableReminderRequest) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setReminderConfirmation(null);
+      if (event.key === "Escape") {
+        setReminderConfirmation(null);
+        if (!timetableReminderBusy) setTimetableReminderRequest(null);
+      }
     };
     window.addEventListener("keydown", closeOnEscape);
     const focusTimer = window.setTimeout(() => reminderCancelRef.current?.focus(), 0);
@@ -186,7 +312,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       window.removeEventListener("keydown", closeOnEscape);
       window.clearTimeout(focusTimer);
     };
-  }, [reminderConfirmation]);
+  }, [reminderConfirmation, timetableReminderRequest, timetableReminderBusy]);
 
   useEffect(() => {
     if (!themeMenuOpen) return;
@@ -591,6 +717,14 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       await saveScheduleRecord(user.uid, id, { courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd }, !editingScheduleId);
     });
     if (!saved) return;
+    const activeReminder = timetableReminders.find((item) => item.sourceType === "weekly" && item.sourceId === id);
+    if (activeReminder) {
+      try { await persistTimetableReminder({ type: "weekly", entry: { id, courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd } }, activeReminder.leadMinutes); }
+      catch (error) {
+        queueTimetableReminderSync({ action: "add", sourceType: "weekly", sourceId: id, title: name, courseCode: code, dayOfWeek: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].indexOf(scheduleDay), time: scheduleStart, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", leadMinutes: activeReminder.leadMinutes });
+        setReminderMessage(error instanceof Error ? `Schedule saved. Its notification update is queued for sync: ${error.message}` : "Schedule saved. Its notification update is queued for sync."); setNotificationsOpen(true);
+      }
+    }
     setScheduleFormOpen(false);
     setEditingScheduleId(null);
     setScheduleCode("");
@@ -621,6 +755,23 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (!request || courseDeleteBusy) return;
     setCourseDeleteBusy(true);
     try {
+      const removal = { action: "removeCourse", courseCode: request.code };
+      if (!navigator.onLine) queueTimetableReminderSync(removal);
+      else {
+        try {
+          const token = await getIdToken(user);
+          const reminderResponse = await fetch("/api/reminders/push/timetable", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(removal) });
+          if (!reminderResponse.ok) throw new Error("Could not clear timetable reminders.");
+          await removeCourseTimetableReminderPreferences(user.uid, request.code);
+        } catch {
+          queueTimetableReminderSync(removal);
+          setReminderMessage("Course deletion is saved. Its notification cleanup is queued for sync."); setNotificationsOpen(true);
+        }
+      }
+      setTimetableReminders((current) => current.filter((item) => {
+        const entry = item.sourceType === "weekly" ? schedules.find((schedule) => schedule.id === item.sourceId) : exams.find((exam) => exam.id === item.sourceId);
+        return entry?.courseCode !== request.code;
+      }));
       const saved = await persistCloudRecord(() => deleteCourseRecord(user.uid, request.code));
       if (saved) setCourseDeleteRequest(null);
     } finally {
@@ -640,6 +791,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (!request || timetableDeleteBusy) return;
     setTimetableDeleteBusy(true);
     try {
+      const hasReminder = timetableReminders.some((item) => item.sourceType === request.type && item.sourceId === request.entry.id);
+      if (hasReminder && !(await removeTimetableReminder(request, false))) return;
       const saved = await persistCloudRecord(() => request.type === "weekly"
         ? deleteScheduleRecord(user.uid, request.entry.id)
         : deleteExamRecord(user.uid, request.entry.id));
@@ -660,6 +813,14 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const id = editingExamId ?? createRecordId();
     const saved = await persistCloudRecord(() => saveExamRecord(user.uid, id, { title, courseCode, date, start, location }, !editingExamId));
     if (saved) {
+      const activeReminder = timetableReminders.find((item) => item.sourceType === "exam" && item.sourceId === id);
+      if (activeReminder) {
+        try { await persistTimetableReminder({ type: "exam", entry: { id, title, courseCode, date, start, location } }, activeReminder.leadMinutes); }
+        catch (error) {
+          queueTimetableReminderSync({ action: "add", sourceType: "exam", sourceId: id, title, courseCode, date, time: start, location, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", leadMinutes: activeReminder.leadMinutes });
+          setReminderMessage(error instanceof Error ? `Exam saved. Its notification update is queued for sync: ${error.message}` : "Exam saved. Its notification update is queued for sync."); setNotificationsOpen(true);
+        }
+      }
       setExamDraft({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
       setEditingExamId(null);
       setExamFormOpen(false);
@@ -680,6 +841,113 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setTimetableDeleteRequest({ type: "exam", entry });
   }
 
+  function openTimetableReminder(request: { type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam }) {
+    const saved = timetableReminders.find((item) => item.sourceType === request.type && item.sourceId === request.entry.id);
+    setTimetableReminderLead(saved?.leadMinutes ?? 15);
+    setTimetableReminderRequest(request);
+    setOpenCourseMenu(null);
+    setAssignmentMenuPosition(null);
+  }
+
+  async function ensureTimetablePushSubscription() {
+    const configResponse = await fetch("/api/reminders/push/config", { cache: "no-store" });
+    const config = await configResponse.json().catch(() => ({}));
+    if (!configResponse.ok || !config.configured || typeof config.publicKey !== "string") throw new Error("Background push reminders are not configured yet. Try again later.");
+    const registration = await navigator.serviceWorker.getRegistration().catch(() => undefined)
+      ?? await navigator.serviceWorker.register("/service-worker.js");
+    let subscription = await registration.pushManager.getSubscription();
+    if (subscription) {
+      const oldKey = subscription.options.applicationServerKey;
+      const newKey = base64UrlToBytes(config.publicKey);
+      if (!oldKey || new Uint8Array(oldKey).length !== newKey.length || !new Uint8Array(oldKey).every((byte, index) => byte === newKey[index])) {
+        await subscription.unsubscribe();
+        subscription = null;
+      }
+    }
+    subscription ??= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(config.publicKey) });
+    const token = await getIdToken(user);
+    const saved = await fetch("/api/reminders/push/subscribe", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ subscription: subscription.toJSON() }) });
+    if (!saved.ok) throw new Error((await saved.json().catch(() => ({}))).error || "Could not enable notifications on this device.");
+  }
+
+  async function persistTimetableReminder(request: { type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam }, leadMinutes: number) {
+    const entry = request.entry;
+    const sourceType = request.type;
+    const course = courses.find((item) => item.code === entry.courseCode);
+    const payload = {
+      action: "add",
+      sourceType,
+      sourceId: entry.id,
+      title: request.type === "exam" ? request.entry.title : course?.name ?? entry.courseCode,
+      courseCode: entry.courseCode,
+      time: entry.start,
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      leadMinutes,
+      ...(request.type === "weekly" ? { dayOfWeek: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].indexOf(request.entry.day) } : { date: request.entry.date, location: request.entry.location }),
+    };
+    const token = await getIdToken(user);
+    const response = await fetch("/api/reminders/push/timetable", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "Could not save this timetable reminder.");
+    try { await syncTimetableReminderMirror(payload); }
+    catch { queueTimetableReminderSync(payload); }
+    return payload.title;
+  }
+
+  async function confirmAddTimetableReminder() {
+    const request = timetableReminderRequest;
+    if (!request || timetableReminderBusy) return;
+    if (!navigator.onLine) { setReminderMessage("Connect to the internet to add a background timetable reminder."); setNotificationsOpen(true); return; }
+    if (typeof Notification === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setReminderMessage("This browser does not support background push reminders."); setNotificationsOpen(true); return;
+    }
+    const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const standalone = window.matchMedia?.("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+    if (isAppleMobile && !standalone) { setReminderMessage("Add CampusOS to your Home Screen in Safari, then open the installed app to enable push reminders."); setNotificationsOpen(true); return; }
+    let permission = Notification.permission;
+    if (permission === "default") permission = await Notification.requestPermission();
+    if (permission !== "granted") { setReminderMessage("Allow notifications for CampusOS to add timetable reminders."); setNotificationsOpen(true); return; }
+
+    setTimetableReminderBusy(true);
+    try {
+      await ensureTimetablePushSubscription();
+      const title = await persistTimetableReminder(request, timetableReminderLead);
+      setTimetableReminders((current) => [...current.filter((item) => item.sourceType !== request.type || item.sourceId !== request.entry.id), { sourceType: request.type, sourceId: request.entry.id, leadMinutes: timetableReminderLead }]);
+      setTimetableReminderRequest(null);
+      setReminderMessage(`Reminder set for ${title}, ${timetableReminderLead} minutes before ${request.type === "weekly" ? "class" : "the exam"}.`);
+      setNotificationsOpen(true);
+    } catch (error) {
+      setReminderMessage(error instanceof Error ? error.message : "Could not add the timetable reminder.");
+      setNotificationsOpen(true);
+    } finally { setTimetableReminderBusy(false); }
+  }
+
+  async function removeTimetableReminder(request: { type: "weekly"; entry: Schedule } | { type: "exam"; entry: Exam }, showMessage = true): Promise<boolean> {
+    const operation = { action: "remove", sourceType: request.type, sourceId: request.entry.id };
+    if (!navigator.onLine) {
+      queueTimetableReminderSync(operation);
+      setTimetableReminders((current) => current.filter((item) => item.sourceType !== request.type || item.sourceId !== request.entry.id));
+      if (showMessage) { setReminderMessage("Reminder removal is saved and will sync when you are back online."); setNotificationsOpen(true); }
+      setOpenCourseMenu(null);
+      return true;
+    }
+    try {
+      const token = await getIdToken(user);
+      const response = await fetch("/api/reminders/push/timetable", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(operation) });
+      if (!response.ok) throw new Error("Could not remove this notification reminder. Try again when connected.");
+      try { await syncTimetableReminderMirror(operation); }
+      catch { queueTimetableReminderSync(operation); }
+      setTimetableReminders((current) => current.filter((item) => item.sourceType !== request.type || item.sourceId !== request.entry.id));
+      if (showMessage) { setReminderMessage("Timetable notification reminder removed."); setNotificationsOpen(true); }
+      setOpenCourseMenu(null);
+      return true;
+    } catch (error) {
+      setReminderMessage(error instanceof Error ? error.message : "Could not remove this notification reminder.");
+      setNotificationsOpen(true);
+      return false;
+    }
+  }
+
   function removeAssignment(id: string) {
     const assignment = assignments.find((item) => item.id === id);
     if (!assignment) return;
@@ -693,6 +961,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (!request || assignmentDeleteBusy) return;
     setAssignmentDeleteBusy(true);
     try {
+      if (assignmentReminders.some((item) => item.assignmentId === request.id)) await removeAssignmentReminder(request.id, false);
       const saved = await persistCloudRecord(() => deleteAssignmentRecord(user.uid, request.id));
       if (saved) setAssignmentDeleteRequest(null);
     } finally {
@@ -703,12 +972,72 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   async function setAssignmentCompletion(id: string, completed: boolean) {
     const assignment = assignments.find((item) => item.id === id);
     if (!assignment) return;
+    if (completed && assignmentReminders.some((item) => item.assignmentId === id)) await removeAssignmentReminder(id, false);
     await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, { ...assignment, completed, studentId: assignment.studentId ?? studentMatriculationNo }, false));
+  }
+
+  async function postAssignmentReminder(operation: Record<string, unknown>) {
+    if (!navigator.onLine) throw new Error("Connect to the internet to schedule an assignment notification.");
+    const token = await getIdToken(user);
+    const response = await fetch("/api/reminders/push/assignment", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(operation) });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "Could not save the assignment reminder.");
+    try { await syncTimetableReminderMirror(operation); }
+    catch { queueTimetableReminderSync(operation); }
+  }
+
+  async function removeAssignmentReminder(assignmentId: string, showMessage = true) {
+    const operation = { action: "remove", assignmentId };
+    if (!navigator.onLine) queueTimetableReminderSync(operation);
+    else {
+      try { await postAssignmentReminder(operation); }
+      catch { queueTimetableReminderSync(operation); }
+    }
+    setAssignmentReminders((current) => current.filter((item) => item.assignmentId !== assignmentId));
+    if (showMessage) { setReminderMessage("Assignment notification reminder removed."); setNotificationsOpen(true); }
+  }
+
+  function openAssignmentReminder(assignment: Assignment) {
+    const saved = assignmentReminders.find((item) => item.assignmentId === assignment.id);
+    setAssignmentReminderDate(assignment.dueDate ?? saved?.dueDate ?? "");
+    setAssignmentReminderTime(saved?.dueTime ?? "09:00");
+    setAssignmentReminderLead(saved?.leadMinutes ?? 60);
+    setAssignmentReminderRequest(assignment);
+    setAssignmentMenuPosition(null);
+    setOpenCourseMenu(null);
+  }
+
+  async function confirmAssignmentReminder() {
+    const assignment = assignmentReminderRequest;
+    if (!assignment || assignmentReminderBusy) return;
+    if (!assignmentReminderDate) { setReminderMessage("Choose the assignment due date to schedule its reminder."); setNotificationsOpen(true); return; }
+    if (!navigator.onLine) { setReminderMessage("Connect to the internet to schedule an assignment notification."); setNotificationsOpen(true); return; }
+    if (typeof Notification === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) { setReminderMessage("This browser does not support background push reminders."); setNotificationsOpen(true); return; }
+    const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const standalone = window.matchMedia?.("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+    if (isAppleMobile && !standalone) { setReminderMessage("Add CampusOS to your Home Screen in Safari, then open the installed app to enable push reminders."); setNotificationsOpen(true); return; }
+    let permission = Notification.permission;
+    if (permission === "default") permission = await Notification.requestPermission();
+    if (permission !== "granted") { setReminderMessage("Allow notifications for CampusOS to add assignment reminders."); setNotificationsOpen(true); return; }
+
+    setAssignmentReminderBusy(true);
+    try {
+      await ensureTimetablePushSubscription();
+      const operation = { action: "add", assignmentId: assignment.id, title: assignment.title, courseCode: assignment.course, dueDate: assignmentReminderDate, dueTime: assignmentReminderTime, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", leadMinutes: assignmentReminderLead };
+      await postAssignmentReminder(operation);
+      setAssignmentReminders((current) => [...current.filter((item) => item.assignmentId !== assignment.id), { assignmentId: assignment.id, dueDate: assignmentReminderDate, dueTime: assignmentReminderTime, leadMinutes: assignmentReminderLead }]);
+      setAssignmentReminderRequest(null);
+      setReminderMessage(`Reminder set for ${assignment.title}.`);
+      setNotificationsOpen(true);
+    } catch (error) {
+      setReminderMessage(error instanceof Error ? error.message : "Could not add the assignment reminder.");
+      setNotificationsOpen(true);
+    } finally { setAssignmentReminderBusy(false); }
   }
 
   function beginEditAssignment(assignment: Assignment) {
     setEditingAssignmentId(assignment.id);
-    setAssignmentDraft({ title: assignment.title, question: assignment.description ?? assignment.question, course: assignment.course, due: assignment.due });
+    setAssignmentDraft({ title: assignment.title, question: assignment.description ?? assignment.question, course: assignment.course, due: assignment.dueDate ?? "" });
     setOpenCourseMenu(null);
   }
 
@@ -717,9 +1046,19 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     if (!editingAssignmentId || !assignmentDraft.title.trim() || !assignmentDraft.question.trim() || !assignmentDraft.due.trim()) return;
     const existing = assignments.find((item) => item.id === editingAssignmentId);
     const description = assignmentDraft.question.trim();
-    const assignment = { ...assignmentDraft, title: assignmentDraft.title.trim(), question: description, description, due: assignmentDraft.due.trim(), completed: existing?.completed ?? false, studentId: existing?.studentId ?? studentMatriculationNo, ...(existing?.createdAt !== undefined ? { createdAt: existing.createdAt } : {}) };
+    const assignment = { ...assignmentDraft, title: assignmentDraft.title.trim(), question: description, description, due: formatAssignmentDueDate(assignmentDraft.due), dueDate: assignmentDraft.due, completed: existing?.completed ?? false, studentId: existing?.studentId ?? studentMatriculationNo, ...(existing?.createdAt !== undefined ? { createdAt: existing.createdAt } : {}) };
     const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, editingAssignmentId, assignment, false));
-    if (saved) setEditingAssignmentId(null);
+    if (saved) {
+      const activeReminder = assignmentReminders.find((item) => item.assignmentId === editingAssignmentId);
+      if (activeReminder) {
+        const updatedReminder = { action: "add", assignmentId: editingAssignmentId, title: assignment.title, courseCode: assignment.course, dueDate: assignment.dueDate, dueTime: activeReminder.dueTime, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", leadMinutes: activeReminder.leadMinutes };
+        try {
+          await postAssignmentReminder(updatedReminder);
+          setAssignmentReminders((current) => current.map((item) => item.assignmentId === editingAssignmentId ? { ...item, dueDate: assignment.dueDate } : item));
+        } catch (error) { setReminderMessage(error instanceof Error ? `Assignment saved. Reminder update failed: ${error.message}` : "Assignment saved. Reminder update failed."); setNotificationsOpen(true); }
+      }
+      setEditingAssignmentId(null);
+    }
   }
 
   async function addAssignment(event: React.FormEvent<HTMLFormElement>) {
@@ -727,14 +1066,11 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
     if (!newTitle.trim() || !newDue) return;
 
-    const formattedDate = new Date(`${newDue}T12:00:00`).toLocaleDateString(
-      "en-GB",
-      { day: "numeric", month: "short" },
-    );
+    const formattedDate = formatAssignmentDueDate(newDue);
 
     const id = createRecordId();
     const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, {
-      title: newTitle.trim(), question: newQuestion.trim(), description: newQuestion.trim(), course: newCourse, due: formattedDate, completed: newAssignmentCompleted,
+      title: newTitle.trim(), question: newQuestion.trim(), description: newQuestion.trim(), course: newCourse, due: formattedDate, dueDate: newDue, completed: newAssignmentCompleted,
       studentId: studentMatriculationNo, createdAt: Date.now(),
     }, true));
     if (!saved) return;
@@ -757,6 +1093,12 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       setReminderMessage("This browser does not support notifications on this page. On iPhone or iPad, add CampusOS to your Home Screen and open the installed app to enable device notifications.");
       return;
     }
+    const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const isStandalone = window.matchMedia?.("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+    if (isAppleMobile && !isStandalone) {
+      setReminderMessage("On iPhone or iPad, first add CampusOS to your Home Screen using Safari’s Share menu, then open the installed app to enable notifications.");
+      return;
+    }
     let permission = Notification.permission;
     if (permission === "default") permission = await Notification.requestPermission();
     if (permission !== "granted") {
@@ -768,10 +1110,38 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       setReminderMessage("Device notifications are allowed. Add a pending assignment to send a reminder.");
       return;
     }
+    let registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration().catch(() => undefined) : undefined;
     try {
-      let registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration().catch(() => undefined) : undefined;
-      if (!registration && "serviceWorker" in navigator) {
-        registration = await navigator.serviceWorker.register("/service-worker.js").catch(() => undefined);
+      if (!registration && "serviceWorker" in navigator) registration = await navigator.serviceWorker.register("/service-worker.js").catch(() => undefined);
+      if (registration && "PushManager" in window && user.emailVerified) {
+        const configResponse = await fetch("/api/reminders/push/config", { cache: "no-store" });
+        const config = await configResponse.json().catch(() => ({}));
+        if (configResponse.ok && typeof config.publicKey === "string" && config.publicKey) {
+          let subscription = await registration.pushManager.getSubscription();
+          if (subscription) {
+            const existingKey = subscription.options.applicationServerKey;
+            const requestedKey = base64UrlToBytes(config.publicKey);
+            const matchesKey = existingKey && new Uint8Array(existingKey).length === requestedKey.length && new Uint8Array(existingKey).every((byte, index) => byte === requestedKey[index]);
+            if (!matchesKey) { await subscription.unsubscribe(); subscription = null; }
+          }
+          subscription ??= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(config.publicKey) });
+          const idToken = await getIdToken(user);
+          const authHeaders = { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" };
+          const subscribed = await fetch("/api/reminders/push/subscribe", { method: "POST", headers: authHeaders, body: JSON.stringify({ subscription: subscription.toJSON() }) });
+          if (!subscribed.ok) throw new Error((await subscribed.json().catch(() => ({}))).error || "Could not register this device for push reminders.");
+          const sent = await fetch("/api/reminders/push/send", { method: "POST", headers: authHeaders, body: JSON.stringify({ reminders: pending.slice(0, 20).map(({ id, title, course, due }) => ({ id, title, course, due })) }) });
+          const result = await sent.json().catch(() => ({}));
+          if (sent.ok) {
+            setReminderMessage(`Sent ${result.count} background reminder${result.count === 1 ? "" : "s"}. This device is subscribed for future push reminders.`);
+            return;
+          }
+          if (sent.status === 503 && String(result.error ?? "").includes("not configured")) {
+            for (const assignment of pending) await registration.showNotification(`Assignment reminder: ${assignment.title}`, { body: `${assignment.course} · Due ${assignment.due}`, icon: "/campusos-icon.svg", badge: "/campusos-icon.svg", tag: `assignment-${assignment.id}`, silent: !soundEnabled, data: { url: "/" } });
+            setReminderMessage("Reminders were shown on this device. Background delivery needs the push service to be configured on the CampusOS server.");
+            return;
+          }
+          throw new Error(typeof result.error === "string" ? result.error : "The push service could not deliver reminders.");
+        }
       }
       for (const assignment of pending) {
         const options = {
@@ -786,9 +1156,12 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         if (registration && "showNotification" in registration) await registration.showNotification(`Assignment reminder: ${assignment.title}`, options);
         else new Notification(`Assignment reminder: ${assignment.title}`, options);
       }
-      setReminderMessage(`${pending.length} pending assignment ${pending.length === 1 ? "reminder was" : "reminders were"} sent.`);
-    } catch {
-      setReminderMessage("The browser could not send reminders. Check notification permissions and try again.");
+      setReminderMessage(`${pending.length} pending assignment ${pending.length === 1 ? "reminder was" : "reminders were"} shown on this device. Background delivery is unavailable in this browser or is not configured yet.`);
+    } catch (error) {
+      if (registration && "showNotification" in registration && Notification.permission === "granted") {
+        for (const assignment of pending) await registration.showNotification(`Assignment reminder: ${assignment.title}`, { body: `${assignment.course} · Due ${assignment.due}`, icon: "/campusos-icon.svg", badge: "/campusos-icon.svg", tag: `assignment-${assignment.id}`, silent: !soundEnabled, data: { url: "/" } });
+        setReminderMessage("Reminders were shown on this device. Background delivery could not be reached; CampusOS will use this device again when you retry.");
+      } else setReminderMessage(error instanceof Error ? error.message : "The browser could not send reminders. Check notification permissions and try again.");
     }
   }
 
@@ -954,6 +1327,51 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 }} disabled={reminderConfirmation === "email" && (!isOnline || !user.email || !user.emailVerified || emailReminderSending)}>
                   {reminderConfirmation === "desktop" ? pendingCount ? "Send to device" : "Enable notifications" : "Send email"}
                 </button>
+              </div>
+            </section>
+          </div>
+        )}
+        {timetableReminderRequest && (
+          <div className="timetable-reminder-backdrop" onMouseDown={(event) => { if (!timetableReminderBusy && event.target === event.currentTarget) setTimetableReminderRequest(null); }}>
+            <section className="timetable-reminder-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="timetable-reminder-title" aria-describedby="timetable-reminder-description">
+              <span className="reminder-confirm-icon" aria-hidden="true">◷</span>
+              <p className="profile-kicker">TIMETABLE REMINDER</p>
+              <h2 id="timetable-reminder-title">{timetableReminders.some((item) => item.sourceType === timetableReminderRequest.type && item.sourceId === timetableReminderRequest.entry.id) ? "Update this notification reminder?" : "Add this to notification reminders?"}</h2>
+              <p id="timetable-reminder-description">{timetableReminderRequest.type === "weekly" ? <><strong>{courses.find((course) => course.code === timetableReminderRequest.entry.courseCode)?.name ?? timetableReminderRequest.entry.courseCode}</strong> · Every {timetableReminderRequest.entry.day} at {timetableReminderRequest.entry.start}</> : <><strong>{timetableReminderRequest.entry.title}</strong> · {timetableReminderRequest.entry.courseCode} · {timetableReminderRequest.entry.date} at {timetableReminderRequest.entry.start}{timetableReminderRequest.entry.location ? ` · ${timetableReminderRequest.entry.location}` : ""}</>}<br />CampusOS will send a device notification before it starts, including when the app is closed where supported.</p>
+              <label className="timetable-reminder-lead">Remind me
+                <select value={timetableReminderLead} onChange={(event) => setTimetableReminderLead(Number(event.target.value))}>
+                  <option value={5}>5 minutes before</option><option value={15}>15 minutes before</option><option value={30}>30 minutes before</option><option value={60}>1 hour before</option>
+                </select>
+              </label>
+              <div className="reminder-confirm-actions">
+                <button type="button" className="reminder-confirm-cancel" disabled={timetableReminderBusy} onClick={() => setTimetableReminderRequest(null)}>Cancel</button>
+                <button type="button" className="primary-button reminder-confirm-send" disabled={timetableReminderBusy} onClick={() => void confirmAddTimetableReminder()}>{timetableReminderBusy ? "Saving reminder…" : "Confirm reminder"}</button>
+              </div>
+            </section>
+          </div>
+        )}
+        {assignmentReminderRequest && (
+          <div className="timetable-reminder-backdrop" onMouseDown={(event) => { if (!assignmentReminderBusy && event.target === event.currentTarget) setAssignmentReminderRequest(null); }}>
+            <section className="timetable-reminder-dialog assignment-reminder-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="assignment-reminder-title" aria-describedby="assignment-reminder-description">
+              <span className="reminder-confirm-icon" aria-hidden="true">◷</span>
+              <p className="profile-kicker">ASSIGNMENT REMINDER</p>
+              <h2 id="assignment-reminder-title">{assignmentReminders.some((item) => item.assignmentId === assignmentReminderRequest.id) ? "Update this notification reminder?" : "Add this assignment to notification reminders?"}</h2>
+              <p id="assignment-reminder-description"><strong>{assignmentReminderRequest.title}</strong> · {assignmentReminderRequest.course}<br />CampusOS will send a push notification to this account’s subscribed devices before the deadline, including when the app is closed where supported.</p>
+              {!assignmentReminderRequest.dueDate && <p className="reminder-message">This assignment was saved without an exact year. Choose the correct due date to schedule its reminder.</p>}
+              <label className="timetable-reminder-lead">Assignment due date
+                <input type="date" value={assignmentReminderDate} onChange={(event) => setAssignmentReminderDate(event.target.value)} required />
+              </label>
+              <label className="timetable-reminder-lead">Due time
+                <input type="time" value={assignmentReminderTime} onChange={(event) => setAssignmentReminderTime(event.target.value)} required />
+              </label>
+              <label className="timetable-reminder-lead">Remind me
+                <select value={assignmentReminderLead} onChange={(event) => setAssignmentReminderLead(Number(event.target.value))}>
+                  <option value={15}>15 minutes before</option><option value={60}>1 hour before</option><option value={1440}>1 day before</option>
+                </select>
+              </label>
+              <div className="reminder-confirm-actions">
+                <button type="button" className="reminder-confirm-cancel" disabled={assignmentReminderBusy} onClick={() => setAssignmentReminderRequest(null)}>Cancel</button>
+                <button type="button" className="primary-button reminder-confirm-send" disabled={assignmentReminderBusy || !assignmentReminderDate} onClick={() => void confirmAssignmentReminder()}>{assignmentReminderBusy ? "Saving reminder…" : "Confirm reminder"}</button>
               </div>
             </section>
           </div>
@@ -1291,7 +1709,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <label>Assignment title<input value={assignmentDraft.title} onChange={(event) => setAssignmentDraft((current) => ({ ...current, title: event.target.value }))} required /></label>
                     <label>Assignment description<textarea value={assignmentDraft.question} onChange={(event) => setAssignmentDraft((current) => ({ ...current, question: event.target.value }))} rows={4} required /></label>
                     <label>Course<select value={assignmentDraft.course} onChange={(event) => setAssignmentDraft((current) => ({ ...current, course: event.target.value }))} required>{courses.map((course) => <option key={course.code} value={course.code}>{course.code} — {course.name}</option>)}</select></label>
-                    <label>Due date<input value={assignmentDraft.due} onChange={(event) => setAssignmentDraft((current) => ({ ...current, due: event.target.value }))} placeholder="e.g. 18 May" required /></label>
+                    <label>Due date<input type="date" value={assignmentDraft.due} onChange={(event) => setAssignmentDraft((current) => ({ ...current, due: event.target.value }))} required /></label>
                     <label>Student ID / matriculation number<input value={assignment.studentId || studentMatriculationNo} readOnly aria-readonly="true" /></label>
                     <div className="assignment-edit-actions"><button className="primary-button" type="submit">Save changes</button><button className="profile-cancel" type="button" onClick={() => setEditingAssignmentId(null)}>Cancel</button></div>
                   </form>
@@ -1305,8 +1723,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     </div>
                     <div className="assignment-status-column"><span className="assignment-deadline">Due {assignment.due}</span><label className={`assignment-status-select ${assignment.completed ? "is-complete" : ""}`}><span className="sr-only">Completion status for {assignment.title}</span><select value={assignment.completed ? "completed" : "not-completed"} onChange={(event) => void setAssignmentCompletion(assignment.id, event.target.value === "completed")}><option value="not-completed">Not completed</option><option value="completed">Completed</option></select></label></div>
                     <div className="course-menu-wrap task-menu-wrap">
-                      <button className="course-menu-button" aria-label={`Options for ${assignment.title}`} aria-expanded={openCourseMenu === `assignment-${assignment.id}`} onClick={(event) => toggleAssignmentMenu(event, assignment.id)}>⋯</button>
-                      {openCourseMenu === `assignment-${assignment.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditAssignment(assignment); }}>Edit task</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeAssignment(assignment.id); }}>Delete task</button></div>, document.body)}
+                      <button className="course-menu-button" aria-label={`Options for ${assignment.title}`} aria-expanded={openCourseMenu === `assignment-${assignment.id}`} onClick={(event) => {
+                        const hasReminder = assignmentReminders.some((item) => item.assignmentId === assignment.id);
+                        const coarse = window.matchMedia("(pointer: coarse)").matches;
+                        toggleAssignmentMenu(event, assignment.id, `assignment-${assignment.id}`, coarse ? (hasReminder ? 188 : 144) : (hasReminder ? 154 : 120));
+                      }}>⋯</button>
+                      {openCourseMenu === `assignment-${assignment.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}>
+                        <button type="button" role="menuitem" onClick={() => openAssignmentReminder(assignment)}>{assignmentReminders.some((item) => item.assignmentId === assignment.id) ? "Update notification reminder" : "Add to notification reminder"}</button>
+                        {assignmentReminders.some((item) => item.assignmentId === assignment.id) && <button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeAssignmentReminder(assignment.id); }}>Remove notification reminder</button>}
+                        <button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditAssignment(assignment); }}>Edit task</button>
+                        <button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeAssignment(assignment.id); }}>Delete task</button>
+                      </div>, document.body)}
                     </div>
                   </div>
                 ))}
@@ -1365,6 +1792,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               <div className="timetable-list">
                 {schedules.map((schedule) => {
                   const course = courses.find((item) => item.code === schedule.courseCode);
+                  const hasReminder = timetableReminders.some((item) => item.sourceType === "weekly" && item.sourceId === schedule.id);
                   return (
                     <div className="lecture-row" key={schedule.id} data-search-id={schedule.id}>
                       <span className="lecture-day">{schedule.day.slice(0, 3).toUpperCase()}</span>
@@ -1374,7 +1802,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                       </div>
                       <div className="course-menu-wrap">
                         <button className="course-menu-button" aria-label={`Options for ${schedule.courseCode} schedule`} aria-expanded={openCourseMenu === `schedule-${schedule.id}`} onClick={() => setOpenCourseMenu((current) => current === `schedule-${schedule.id}` ? null : `schedule-${schedule.id}`)}>⋯</button>
-                        {openCourseMenu === `schedule-${schedule.id}` && <div className="course-menu"><button onClick={() => beginEditSchedule(schedule)}>Edit schedule</button><button onClick={() => void removeSchedule(schedule.id)}>Delete schedule</button><button onClick={() => beginEditCourse(schedule.courseCode)}>Edit course</button><button onClick={() => void removeCourse(schedule.courseCode)}>Delete course</button></div>}
+                        {openCourseMenu === `schedule-${schedule.id}` && <div className="course-menu"><button onClick={() => openTimetableReminder({ type: "weekly", entry: schedule })}>{hasReminder ? "Edit notification reminder" : "Add to notification reminder"}</button>{hasReminder && <button onClick={() => void removeTimetableReminder({ type: "weekly", entry: schedule })}>Remove notification reminder</button>}<button onClick={() => beginEditSchedule(schedule)}>Edit schedule</button><button onClick={() => void removeSchedule(schedule.id)}>Delete schedule</button><button onClick={() => beginEditCourse(schedule.courseCode)}>Edit course</button><button onClick={() => void removeCourse(schedule.courseCode)}>Delete course</button></div>}
                       </div>
                     </div>
                   );
@@ -1403,14 +1831,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               <div className="exam-list">
                 {[...exams].sort((a, b) => `${a.date}T${a.start}`.localeCompare(`${b.date}T${b.start}`)).map((exam) => {
                   const examDate = new Date(`${exam.date}T00:00:00`);
+                  const hasReminder = timetableReminders.some((item) => item.sourceType === "exam" && item.sourceId === exam.id);
                   const daysAway = Math.ceil((examDate.getTime() - new Date(new Date().toDateString()).getTime()) / 86400000);
                   const dateLabel = Number.isNaN(examDate.getTime()) ? exam.date : examDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
                   return <article className="exam-row" key={exam.id} data-search-id={exam.id}>
                     <div className="exam-date-tile"><strong>{Number.isNaN(examDate.getTime()) ? "—" : examDate.getDate()}</strong><span>{Number.isNaN(examDate.getTime()) ? "" : examDate.toLocaleDateString("en-GB", { month: "short" })}</span></div>
                     <div className="exam-info"><strong>{exam.title}</strong><span>{exam.courseCode} · {dateLabel} · {exam.start}</span><span className="exam-location">{exam.location}</span></div>
                     <span className={`exam-countdown ${daysAway < 0 ? "exam-past" : ""}`}>{daysAway < 0 ? "Past" : daysAway === 0 ? "Today" : daysAway === 1 ? "Tomorrow" : `${daysAway} days`}</span>
-                    <div className="course-menu-wrap task-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={(event) => toggleAssignmentMenu(event, exam.id, `exam-${exam.id}`, window.matchMedia("(pointer: coarse)").matches ? 196 : 170)}>⋯</button>
-                      {openCourseMenu === `exam-${exam.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditExam(exam); }}>Edit schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeExam(exam.id); }}>Delete schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditCourse(exam.courseCode); }}>Edit course</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeCourse(exam.courseCode); }}>Delete course</button></div>, document.body)}
+                    <div className="course-menu-wrap task-menu-wrap"><button className="course-menu-button" aria-label={`Options for ${exam.title}`} aria-expanded={openCourseMenu === `exam-${exam.id}`} onClick={(event) => toggleAssignmentMenu(event, exam.id, `exam-${exam.id}`, window.matchMedia("(pointer: coarse)").matches ? (hasReminder ? 280 : 240) : (hasReminder ? 248 : 208))}>⋯</button>
+                      {openCourseMenu === `exam-${exam.id}` && assignmentMenuPosition && createPortal(<div className="course-menu task-menu task-menu-portal" role="menu" style={assignmentMenuPosition}><button type="button" role="menuitem" onClick={() => openTimetableReminder({ type: "exam", entry: exam })}>{hasReminder ? "Edit notification reminder" : "Add to notification reminder"}</button>{hasReminder && <button type="button" role="menuitem" onClick={() => void removeTimetableReminder({ type: "exam", entry: exam })}>Remove notification reminder</button>}<button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditExam(exam); }}>Edit schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeExam(exam.id); }}>Delete schedule</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); beginEditCourse(exam.courseCode); }}>Edit course</button><button type="button" role="menuitem" onClick={() => { setAssignmentMenuPosition(null); void removeCourse(exam.courseCode); }}>Delete course</button></div>, document.body)}
                     </div>
                   </article>;
                 })}

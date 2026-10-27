@@ -20,6 +20,30 @@ self.addEventListener("notificationclick", (event) => {
   }));
 });
 
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data?.json() ?? {};
+  } catch {
+    payload = { body: event.data?.text() ?? "You have a CampusOS reminder." };
+  }
+  const title = typeof payload.title === "string" ? payload.title : "CampusOS reminder";
+  const options = {
+    body: typeof payload.body === "string" ? payload.body : "Open CampusOS to review your reminders.",
+    icon: "/campusos-icon.svg",
+    badge: "/campusos-icon.svg",
+    tag: typeof payload.tag === "string" ? payload.tag : "campusos-reminder",
+    renotify: false,
+    data: { url: typeof payload.url === "string" && payload.url.startsWith("/") ? payload.url : "/" },
+  };
+  event.waitUntil(Promise.all([
+    self.registration.showNotification(title, options),
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) client.postMessage({ type: "campusos:refresh" });
+    }),
+  ]));
+});
+
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
