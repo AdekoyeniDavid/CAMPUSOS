@@ -8,6 +8,9 @@ import {
   setPersistence,
   browserLocalPersistence,
   browserSessionPersistence,
+  applyActionCode,
+  verifyPasswordResetCode,
+  confirmPasswordReset,
   getIdToken,
   reload,
   signOut,
@@ -239,6 +242,119 @@ export function AuthScreen({ initialError = "" }: { initialError?: string }) {
 
 export { readableAuthError };
 
+
+/** Completes Firebase email verification on the app's own domain. */
+export function EmailActionScreen() {
+  const [mode, setMode] = useState("");
+  const [status, setStatus] = useState<"working" | "reset-ready" | "success" | "error">("working");
+  const [message, setMessage] = useState("Opening your secure account link…");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const actionCode = useRef("");
+  const actionStarted = useRef(false);
+
+  useEffect(() => {
+    if (actionStarted.current) return;
+    actionStarted.current = true;
+
+    const url = new URL(window.location.href);
+    const actionMode = url.searchParams.get("mode") ?? "";
+    const oobCode = url.searchParams.get("oobCode") ?? "";
+    const auth = firebaseAuth;
+    // Remove one-time credentials from the address bar and browser history immediately.
+    url.searchParams.delete("oobCode");
+    url.searchParams.delete("apiKey");
+    url.searchParams.delete("mode");
+    url.searchParams.delete("continueUrl");
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+
+    setMode(actionMode);
+    actionCode.current = oobCode;
+    if (!actionCode.current || !auth) {
+      setStatus("error");
+      setMessage("This account link is incomplete or unavailable. Request a new email and open its latest link.");
+      return;
+    }
+
+    const runAction = async () => {
+      if (actionMode === "resetPassword") {
+        const address = await verifyPasswordResetCode(auth, actionCode.current);
+        setEmail(address);
+        setStatus("reset-ready");
+        setMessage("Choose a new password for your CampusOS account.");
+        return;
+      }
+      if (!["verifyEmail", "recoverEmail", "verifyAndChangeEmail"].includes(actionMode)) {
+        throw new Error("unsupported-action");
+      }
+      await applyActionCode(auth, actionCode.current);
+      setStatus("success");
+      setMessage(actionMode === "verifyEmail"
+        ? "Your email is verified. Continue to CampusOS and sign in to open your account."
+        : actionMode === "recoverEmail"
+          ? "Your previous email address has been restored. Continue to CampusOS to sign in."
+          : "Your email address has been updated. Continue to CampusOS to sign in.");
+    };
+    void runAction().catch((error: unknown) => {
+      const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+      setStatus("error");
+      setMessage(code.includes("expired-action-code") || code.includes("invalid-action-code")
+        ? "This account link has expired or was already used. Request a new email and open the latest link."
+        : "We couldn’t complete this account link. Check your connection and try again.");
+    });
+  }, []);
+
+  async function saveNewPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!firebaseAuth || password.length < 8 || password !== confirmPassword) {
+      setMessage(password !== confirmPassword ? "The passwords do not match." : "Choose a password with at least 8 characters.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await confirmPasswordReset(firebaseAuth, actionCode.current, password);
+      setStatus("success");
+      setMessage("Your password has been changed. Continue to CampusOS and sign in with the new password.");
+      setPassword("");
+      setConfirmPassword("");
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+      setStatus("error");
+      setMessage(code.includes("expired-action-code") || code.includes("invalid-action-code")
+        ? "This password reset link has expired or was already used. Request a new password reset email."
+        : "We couldn’t change the password. Check the requirements and try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const heading = mode === "resetPassword" ? "Reset your password"
+    : mode === "recoverEmail" ? "Restore your email"
+      : mode === "verifyAndChangeEmail" ? "Update your email"
+        : status === "success" ? "Email verified"
+          : status === "error" ? "Account link issue" : "Verifying your email";
+
+  return <main className="auth-screen">
+    <div className="auth-brand"><span className="brand-icon">C</span><span>Campus<span className="brand-light">OS</span></span></div>
+    <section className="auth-card liquid-glass" aria-live="polite">
+      <p className="profile-kicker">CAMPUSOS ACCOUNT</p>
+      <h1>{heading}</h1>
+      {status !== "reset-ready" && <p className={status === "error" ? "auth-error" : "auth-notice"} role={status === "error" ? "alert" : "status"}>{message}</p>}
+      {status === "reset-ready" && <>
+        <p className="auth-subtitle">Resetting password for <strong>{email}</strong>.</p>
+        <form className="auth-form" onSubmit={(event) => void saveNewPassword(event)}>
+          <label>New password<input type="password" autoComplete="new-password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} required disabled={busy} /></label>
+          <label>Confirm new password<input type="password" autoComplete="new-password" minLength={8} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required disabled={busy} /></label>
+          <p className="auth-notice" role="status">{message}</p>
+          <button className="primary-button auth-submit" type="submit" disabled={busy}>{busy ? "Updating password…" : "Save new password"}</button>
+        </form>
+      </>}
+      {(status === "success" || status === "error") && <button className="primary-button auth-submit" onClick={() => window.location.replace("/")}>Continue to CampusOS</button>}
+    </section>
+  </main>;
+}
 
 export function VerificationScreen({ user, onVerified }: { user: User; onVerified: (uid: string) => void }) {
   const [message, setMessage] = useState(() => readStoredValue(pendingVerificationStorageKey) === "pending" ? "Sending a verification link to your email…" : "");

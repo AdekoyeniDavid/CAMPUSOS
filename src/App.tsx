@@ -35,6 +35,7 @@ const ProfilePanel = lazy(() => import("./ProfilePanel").then((module) => ({ def
 const StudyTools = lazy(() => import("./StudyTools").then((module) => ({ default: module.StudyTools })));
 const AuthScreen = lazy(() => import("./AuthScreen").then((module) => ({ default: module.AuthScreen })));
 const VerificationScreen = lazy(() => import("./AuthScreen").then((module) => ({ default: module.VerificationScreen })));
+const EmailActionScreen = lazy(() => import("./AuthScreen").then((module) => ({ default: module.EmailActionScreen })));
 
 type Course = {
   code: string;
@@ -2025,6 +2026,9 @@ function App() {
     });
   }, []);
 
+  const emailActionMode = new URLSearchParams(window.location.search).get("mode");
+  const isEmailAction = ["verifyEmail", "resetPassword", "recoverEmail", "verifyAndChangeEmail"].includes(emailActionMode ?? "");
+  if (isEmailAction) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening secure account link…</section></main>}><EmailActionScreen /></Suspense>;
   if (!authReady) return <main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Checking your secure session…</section></main>;
   if (authError) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening sign in…</section></main>}><AuthScreen initialError={authError} /></Suspense>;
   if (!user) return <Suspense fallback={<main className="auth-screen"><section className="auth-card liquid-glass auth-loading">Opening sign in…</section></main>}><AuthScreen /></Suspense>;

@@ -2117,6 +2117,89 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .content-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* Authentication and email-action screens share a compact, viewport-safe layout. */
+.auth-screen {
+  min-height: 100vh;
+  min-height: 100svh;
+  min-height: 100dvh;
+  align-content: center;
+  padding-top: max(88px, calc(72px + env(safe-area-inset-top)));
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+}
+
+.auth-card {
+  width: min(100%, 28rem);
+  padding: clamp(20px, 4vw, 34px);
+  border-radius: clamp(18px, 3vw, 26px);
+}
+
+.auth-card h1 {
+  font-size: clamp(22px, 4vw, 28px);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.auth-subtitle,
+.auth-notice,
+.auth-error {
+  overflow-wrap: anywhere;
+}
+
+.auth-form input {
+  min-height: 46px;
+  font-size: 16px;
+}
+
+.auth-submit {
+  min-height: 48px;
+}
+
+.auth-links button,
+.verification-links button {
+  min-height: 44px;
+}
+
+@media (max-width: 600px) {
+  .auth-screen {
+    justify-items: center;
+    padding-right: max(14px, env(safe-area-inset-right));
+    padding-left: max(14px, env(safe-area-inset-left));
+  }
+
+  .auth-brand {
+    top: calc(14px + env(safe-area-inset-top));
+    left: max(14px, env(safe-area-inset-left));
+  }
+
+  .auth-card {
+    width: min(100%, 30rem);
+  }
+}
+
+@media (max-width: 360px) {
+  .auth-screen {
+    padding-right: max(10px, env(safe-area-inset-right));
+    padding-left: max(10px, env(safe-area-inset-left));
+  }
+
+  .auth-card { padding: 19px 16px; }
+  .auth-links { gap: 4px; }
+}
+
+@media (max-height: 560px) {
+  .auth-screen {
+    align-content: start;
+    padding-top: max(70px, calc(60px + env(safe-area-inset-top)));
+  }
+
+  .auth-brand { top: calc(10px + env(safe-area-inset-top)); }
+  .auth-card { animation: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-card { animation: none; }
+}
+
 /* Shared responsive guardrails for phone, tablet, desktop, and installed PWA layouts. */
 .app-shell {
   min-height: 100vh;
