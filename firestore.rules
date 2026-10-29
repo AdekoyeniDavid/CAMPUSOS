@@ -70,14 +70,18 @@ service cloud.firestore {
 
     function validCourse() {
       return request.resource.data.keys().hasOnly([
-          'code', 'name', 'color', 'createdAt', 'updatedAt'
+          'code', 'name', 'color', 'creditUnits', 'createdAt', 'updatedAt'
         ])
         && request.resource.data.code is string
         && request.resource.data.code.size() > 0
         && request.resource.data.code.size() <= 32
         && request.resource.data.name is string
         && request.resource.data.name.size() > 0
-        && request.resource.data.name.size() <= 160;
+        && request.resource.data.name.size() <= 160
+        && (!request.resource.data.keys().hasAny(['creditUnits'])
+          || (request.resource.data.creditUnits is int
+            && request.resource.data.creditUnits >= 1
+            && request.resource.data.creditUnits <= 5));
     }
 
     function validAssignment(assignmentId) {

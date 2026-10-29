@@ -41,6 +41,7 @@ type Course = {
   code: string;
   name: string;
   color: string;
+  creditUnits?: number;
 };
 
 type Schedule = {
@@ -201,12 +202,31 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [showCourseForm, setShowCourseForm] = useState(false);
   const [newCourseCode, setNewCourseCode] = useState("");
   const [newCourseName, setNewCourseName] = useState("");
+  const [newCourseCreditUnits, setNewCourseCreditUnits] = useState(1);
+  const [showCourseCredits, setShowCourseCredits] = useState(false);
+  const courseCreditPickerRef = useRef<HTMLDivElement>(null);
   const [showForm, setShowForm] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newQuestion, setNewQuestion] = useState("");
   const [newCourse, setNewCourse] = useState("COS 102");
   const [newDue, setNewDue] = useState("");
   const [newAssignmentCompleted, setNewAssignmentCompleted] = useState(false);
+
+  useEffect(() => {
+    if (!showCourseCredits) return;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (event.target instanceof Node && !courseCreditPickerRef.current?.contains(event.target)) setShowCourseCredits(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowCourseCredits(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePress);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showCourseCredits]);
 
   useEffect(() => {
     let active = true;
@@ -726,13 +746,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const code = newCourseCode.trim().toUpperCase();
     const name = newCourseName.trim();
     if (!code || !name || courses.some((course) => course.code === code && course.code !== editingCourseCode)) return;
-    const course = { code, name, color: "leather" };
+    const course = { code, name, color: "leather", creditUnits: newCourseCreditUnits };
     const saved = await persistCloudRecord(() => editingCourseCode
       ? renameCourseRecord(user.uid, editingCourseCode, code, course)
       : saveCourseRecord(user.uid, code, course));
     if (!saved) return;
     setNewCourseCode("");
     setNewCourseName("");
+    setNewCourseCreditUnits(1);
+    setShowCourseCredits(false);
     setEditingCourseCode(null);
     setShowCourseForm(false);
   }
@@ -753,6 +775,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingCourseCode(null);
     setNewCourseCode("");
     setNewCourseName("");
+    setNewCourseCreditUnits(1);
+    setShowCourseCredits(false);
     setShowCourseForm(true);
   }
 
@@ -762,6 +786,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingCourseCode(course?.code ?? null);
     setNewCourseCode(course?.code ?? normalizedCode);
     setNewCourseName(course?.name ?? normalizedCode);
+    setNewCourseCreditUnits(course?.creditUnits ?? 1);
+    setShowCourseCredits(false);
     setShowCourseForm(true);
     setActivePage("My Courses");
     setOpenCourseMenu(null);
@@ -1771,6 +1797,18 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 <form className="assignment-form course-form" onSubmit={saveCourse}>
                   <label>Course code<input value={newCourseCode} onChange={(event) => setNewCourseCode(event.target.value)} placeholder="e.g. BIO 104" required /></label>
                   <label>Course name<input value={newCourseName} onChange={(event) => setNewCourseName(event.target.value)} placeholder="e.g. Introductory Biology" required /></label>
+                  <div className="course-credit-field" ref={courseCreditPickerRef}>
+                    <span>Course credit units</span>
+                    <button type="button" className="course-credit-trigger liquid-glass" aria-haspopup="dialog" aria-expanded={showCourseCredits} onClick={() => setShowCourseCredits((open) => !open)}>
+                      <span>{newCourseCreditUnits} {newCourseCreditUnits === 1 ? "credit unit" : "credit units"}</span><span aria-hidden="true">⌄</span>
+                    </button>
+                    {showCourseCredits && <div className="course-credit-popover liquid-glass" role="dialog" aria-label="Select course credit units">
+                      <strong>Select course credits</strong>
+                      <div className="course-credit-options" role="group" aria-label="Credit units from 1 to 5">
+                        {[1, 2, 3, 4, 5].map((units) => <button key={units} type="button" className={newCourseCreditUnits === units ? "selected" : ""} aria-pressed={newCourseCreditUnits === units} onClick={() => { setNewCourseCreditUnits(units); setShowCourseCredits(false); }}><strong>{units}</strong><span>{units === 1 ? "unit" : "units"}</span></button>)}
+                      </div>
+                    </div>}
+                  </div>
                   <button className="primary-button" type="submit">{editingCourseCode ? "Save changes" : "Save course"}</button>
                   {newCourseCode.trim() && courses.some((course) => course.code === newCourseCode.trim().toUpperCase() && course.code !== editingCourseCode) && <p className="form-error">A course with this code already exists.</p>}
                 </form>
@@ -1801,6 +1839,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     </div>
                     <h3>{course.name}</h3>
                     <p>{course.code}</p>
+                    <span className="course-credit-badge">{course.creditUnits ? `${course.creditUnits} ${course.creditUnits === 1 ? "credit" : "credits"}` : "Credits not set"}</span>
                   </article>
                 ))}
               </div>

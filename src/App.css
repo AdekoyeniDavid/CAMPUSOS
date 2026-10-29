@@ -2200,6 +2200,166 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .auth-card { animation: none; }
 }
 
+/* Course credits use a responsive glass picker that remains usable on touch screens. */
+.course-credit-field {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+  color: #53566d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.course-credit-trigger {
+  display: flex;
+  width: 100%;
+  min-height: 46px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 13px;
+  border-radius: 12px;
+  color: #735438;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.course-credit-popover {
+  position: absolute;
+  z-index: 26;
+  top: calc(100% + 9px);
+  left: 0;
+  width: min(330px, calc(100vw - 40px));
+  padding: 15px;
+  border-radius: 18px;
+  animation: glassDrop .25s cubic-bezier(.2,.8,.2,1) both;
+}
+
+.course-credit-popover > strong {
+  display: block;
+  margin: 0 0 11px;
+  color: #353950;
+  font-size: 13px;
+}
+
+.course-credit-options {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.course-credit-options button {
+  display: grid;
+  min-width: 0;
+  min-height: 58px;
+  align-content: center;
+  justify-items: center;
+  gap: 2px;
+  padding: 6px 3px;
+  border: 1px solid rgba(255,255,255,.76);
+  border-radius: 13px;
+  background: rgba(255,255,255,.46);
+  color: #735438;
+  cursor: pointer;
+  transition: transform .18s ease, background .18s ease, box-shadow .18s ease;
+}
+
+.course-credit-options button strong { font-size: 17px; }
+.course-credit-options button span { font-size: 9px; }
+.course-credit-options button:hover { transform: translateY(-2px); }
+.course-credit-options button.selected { background: rgba(232,214,191,.78); border-color: rgba(185,149,112,.48); box-shadow: inset 0 1px rgba(255,255,255,.82), 0 5px 14px rgba(115,84,56,.1); }
+
+.course-credit-badge {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  margin-top: 6px;
+  padding: 5px 9px;
+  border: 1px solid rgba(185,149,112,.22);
+  border-radius: 999px;
+  background: rgba(232,214,191,.38);
+  color: #735438;
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.app-shell[data-theme="dark"] .course-credit-field,
+.app-shell[data-theme="dark"] .course-credit-popover > strong { color: #eee9e2; }
+.app-shell[data-theme="dark"] .course-credit-trigger,
+.app-shell[data-theme="dark"] .course-credit-options button { color: #e8c9a6; }
+.app-shell[data-theme="dark"] .course-credit-options button { background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.12); }
+.app-shell[data-theme="dark"] .course-credit-options button.selected { background: rgba(185,149,112,.24); border-color: rgba(210,174,137,.36); }
+.app-shell[data-theme="dark"] .course-credit-badge { color: #e8c9a6; background: rgba(185,149,112,.16); border-color: rgba(210,174,137,.2); }
+
+@media (max-width: 700px) {
+  .course-credit-popover { width: min(100%, 330px); }
+  .course-credit-options button { min-height: 54px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .course-credit-popover,
+  .course-credit-options button { animation: none; transition: none; }
+}
+
+/* Keep course entry and credit controls balanced from narrow phones to wide displays. */
+.course-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 255px), 1fr));
+}
+
+.course-form {
+  grid-template-columns: minmax(140px, .8fr) minmax(200px, 1.35fr) minmax(160px, .85fr) auto;
+  align-items: end;
+}
+
+.course-form .primary-button {
+  min-height: 46px;
+  align-self: end;
+  white-space: nowrap;
+}
+
+.course-form .form-error {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.course-credit-field :focus-visible,
+.course-credit-options button:focus-visible {
+  outline: 3px solid #b99570;
+  outline-offset: 2px;
+}
+
+@media (min-width: 1200px) {
+  .course-form { gap: 18px; }
+  .course-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr)); }
+}
+
+@media (min-width: 701px) and (max-width: 980px) {
+  .course-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .course-form .primary-button { justify-self: start; }
+}
+
+@media (max-width: 700px) {
+  .course-form { grid-template-columns: minmax(0, 1fr); }
+  .course-form .primary-button { width: 100%; justify-self: stretch; }
+  .course-credit-popover { max-width: calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right)); }
+}
+
+@media (pointer: coarse) {
+  .course-credit-trigger { min-height: 48px; }
+  .course-credit-options button { min-height: 48px; }
+}
+
+@media (max-width: 340px) {
+  .course-credit-popover { padding: 11px; border-radius: 15px; }
+  .course-credit-options { gap: 4px; }
+  .course-credit-options button { border-radius: 10px; }
+  .course-credit-options button span { font-size: 8px; }
+}
+
 /* Shared responsive guardrails for phone, tablet, desktop, and installed PWA layouts. */
 .app-shell {
   min-height: 100vh;

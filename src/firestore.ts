@@ -5,7 +5,7 @@ import { deleteLocalRecord, listLocalRecords, replaceWithRemoteRecords, saveLoca
 import { watchWithReconnect } from "./reconnect";
 
 export type StudentSection = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress";
-export type CourseRecord = { code: string; name: string; color: string };
+export type CourseRecord = { code: string; name: string; color: string; creditUnits?: number };
 export type AssignmentRecord = { title: string; question: string; description?: string; course: string; due: string; dueDate?: string; completed: boolean; studentId?: string; createdAt?: number | string | { seconds?: number }; updatedAt?: number | string | { seconds?: number } };
 export type ScheduleRecord = { courseCode: string; day: string; start: string; end: string };
 export type ExamRecord = { title: string; courseCode: string; date: string; start: string; location: string };

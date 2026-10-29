@@ -4,7 +4,7 @@ import { firebaseConfigured } from "./firebase";
 import { saveStudentSection } from "./firestore";
 import { watchLocalRecords } from "./offlineStore";
 
-type CourseSummary = { code: string; name: string };
+type CourseSummary = { code: string; name: string; creditUnits?: number };
 type SectionId = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress" | "security";
 type Values = Record<string, string>;
 type ProfileData = Record<Exclude<SectionId, "security">, Values>;
@@ -13,7 +13,7 @@ type Field = { key: string; label: string; type?: "text" | "email" | "date" | "t
 
 function registeredCoursesText(courses: CourseSummary[]) {
   return courses.length
-    ? courses.map((course) => `${course.code} — ${course.name} · credit units not provided`).join("\n")
+    ? courses.map((course) => `${course.code} — ${course.name} · ${course.creditUnits ? `${course.creditUnits} ${course.creditUnits === 1 ? "credit unit" : "credit units"}` : "credit units not provided"}`).join("\n")
     : "No courses registered yet.";
 }
 
