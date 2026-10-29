@@ -2360,6 +2360,67 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .course-credit-options button span { font-size: 8px; }
 }
 
+/* Backup and recovery controls adapt to device width and touch input. */
+.backup-card {
+  min-width: 0;
+  align-items: flex-start;
+  gap: clamp(12px, 2vw, 20px);
+  padding: clamp(14px, 2vw, 24px);
+}
+
+.backup-card > div:last-child {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.backup-card p { max-width: 78ch; }
+.backup-file-label { width: min(100%, 460px); }
+.backup-file-label input { width: 100%; min-width: 0; }
+.restore-confirm { width: 100%; min-width: 0; }
+.restore-confirm-warning { min-width: 0; }
+.restore-confirm-warning :is(button, p) { min-width: 0; overflow-wrap: anywhere; }
+
+@media (min-width: 1100px) {
+  .backup-card { gap: 20px; padding: 24px 28px; }
+  .backup-download-actions { margin-top: 14px; }
+}
+
+@media (max-width: 600px) {
+  .backup-card { flex-direction: column; gap: 10px; padding: 16px; }
+  .backup-symbol { width: 40px; height: 40px; border-radius: 13px; }
+  .backup-download-actions { align-items: stretch; }
+  .backup-download-actions button { width: 100%; min-height: 46px; }
+  .backup-file-label { display: grid; width: 100%; gap: 8px; margin-top: 8px; }
+  .backup-file-label input { min-height: 44px; font-size: 16px; }
+  .restore-confirm { align-items: stretch; }
+  .restore-confirm > :is(button, .profile-cancel) { width: 100%; min-height: 44px; }
+  .restore-confirm-warning { grid-template-columns: minmax(0, 1fr); }
+  .restore-confirm-warning p { grid-column: 1; }
+  .restore-confirm-warning button { width: 100%; min-height: 44px; }
+  .backup-format-note { font-size: 11px; }
+}
+
+@media (max-width: 360px) {
+  .backup-card { padding: 13px; border-radius: 16px; }
+  .backup-card h3 { font-size: 13px; }
+  .backup-card p { font-size: 11px; }
+  .backup-file-label input { font-size: 16px; }
+  .restore-confirm-warning { padding: 9px; }
+}
+
+@media (pointer: coarse) {
+  .backup-download-actions button,
+  .backup-file-label input,
+  .restore-confirm button { min-height: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .backup-card,
+  .restore-confirm-warning { animation: none; }
+}
+
 /* Shared responsive guardrails for phone, tablet, desktop, and installed PWA layouts. */
 .app-shell {
   min-height: 100vh;

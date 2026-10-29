@@ -4,7 +4,7 @@ import { firebaseConfigured } from "./firebase";
 import { createRecordId } from "./browser";
 import { saveStudyRecord } from "./firestore";
 import { deleteLocalAttachment, getLocalAttachment, listLocalRecords, pendingWriteCount, restoreLocalRecords, saveLocalAttachment, syncPendingWrites, watchLocalRecords } from "./offlineStore";
-import { recordsFromBackup, studyCollectionNames, validateBackup } from "./backup";
+import { parseBackupFile, recordsFromBackup, studyCollectionNames } from "./backup";
 import type { Backup } from "./backup";
 import { createBackupPdf } from "./backupPdf";
 
@@ -322,8 +322,8 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     setBackupMessage("Preparing your PDF backup from this device…");
     try {
       const backup = await collectBackup();
-      downloadBlob(createBackupPdf(backup), `campusos-backup-${new Date().toISOString().slice(0, 10)}.pdf`);
-      setBackupMessage("PDF backup downloaded.");
+      downloadBlob(await createBackupPdf(backup), `campusos-backup-${new Date().toISOString().slice(0, 10)}.pdf`);
+      setBackupMessage("Restorable PDF backup downloaded.");
     } catch (error) { setBackupMessage(error instanceof Error ? error.message : "The backup could not be created. Check your connection and try again."); }
   }
 
@@ -331,10 +331,8 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     const file = event.target.files?.[0]; event.target.value = "";
     if (!file) return;
     setBackupMessage(""); setRestoreData(null);
-    if (file.size > 10_000_000) { setBackupMessage("This backup is larger than 10 MB and cannot be restored here."); return; }
     try {
-      const parsed: unknown = JSON.parse(await file.text());
-      if (!validateBackup(parsed, studentUid)) throw new Error("Choose a valid CampusOS backup made for this signed-in account.");
+      const parsed = await parseBackupFile(file, studentUid);
       setRestoreData(parsed); setBackupMessage(`Backup ready: ${recordsFromBackup(parsed).length} saved records can be restored.`);
     } catch (error) { setBackupMessage(error instanceof Error ? error.message : "This backup file could not be read."); }
   }
@@ -396,8 +394,8 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
 
     {page === "Backup & Recovery" && <section className="panel study-panel">
       <div className="section-heading"><div><h2>Backup &amp; recovery</h2><p>Download a portable copy or restore a backup to your cloud account.</p></div><span className="study-count-pill">Your account only</span></div>
-      <div className="backup-card liquid-glass"><div className="backup-symbol">⇩</div><div><h3>Download your academic data</h3><p>Get a readable PDF of your profile, courses, assignments, timetable, exams, notes, resources, and grades. Attached file contents remain on this device.</p><div className="backup-download-actions"><button className="primary-button" type="button" onClick={() => void downloadBackup()}>Download PDF</button></div><small className="backup-format-note">PDF is formatted for viewing and printing.</small></div></div>
-      <div className="backup-card liquid-glass"><div className="backup-symbol recovery">↥</div><div><h3>Recover from a backup</h3><p>Choose a CampusOS backup for this signed-in account. Restoring merges saved information; it does not remove current records.</p><label className="backup-file-label">Choose backup file<input type="file" accept="application/json,.json" onChange={(event) => void readBackup(event)} /></label>{restoreData && <div className="restore-confirm"><span>Ready to restore the backup for this account.</span><button className="primary-button" type="button" disabled={restoringBusy} onClick={() => setRestoring(true)}>{restoringBusy ? "Restoring…" : "Restore backup"}</button><button className="profile-cancel" type="button" onClick={() => { setRestoreData(null); setRestoring(false); }}>Cancel</button>{restoring && <div className="restore-confirm-warning"><p>Confirm recovery? Saved profile and academic records will be merged from this file.</p><button type="button" className="primary-button" disabled={restoringBusy} onClick={() => void restoreBackup()}>Confirm recovery</button><button type="button" className="profile-cancel" onClick={() => setRestoring(false)}>Go back</button></div>}</div>}</div></div>
+      <div className="backup-card liquid-glass"><div className="backup-symbol">⇩</div><div><h3>Download your academic data</h3><p>Get a readable, restorable PDF of your profile, courses, assignments, timetable, exams, notes, resources, and grades. Attached file contents remain on this device.</p><div className="backup-download-actions"><button className="primary-button" type="button" onClick={() => void downloadBackup()}>Download PDF</button></div><small className="backup-format-note">Use the original downloaded PDF in CampusOS recovery. Keep it private; it contains your academic information.</small></div></div>
+      <div className="backup-card liquid-glass"><div className="backup-symbol recovery">↥</div><div><h3>Recover from a backup</h3><p>Choose a CampusOS PDF or JSON backup for this signed-in account. Restoring merges saved information; records with matching IDs are updated and other current records are kept.</p><label className="backup-file-label">Choose PDF or JSON backup<input type="file" accept="application/pdf,.pdf,application/json,.json" onChange={(event) => void readBackup(event)} /></label><small className="backup-format-note">Older report-only PDFs do not include recovery data. Download a new PDF backup from this version to make it restorable.</small>{restoreData && <div className="restore-confirm"><span>Ready to restore the backup for this account.</span><button className="primary-button" type="button" disabled={restoringBusy} onClick={() => setRestoring(true)}>{restoringBusy ? "Restoring…" : "Restore backup"}</button><button className="profile-cancel" type="button" onClick={() => { setRestoreData(null); setRestoring(false); }}>Cancel</button>{restoring && <div className="restore-confirm-warning"><p>Confirm recovery? Records with matching IDs will be updated. Other current records will remain.</p><button type="button" className="primary-button" disabled={restoringBusy} onClick={() => void restoreBackup()}>Confirm recovery</button><button type="button" className="profile-cancel" onClick={() => setRestoring(false)}>Go back</button></div>}</div>}</div></div>
       {backupMessage && <p className="study-feedback" role="status">{backupMessage}</p>}
       <p className="study-footnote">Backups contain private academic information. Keep downloaded files in a secure location and do not share them.</p>
     </section>}

@@ -1,5 +1,6 @@
 import type { Backup } from "./backup.ts";
 import { createGlassReportPdf, type PdfReportSection } from "./pdfExport.ts";
+import { makeRestorablePdf } from "./backup.ts";
 
 const sectionNames: Record<string, string> = {
   profile: "Student profile",
@@ -57,7 +58,7 @@ function rowsFromCollection(records: Array<{ id: string; data: Record<string, un
   });
 }
 
-export function createBackupPdf(backup: Backup) {
+export async function createBackupPdf(backup: Backup) {
   const sections: PdfReportSection[] = [{
     title: "Account summary",
     rows: [
@@ -82,5 +83,6 @@ export function createBackupPdf(backup: Backup) {
   for (const name of ["courses", "assignments", "schedules", "exams"] as const) {
     sections.push({ title: collectionNames[name], rows: rowsFromCollection(backup.collections[name]) });
   }
-  return createGlassReportPdf("CampusOS Academic Backup", "Private student data | account backup", `Created ${backup.createdAt}   |   Keep this file secure`, sections);
+  const report = createGlassReportPdf("CampusOS Academic Backup", "Private student data | account backup", `Created ${backup.createdAt}   |   Keep this file secure`, sections);
+  return makeRestorablePdf(report, backup);
 }

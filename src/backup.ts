@@ -11,6 +11,9 @@ export type Backup = {
 };
 
 export const studyCollectionNames: BackupCollection[] = ["courses", "assignments", "schedules", "exams"];
+const pdfBackupStart = "%CampusOSBackupV1Begin";
+const pdfBackupEnd = "%CampusOSBackupV1End";
+const pdfBackupChunkPrefix = "%CampusOSBackupData:";
 const studentSections = ["profile", "institution", "personal", "contact", "academic", "enrolment", "courses", "progress"];
 const forbiddenKeys = new Set(["__proto__", "prototype", "constructor"]);
 
@@ -57,6 +60,76 @@ export function validateBackup(value: unknown, uid: string): value is Backup {
     }
   }
   try { return new TextEncoder().encode(JSON.stringify(value)).byteLength <= 9_500_000; } catch { return false; }
+}
+
+function encodeBase64(bytes: Uint8Array) {
+  const chunks: string[] = [];
+  // Keep each chunk divisible by three so joining encoded chunks preserves base64 padding.
+  const chunkSize = 24_576;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+    let binary = "";
+    for (let index = 0; index < chunk.length; index++) binary += String.fromCharCode(chunk[index]);
+    chunks.push(btoa(binary));
+  }
+  return chunks.join("");
+}
+
+function decodeBase64(value: string) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return new TextDecoder().decode(bytes);
+}
+
+async function sha256Hex(value: string) {
+  if (!globalThis.crypto?.subtle) return "";
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Attach a machine-readable, checksummed copy as PDF comments after %%EOF. */
+export async function makeRestorablePdf(pdf: Blob, backup: Backup) {
+  const json = JSON.stringify(backup);
+  const bytes = new TextEncoder().encode(json);
+  const payload = encodeBase64(bytes);
+  const checksum = await sha256Hex(json);
+  const dataLines = payload.match(/.{1,3000}/g) ?? [];
+  const metadata = [
+    pdfBackupStart,
+    `%CampusOSBackupSha256:${checksum || "unavailable"}`,
+    ...dataLines.map((line) => `${pdfBackupChunkPrefix}${line}`),
+    pdfBackupEnd,
+  ].join("\n");
+  return new Blob([pdf, "\n", metadata, "\n"], { type: "application/pdf" });
+}
+
+/** Read a JSON backup or a CampusOS PDF that contains its structured recovery payload. */
+export async function parseBackupFile(file: File, uid: string): Promise<Backup> {
+  if (file.size > 30_000_000) throw new Error("This backup is larger than 30 MB and cannot be restored here.");
+  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  let parsed: unknown;
+  if (isPdf) {
+    const content = await file.text();
+    const start = content.lastIndexOf(pdfBackupStart);
+    const end = content.indexOf(pdfBackupEnd, start);
+    if (start < 0 || end < 0) {
+      throw new Error("This PDF is a readable report without recovery data. Download a new PDF backup from CampusOS to make it restorable.");
+    }
+    const metadata = content.slice(start, end);
+    const checksum = metadata.match(/^%CampusOSBackupSha256:([a-f0-9]{64}|unavailable)$/m)?.[1];
+    const payload = Array.from(metadata.matchAll(/^%CampusOSBackupData:([A-Za-z0-9+/=]+)$/gm), (match) => match[1]).join("");
+    if (!checksum || !payload || payload.length > 20_000_000) throw new Error("The recovery data in this PDF is incomplete or too large to read.");
+    const json = decodeBase64(payload);
+    if (checksum !== "unavailable" && await sha256Hex(json) !== checksum) {
+      throw new Error("The recovery data in this PDF failed its integrity check. Choose another backup file.");
+    }
+    parsed = JSON.parse(json);
+  } else {
+    parsed = JSON.parse(await file.text());
+  }
+  if (!validateBackup(parsed, uid)) throw new Error("Choose a valid CampusOS backup made for this signed-in account.");
+  return parsed;
 }
 
 export function recordsFromBackup(backup: Backup): LocalRestoreRecord[] {
