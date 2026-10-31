@@ -2,28 +2,32 @@ import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { firebaseConfigured } from "./firebase";
 import { createRecordId } from "./browser";
-import { saveStudyRecord } from "./firestore";
+import { saveStudyRecord, studyRecordId } from "./firestore";
 import { deleteLocalAttachment, getLocalAttachment, listLocalRecords, pendingWriteCount, restoreLocalRecords, saveLocalAttachment, syncPendingWrites, watchLocalRecords } from "./offlineStore";
 import { parseBackupFile, recordsFromBackup, studyCollectionNames } from "./backup";
 import type { Backup } from "./backup";
 import { createBackupPdf } from "./backupPdf";
 
 type StudyAttachment = { id: string; name: string; size: number; type: string };
-type Note = { id: string; title: string; category: string; content: string; resourceUrl: string; attachment?: StudyAttachment };
+type Note = { id: string; title: string; category: string; content: string; resourceUrl: string; courseCode?: string; attachment?: StudyAttachment };
 type AttachmentDeleteRequest = { attachment: StudyAttachment; source: "draft" } | { attachment: StudyAttachment; source: "saved" | "note"; noteId: string };
 type Grade = { id: string; course: string; credits: number; letter: string; term: string };
-const categories = ["Lecture notes", "Reading", "Research", "Resource link", "Other"];
+type StudyCourse = { code: string; name: string };
+const categories = ["Lecture notes", "Course outline", "Reading", "Research", "Resource link", "Other"];
 const gradePoints: Record<string, number> = { A: 5, B: 4, C: 3, D: 2, E: 1, F: 0 };
-const emptyNote = { title: "", category: categories[0], content: "", resourceUrl: "" };
+const emptyNote = { title: "", category: categories[0], content: "", resourceUrl: "", courseCode: "" };
 
-export function StudyTools({ page, studentUid, connected, online, syncPending, cloudMessage, recordCounts, searchTargetId }: {
+export function StudyTools({ page, studentUid, currentAcademicSession, currentAcademicSemester, connected, online, syncPending, cloudMessage, recordCounts, courses, searchTargetId }: {
   page: string;
   studentUid: string;
+  currentAcademicSession: string;
+  currentAcademicSemester: string;
   connected: boolean;
   online: boolean;
   syncPending: boolean;
   cloudMessage: string;
   recordCounts: Record<string, number>;
+  courses: StudyCourse[];
   searchTargetId?: string | null;
 }) {
   const [notes, setNotes] = useState<Note[]>([]);
@@ -39,6 +43,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
   const [gradeDeleteRequest, setGradeDeleteRequest] = useState<Grade | null>(null);
   const [gradeDeleteBusy, setGradeDeleteBusy] = useState(false);
   const [noteFilter, setNoteFilter] = useState("All materials");
+  const [courseFilter, setCourseFilter] = useState("All courses");
   const [search, setSearch] = useState("");
   const [gradeDraft, setGradeDraft] = useState({ course: "", credits: "", letter: "A", term: "" });
   const [databaseError, setDatabaseError] = useState("");
@@ -50,16 +55,29 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
   const [restoringBusy, setRestoringBusy] = useState(false);
 
   useEffect(() => {
+    setForm(emptyNote);
+    setEditingNoteId(null);
+    setDraftAttachment(null);
+    setAttachmentFile(null);
+    setGradeDraft({ course: "", credits: "", letter: "A", term: "" });
+  }, [studentUid, currentAcademicSession, currentAcademicSemester]);
+
+  useEffect(() => {
     const localUnsubscribe = watchLocalRecords(studentUid, "studentSections", (records) => {
-      const notesRecord = records.find((item) => item.id === "studyNotes");
-      const gradesRecord = records.find((item) => item.id === "gradeRecords");
+      const validPeriod = /^\d{4}\/\d{4}$/.test(currentAcademicSession) && ["First semester", "Second semester", "Extended semester"].includes(currentAcademicSemester);
+      const notesId = validPeriod ? studyRecordId("studyNotes", currentAcademicSession, currentAcademicSemester) : "__no_current_academic_period__";
+      const gradesId = validPeriod ? studyRecordId("gradeRecords", currentAcademicSession, currentAcademicSemester) : "__no_current_academic_period__";
+      const notesRecord = records.find((item) => item.id === notesId);
+      const gradesRecord = records.find((item) => item.id === gradesId);
       if (Array.isArray(notesRecord?.["value"])) setNotes(notesRecord["value"] as Note[]);
+      else setNotes([]);
       if (Array.isArray(gradesRecord?.["value"])) setGrades(gradesRecord["value"] as Grade[]);
+      else setGrades([]);
     });
     if (!firebaseConfigured) { setDatabaseError("Firebase is not configured. Study records are available only on this device."); return localUnsubscribe; }
     setDatabaseError("");
     return localUnsubscribe;
-  }, [studentUid]);
+  }, [studentUid, currentAcademicSession, currentAcademicSemester]);
 
   useEffect(() => {
     if (!studySavePending) return;
@@ -101,6 +119,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     if (page !== "Notes & Resources" || !searchTargetId) return;
     setSearch("");
     setNoteFilter("All materials");
+    setCourseFilter("All courses");
     const timer = window.setTimeout(() => {
       const target = Array.from(document.querySelectorAll<HTMLElement>(".study-note[data-search-id]"))
         .find((element) => element.dataset.searchId === searchTargetId);
@@ -119,6 +138,15 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     const pointsTotal = grades.reduce((sum, item) => sum + (gradePoints[item.letter] ?? 0) * item.credits, 0);
     return { value: creditTotal ? (pointsTotal / creditTotal).toFixed(2) : "0.00", credits: creditTotal, points: pointsTotal };
   }, [grades]);
+  const courseByCode = useMemo(() => new Map(courses.map((course) => [course.code, course])), [courses]);
+  const materialCountByCourse = useMemo(() => notes.reduce((counts, note) => {
+    if (note.courseCode) counts.set(note.courseCode, (counts.get(note.courseCode) ?? 0) + 1);
+    return counts;
+  }, new Map<string, number>()), [notes]);
+  const linkedCourseCodes = useMemo(() => Array.from(new Set([...courses.map((course) => course.code), ...notes.flatMap((note) => note.courseCode ? [note.courseCode] : [])])).sort(), [courses, notes]);
+  const matchingNotes = useMemo(() => notes.filter((note) => (noteFilter === "All materials" || note.category === noteFilter)
+    && (courseFilter === "All courses" || (courseFilter === "Unassigned" ? !note.courseCode : note.courseCode === courseFilter))
+    && `${note.title} ${note.content} ${note.category} ${note.courseCode ?? ""}`.toLowerCase().includes(search.toLowerCase())), [notes, noteFilter, courseFilter, search]);
 
   async function saveNotes(next: Note[]) {
     if (new Blob([JSON.stringify(next)]).size > 400_000) throw new Error("Your study notes are over the safe per-account storage limit. Remove large attachments and try again.");
@@ -130,8 +158,11 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
   }
 
   async function queueStudyRecord(field: "studyNotes" | "gradeRecords", value: unknown[]) {
+    if (!/^\d{4}\/\d{4}$/.test(currentAcademicSession) || !["First semester", "Second semester", "Extended semester"].includes(currentAcademicSemester)) {
+      throw new Error("Set a current academic year and semester in Student Account → Academic Details before saving study records.");
+    }
     setStudySavePending(true);
-    await saveStudyRecord(studentUid, field, value);
+    await saveStudyRecord(studentUid, field, value, currentAcademicSession, currentAcademicSemester);
     setSaveMessage("Saved on this device. Firestore sync will retry automatically.");
     const pending = await pendingWriteCount(studentUid, "studentSections");
     if (pending === 0) {
@@ -160,7 +191,8 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
         await saveLocalAttachment(studentUid, draftAttachment.id, attachmentFile);
         attachmentStored = true;
       }
-      const nextNote: Note = { id: noteId, ...form, ...(draftAttachment ? { attachment: draftAttachment } : {}) };
+      const { courseCode, ...noteFields } = form;
+      const nextNote: Note = { id: noteId, ...noteFields, ...(courseCode ? { courseCode } : {}), ...(draftAttachment ? { attachment: draftAttachment } : {}) };
       const next = editingNoteId ? notes.map((item) => item.id === editingNoteId ? nextNote : item) : [nextNote, ...notes];
       try { await saveNotes(next); }
       catch (error) {
@@ -257,7 +289,7 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
 
   async function addGrade(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const grade: Grade = { id: createRecordId(), course: gradeDraft.course.trim(), credits: Number(gradeDraft.credits), letter: gradeDraft.letter, term: gradeDraft.term.trim() };
+    const grade: Grade = { id: createRecordId(), course: gradeDraft.course.trim(), credits: Number(gradeDraft.credits), letter: gradeDraft.letter, term: gradeDraft.term.trim() || `${currentAcademicSession} · ${currentAcademicSemester}` };
     if (!grade.course || !Number.isFinite(grade.credits) || grade.credits <= 0 || grade.credits > 50) return;
     try { const next = [grade, ...grades]; await saveGrades(next); setGrades(next); setGradeDraft({ course: "", credits: "", letter: "A", term: "" }); setDatabaseError(""); }
     catch { setStudySavePending(false); setDatabaseError("The grade record could not be saved locally. Check available device storage and try again."); }
@@ -349,8 +381,18 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     finally { setRestoringBusy(false); }
   }
 
-  const matchingNotes = notes.filter((note) => (noteFilter === "All materials" || note.category === noteFilter)
-    && `${note.title} ${note.content} ${note.category}`.toLowerCase().includes(search.toLowerCase()));
+  function startCourseMaterial(course: StudyCourse) {
+    setForm({ ...emptyNote, courseCode: course.code });
+    setEditingNoteId(null);
+    setDraftAttachment(null);
+    setAttachmentFile(null);
+    setDatabaseError("");
+    requestAnimationFrame(() => {
+      const formElement = document.querySelector<HTMLFormElement>(".study-form-notes");
+      formElement?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+      formElement?.querySelector<HTMLInputElement>("[name='study-material-title']")?.focus({ preventScroll: true });
+    });
+  }
 
   return <section className="study-tools-page">
     {gradeDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!gradeDeleteBusy && event.target === event.currentTarget) setGradeDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="grade-delete-title" aria-describedby="grade-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">GRADE RECORD REMOVAL</p><h2 id="grade-delete-title">Delete this grade?</h2><p id="grade-delete-description">Remove the <strong>{gradeDeleteRequest.course}</strong> record ({gradeDeleteRequest.letter}, {gradeDeleteRequest.credits} credit {gradeDeleteRequest.credits === 1 ? "unit" : "units"}) from your grade calculator? This cannot be undone.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={gradeDeleteBusy} onClick={() => setGradeDeleteRequest(null)}>Keep grade</button><button type="button" className="attachment-delete-confirm" disabled={gradeDeleteBusy} onClick={() => void confirmGradeDelete()}>{gradeDeleteBusy ? "Deleting…" : "Delete grade"}</button></div></section></div>}
@@ -359,21 +401,31 @@ export function StudyTools({ page, studentUid, connected, online, syncPending, c
     {databaseError && <p className="study-feedback study-error" role="alert">{databaseError}</p>}
     {saveMessage && <p className="study-feedback" role="status">{saveMessage}</p>}
     {page === "Notes & Resources" && <section className="panel study-panel">
-      <div className="section-heading"><div><h2>Study materials</h2><p>Save notes, links, and readings in your private Firestore account.</p></div><span className="study-count-pill">{notes.length} saved</span></div>
-      <form className="assignment-form study-form" onSubmit={(event) => void submitNote(event)}>
-        <label>Title<input value={form.title} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} placeholder="e.g. Week 3 lecture notes" maxLength={120} required /></label>
+      <div className="section-heading"><div><h2>Study materials</h2><p>Courses from My Courses sync here automatically. Add an outline, notes, links, or documents for each course.</p></div><span className="study-count-pill">{notes.length} saved</span></div>
+      <div className="study-period-banner liquid-glass"><span>Current academic period</span><strong>{currentAcademicSession} · {currentAcademicSemester}</strong></div>
+      <section className="course-material-library liquid-glass" aria-label="Registered courses and materials">
+        <div className="course-material-library-heading"><div><h3>Your registered courses</h3><p>Choose a course to add its outline or study material.</p></div><span>{courses.length} courses</span></div>
+        {courses.length ? <div className="course-material-course-grid">{courses.map((course) => {
+          const courseMaterialCount = materialCountByCourse.get(course.code) ?? 0;
+          return <article className="course-material-course liquid-glass" key={course.code}><div><strong>{course.code}</strong><span>{course.name}</span></div><small>{courseMaterialCount} {courseMaterialCount === 1 ? "material" : "materials"}</small><button type="button" className="course-material-add" onClick={() => startCourseMaterial(course)}>＋ Add materials</button></article>;
+        })}</div> : <p className="course-material-empty">Add courses in My Courses and they will appear here automatically.</p>}
+      </section>
+      <form className="assignment-form study-form study-form-notes" onSubmit={(event) => void submitNote(event)}>
+        <label>Title<input name="study-material-title" value={form.title} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} placeholder="e.g. Week 3 lecture notes" maxLength={120} required /></label>
+        <label>Course<select value={form.courseCode} onChange={(event) => setForm((current) => ({ ...current, courseCode: event.target.value }))}><option value="">Not linked to a course</option>{courses.map((course) => <option key={course.code} value={course.code}>{course.code} · {course.name}</option>)}{form.courseCode && !courses.some((course) => course.code === form.courseCode) && <option value={form.courseCode}>{form.courseCode} · previously linked</option>}</select></label>
         <label>Organize as<select value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))}>{categories.map((category) => <option key={category}>{category}</option>)}</select></label>
         <label className="study-wide">Notes or resource description<textarea value={form.content} onChange={(event) => setForm((current) => ({ ...current, content: event.target.value }))} placeholder="Write a summary, key concepts, or study instructions…" rows={4} maxLength={15000} /></label>
         <label className="study-wide">Resource link (optional)<input type="url" value={form.resourceUrl} onChange={(event) => setForm((current) => ({ ...current, resourceUrl: event.target.value }))} placeholder="https://…" maxLength={1000} /></label>
         <div className="study-attachment-field study-wide"><span>Document attachment <small>PDF or document · up to 20 MB · saved on this device</small></span><label className="study-attachment-picker liquid-glass"><span aria-hidden="true">↥</span>{draftAttachment ? "Replace document" : "Upload PDF or document"}<input type="file" accept=".pdf,.doc,.docx,.odt,.rtf,.txt,.pages,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={selectStudyAttachment} aria-label="Upload a PDF or document" /></label>{draftAttachment && <div className="study-attachment-preview liquid-glass"><span aria-hidden="true">▤</span><span className="study-attachment-name">{draftAttachment.name}<small>{(draftAttachment.size / (1024 * 1024)).toFixed(2)} MB · saved when you save this material</small></span><button type="button" className="study-action destructive" aria-label="Remove attached document" onClick={() => setAttachmentDeleteRequest({ source: "draft", attachment: draftAttachment })}>Remove</button></div>}</div>
         <div className="study-form-actions"><button className="primary-button" type="submit">{editingNoteId ? "Save changes" : "Save material"}</button>{editingNoteId && <button type="button" className="profile-cancel" onClick={() => { setEditingNoteId(null); setForm(emptyNote); setDraftAttachment(null); setAttachmentFile(null); }}>Cancel</button>}</div>
       </form>
-      <div className="study-filter-row"><input aria-label="Search study materials" placeholder="Search materials…" value={search} onChange={(event) => setSearch(event.target.value)} /><select aria-label="Filter materials by category" value={noteFilter} onChange={(event) => setNoteFilter(event.target.value)}><option>All materials</option>{categories.map((category) => <option key={category}>{category}</option>)}</select></div>
-      <div className="study-note-list">{matchingNotes.map((note) => <article className="study-note liquid-glass" key={note.id} data-search-id={note.id}><div className="study-note-top"><span className="study-category">{note.category}</span><div><button type="button" className="study-action" onClick={() => { setForm({ title: note.title, category: note.category, content: note.content, resourceUrl: note.resourceUrl }); setDraftAttachment(note.attachment ?? null); setAttachmentFile(null); setEditingNoteId(note.id); }}>Edit</button><button type="button" className="study-action destructive" onClick={() => void removeNote(note.id)}>Delete</button></div></div><h3>{note.title}</h3>{note.content && <p>{note.content}</p>}{note.resourceUrl && <a href={note.resourceUrl} target="_blank" rel="noreferrer">Open resource ↗</a>}{note.attachment && <div className="study-attached-document-row"><button type="button" className="study-attached-document liquid-glass" onClick={() => void downloadStudyAttachment(note.attachment!)}><span aria-hidden="true">▤</span><span>{note.attachment.name}<small>Download · {(note.attachment.size / (1024 * 1024)).toFixed(2)} MB</small></span><span aria-hidden="true">↓</span></button><button type="button" className="study-action destructive study-attachment-delete" onClick={() => setAttachmentDeleteRequest({ source: "saved", noteId: note.id, attachment: note.attachment! })}>Delete document</button></div>}</article>)}{matchingNotes.length === 0 && <p className="empty-state">No materials match. Add a note or resource to start organizing your study library.</p>}</div>
+      <div className="study-filter-row"><input aria-label="Search study materials" placeholder="Search materials…" value={search} onChange={(event) => setSearch(event.target.value)} /><select aria-label="Filter materials by category" value={noteFilter} onChange={(event) => setNoteFilter(event.target.value)}><option>All materials</option>{categories.map((category) => <option key={category}>{category}</option>)}</select><select aria-label="Filter materials by course" value={courseFilter} onChange={(event) => setCourseFilter(event.target.value)}><option>All courses</option><option>Unassigned</option>{linkedCourseCodes.map((code) => <option key={code} value={code}>{code}{!courses.some((course) => course.code === code) ? " · previous course" : ""}</option>)}</select></div>
+      <div className="study-note-list">{matchingNotes.map((note) => { const linkedCourse = note.courseCode ? courseByCode.get(note.courseCode) : undefined; return <article className="study-note liquid-glass" key={note.id} data-search-id={note.id}><div className="study-note-top"><span className="study-category">{note.category}</span><div><button type="button" className="study-action" onClick={() => { setForm({ title: note.title, category: note.category, content: note.content, resourceUrl: note.resourceUrl, courseCode: note.courseCode ?? "" }); setDraftAttachment(note.attachment ?? null); setAttachmentFile(null); setEditingNoteId(note.id); }}>Edit</button><button type="button" className="study-action destructive" onClick={() => void removeNote(note.id)}>Delete</button></div></div>{note.courseCode && <span className="study-course-tag">{linkedCourse?.code ?? note.courseCode}{linkedCourse?.name ? ` · ${linkedCourse.name}` : ""}</span>}<h3>{note.title}</h3>{note.content && <p>{note.content}</p>}{note.resourceUrl && <a href={note.resourceUrl} target="_blank" rel="noreferrer">Open resource ↗</a>}{note.attachment && <div className="study-attached-document-row"><button type="button" className="study-attached-document liquid-glass" onClick={() => void downloadStudyAttachment(note.attachment!)}><span aria-hidden="true">▤</span><span>{note.attachment.name}<small>Download · {(note.attachment.size / (1024 * 1024)).toFixed(2)} MB</small></span><span aria-hidden="true">↓</span></button><button type="button" className="study-action destructive study-attachment-delete" onClick={() => setAttachmentDeleteRequest({ source: "saved", noteId: note.id, attachment: note.attachment! })}>Delete document</button></div>}</article>; })}{matchingNotes.length === 0 && <p className="empty-state">No materials match. Add a note or resource to start organizing your study library.</p>}</div>
     </section>}
 
     {page === "Grade Calculator" && <section className="panel study-panel">
       <div className="section-heading"><div><h2>CGPA calculator</h2><p>Track course grades using a 5.0 scale (A=5, B=4, C=3, D=2, E=1, F=0).</p></div><span className="study-count-pill">{grades.length} courses</span></div>
+      <div className="study-period-banner liquid-glass"><span>Current academic period</span><strong>{currentAcademicSession} · {currentAcademicSemester}</strong></div>
       <div className="cgpa-summary liquid-glass"><div><span>Current CGPA</span><strong>{cgpa.value}</strong><small>out of 5.00</small></div><div><span>Credits counted</span><strong>{cgpa.credits}</strong><small>weighted credit units</small></div><div><span>Quality points</span><strong>{cgpa.points.toFixed(1)}</strong><small>grade points × credits</small></div></div>
       <form className="assignment-form study-form grade-form" onSubmit={(event) => void addGrade(event)}>
         <label>Course<input value={gradeDraft.course} onChange={(event) => setGradeDraft((current) => ({ ...current, course: event.target.value }))} placeholder="Course code or title" maxLength={120} required /></label>

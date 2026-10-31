@@ -17,6 +17,7 @@ const retryDelayMs = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const initialRetryDelayMs = 750;
 const maxRetryDelayMs = 10_000;
+const maxConcurrentRecordWrites = 4;
 const localChangeChannel = (() => {
   if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") return undefined;
   try { return new BroadcastChannel("campusos-local-record-changes-v1"); } catch { return undefined; }
@@ -43,6 +44,17 @@ function openDatabase(): Promise<StoreDatabase> {
 function makeKey(uid: string, collection: OfflineCollection, id: string) { return `${uid}/${collection}/${id}`; }
 function makeAttachmentKey(uid: string, id: string) { return `${uid}/attachments/${id}`; }
 function watcherKey(uid: string, collection: OfflineCollection) { return `${uid}/${collection}`; }
+
+function syncConcurrencyForDevice() {
+  if (typeof navigator === "undefined") return 1;
+  const deviceNavigator = navigator as Navigator & { connection?: { effectiveType?: string; saveData?: boolean; rtt?: number } };
+  const network = deviceNavigator.connection;
+  const cores = navigator.hardwareConcurrency || 4;
+  const connectionType = network?.effectiveType ?? "";
+  if (network?.saveData || cores <= 2 || connectionType === "slow-2g" || connectionType === "2g") return 1;
+  if (cores <= 4 || connectionType === "3g" || (network?.rtt ?? 0) > 500) return 2;
+  return maxConcurrentRecordWrites;
+}
 
 export async function saveLocalAttachment(uid: string, id: string, file: Blob) {
   if (!uid || !id || id.includes("/") || file.size <= 0) throw new Error("This document cannot be saved.");
@@ -232,6 +244,46 @@ export async function pendingWriteCount(uid: string, collection?: OfflineCollect
     .filter((item) => item.uid === uid && (!collection || item.collection === collection)).length;
 }
 
+async function writePendingItem(uid: string, item: PendingWrite, db: NonNullable<Awaited<ReturnType<typeof getFirestoreDb>>>) {
+  const { deleteDoc, deleteField, doc, serverTimestamp, setDoc } = await import("firebase/firestore");
+  const ref = item.collection === "studentSections"
+    ? doc(db, "students", uid)
+    : doc(db, "students", uid, item.collection, item.id);
+  if (item.collection === "studentSections") {
+    const scopedStudyPeriod = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})__(first-semester|second-semester|extended-semester)$/.exec(item.id);
+    const scopedStudyYear = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})$/.exec(item.id);
+    if (item.deleted && (item.id === "studyNotes" || item.id === "gradeRecords")) {
+      await setDoc(ref, { progress: { [item.id]: deleteField() }, updatedAt: serverTimestamp() }, { merge: true });
+    } else if (scopedStudyPeriod && item.deleted) {
+      await setDoc(ref, { progress: { academicSessions: { [scopedStudyPeriod[2]]: { [scopedStudyPeriod[3]]: { [scopedStudyPeriod[1]]: deleteField() } } } }, updatedAt: serverTimestamp() }, { merge: true });
+    } else if (scopedStudyPeriod) {
+      await setDoc(ref, { progress: { academicSessions: { [scopedStudyPeriod[2]]: { [scopedStudyPeriod[3]]: { [scopedStudyPeriod[1]]: item.data.value } } } }, updatedAt: serverTimestamp() }, { merge: true });
+    } else if (scopedStudyYear && item.deleted) {
+      await setDoc(ref, { progress: { academicSessions: { [scopedStudyYear[2]]: { [scopedStudyYear[1]]: deleteField() } } }, updatedAt: serverTimestamp() }, { merge: true });
+    } else if (scopedStudyYear) {
+      await setDoc(ref, { progress: { academicSessions: { [scopedStudyYear[2]]: { [scopedStudyYear[1]]: item.data.value } } }, updatedAt: serverTimestamp() }, { merge: true });
+    } else if (item.id === "studyNotes" || item.id === "gradeRecords") {
+      await setDoc(ref, { progress: { [item.id]: item.data.value }, updatedAt: serverTimestamp() }, { merge: true });
+    } else if (!item.deleted) {
+      await setDoc(ref, { [item.id]: item.data, updatedAt: serverTimestamp() }, { merge: true });
+    }
+  } else if (item.deleted) await deleteDoc(ref);
+  else await setDoc(ref, item.data, { merge: true });
+
+  const database = await openDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const tx = database.transaction(outboxStore, "readwrite");
+    const store = tx.objectStore(outboxStore);
+    const request = store.get(item.key);
+    request.onsuccess = () => {
+      if ((request.result as PendingWrite | undefined)?.token === item.token) store.delete(item.key);
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
 export async function syncPendingWrites(uid: string) {
   if (!navigator.onLine) return;
   if (flushRunning.has(uid)) return;
@@ -242,41 +294,42 @@ export async function syncPendingWrites(uid: string) {
   try {
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firestore is not available yet.");
-    const { deleteDoc, doc, serverTimestamp, setDoc } = await import("firebase/firestore");
     const queue = (await readAll<PendingWrite>(outboxStore)).filter((item) => item.uid === uid).sort((a, b) => a.queuedAt - b.queuedAt);
-    for (const item of queue) {
-      if (!navigator.onLine) break;
-      const ref = item.collection === "studentSections"
-        ? doc(db, "students", uid)
-        : doc(db, "students", uid, item.collection, item.id);
-      try {
-        if (item.collection === "studentSections") {
-          if (item.id === "studyNotes" || item.id === "gradeRecords") {
-            await setDoc(ref, { progress: { [item.id]: item.data.value }, updatedAt: serverTimestamp() }, { merge: true });
-          } else if (!item.deleted) {
-            await setDoc(ref, { [item.id]: item.data, updatedAt: serverTimestamp() }, { merge: true });
+    const sectionWrites = queue.filter((item) => item.collection === "studentSections");
+    const recordWrites = queue.filter((item) => item.collection !== "studentSections");
+    let nextRecord = 0;
+    const recordWorker = async () => {
+      while (navigator.onLine) {
+        const index = nextRecord++;
+        if (index >= recordWrites.length) return;
+        try { await writePendingItem(uid, recordWrites[index], db); }
+        catch (error) {
+          failed = true;
+          if (!failureCode && error && typeof error === "object" && "code" in error) {
+            const code = (error as { code?: unknown }).code;
+            if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
           }
-        } else if (item.deleted) await deleteDoc(ref);
-        else await setDoc(ref, item.data, { merge: true });
-        const database = await openDatabase();
-        await new Promise<void>((resolve, reject) => {
-          const tx = database.transaction(outboxStore, "readwrite");
-          const store = tx.objectStore(outboxStore);
-          const request = store.get(item.key);
-          request.onsuccess = () => {
-            if ((request.result as PendingWrite | undefined)?.token === item.token) store.delete(item.key);
-          };
-          tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
-        });
-      } catch (error) {
-        failed = true;
-        if (error && typeof error === "object" && "code" in error) {
-          const code = (error as { code?: unknown }).code;
-          if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
         }
-        break;
       }
-    }
+    };
+    const sectionWorker = async () => {
+      // All student-section data shares one Firestore document, so preserve its write order.
+      for (const item of sectionWrites) {
+        if (!navigator.onLine) return;
+        try { await writePendingItem(uid, item, db); }
+        catch (error) {
+          failed = true;
+          if (!failureCode && error && typeof error === "object" && "code" in error) {
+            const code = (error as { code?: unknown }).code;
+            if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
+          }
+        }
+      }
+    };
+    await Promise.all([
+      ...Array.from({ length: Math.min(syncConcurrencyForDevice(), recordWrites.length) }, () => recordWorker()),
+      sectionWorker(),
+    ]);
   } catch (error) {
     failed = true;
     if (error && typeof error === "object" && "code" in error) {

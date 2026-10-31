@@ -8,6 +8,7 @@ type CourseSummary = { code: string; name: string; creditUnits?: number };
 type SectionId = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress" | "security";
 type Values = Record<string, string>;
 type ProfileData = Record<Exclude<SectionId, "security">, Values>;
+type AcademicSessionRecord = { id: string; year: string; semester: string; createdAt: number };
 
 type Field = { key: string; label: string; type?: "text" | "email" | "date" | "tel" | "textarea" | "select"; options?: string[] };
 
@@ -51,6 +52,7 @@ const genderOptions = ["Male", "Female", "Rather not say"];
 const levelOptions = ["100 level", "200 level", "300 level", "400 level", "500 level"];
 const enrolmentOptions = ["Not admitted", "Admission in progress", "Admitted"];
 const standingOptions = ["Courses not yet approved", "Courses have been approved"];
+const semesterOptions = ["First semester", "Second semester", "Extended semester"];
 const notProvided = "Not provided";
 
 const sectionFields: Array<{ id: Exclude<SectionId, "security">; title: string; fields: Field[] }> = [
@@ -58,7 +60,7 @@ const sectionFields: Array<{ id: Exclude<SectionId, "security">; title: string; 
   { id: "institution", title: "Institution Details", fields: [{ key: "name", label: "Institution name" }] },
   { id: "personal", title: "Personal Details", fields: [{ key: "dateOfBirth", label: "Date of birth", type: "date" }, { key: "gender", label: "Gender", type: "select", options: genderOptions }, { key: "genderDescription", label: "Exact gender (optional)" }, { key: "nationality", label: "Nationality", type: "select", options: countryOptions }] },
   { id: "contact", title: "Contact Details", fields: [{ key: "email", label: "Email", type: "email" }, { key: "phone", label: "Phone number", type: "tel" }, { key: "address", label: "Residential address", type: "textarea" }] },
-  { id: "academic", title: "Academic Details", fields: [{ key: "department", label: "College/Faculty" }, { key: "programme", label: "Programme" }, { key: "level", label: "Level", type: "select", options: levelOptions }, { key: "session", label: "Academic session" }, { key: "semester", label: "Semester", type: "select", options: ["First semester", "Second semester", "Extended semester"] }, { key: "programStart", label: "Program start date", type: "date" }, { key: "programEnd", label: "Expected program end date", type: "date" }] },
+  { id: "academic", title: "Academic Details", fields: [{ key: "department", label: "College/Faculty" }, { key: "programme", label: "Programme" }, { key: "level", label: "Level", type: "select", options: levelOptions }, { key: "programStart", label: "Program start date", type: "date" }, { key: "programEnd", label: "Expected program end date", type: "date" }] },
   { id: "enrolment", title: "Enrolment", fields: [{ key: "admissionDate", label: "Admission date", type: "date" }, { key: "status", label: "Enrolment status", type: "select", options: enrolmentOptions }] },
   { id: "courses", title: "Courses", fields: [{ key: "registeredCourses", label: "Registered courses · code · credit units", type: "textarea" }] },
   { id: "progress", title: "Academic Progress", fields: [{ key: "gpa", label: "GPA" }, { key: "completedCredits", label: "Completed credits" }, { key: "standing", label: "Academic standing", type: "select", options: standingOptions }] },
@@ -69,7 +71,7 @@ const initialData: ProfileData = {
   institution: { name: "Not provided" },
   personal: { dateOfBirth: "", gender: "Not provided", genderDescription: "", nationality: deviceRegionNationality || "Not provided" },
   contact: { email: "", phoneCountryCode: deviceRegionCode, phone: "", address: "" },
-  academic: { department: "Not provided", programme: "Not provided", level: "Not provided", session: "Not provided", semester: "Not provided", programStart: "", programEnd: "" },
+  academic: { department: "Not provided", programme: "Not provided", level: "Not provided", session: "Not provided", sessionHistory: "[]", semester: "Not provided", programStart: "", programEnd: "" },
   enrolment: { admissionDate: "", status: "Not provided" },
   courses: { registeredCourses: "" },
   progress: { gpa: "Not provided", completedCredits: "Not provided", standing: "Not provided" },
@@ -105,9 +107,177 @@ type SectionProps = {
   onChange: (key: string, value: string) => void;
   onSave: (event: FormEvent<HTMLFormElement>) => void;
   onCancel: () => void;
+  onPersistAcademicSessions?: (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string) => Promise<void>;
 };
 
-function ProfileSection({ id, title, fields, values, editing, menuOpen, onMenu, onEdit, onChange, onSave, onCancel }: SectionProps) {
+function readAcademicSessionRecords(serialized: string | undefined, currentSession: string | undefined, currentSemester: string | undefined): AcademicSessionRecord[] {
+  let records: AcademicSessionRecord[] = [];
+  try {
+    const parsed: unknown = JSON.parse(serialized ?? "[]");
+    if (Array.isArray(parsed)) {
+      records = parsed.flatMap((value): AcademicSessionRecord[] => {
+        if (!value || typeof value !== "object") return [];
+        const record = value as Partial<AcademicSessionRecord>;
+        if (typeof record.id !== "string" || typeof record.year !== "string") return [];
+        return [{
+          id: record.id,
+          year: record.year,
+          semester: typeof record.semester === "string" && semesterOptions.includes(record.semester)
+            ? record.semester
+            : record.year === currentSession && typeof currentSemester === "string" && semesterOptions.includes(currentSemester) ? currentSemester : notProvided,
+          createdAt: typeof record.createdAt === "number" && Number.isFinite(record.createdAt) ? record.createdAt : 0,
+        }];
+      });
+    }
+  } catch { /* Old profile records may not contain session history yet. */ }
+
+  if (!records.length && currentSession?.trim() && currentSession !== notProvided) {
+    records = [{ id: "legacy-current-session", year: currentSession.trim(), semester: semesterOptions.includes(currentSemester ?? "") ? currentSemester ?? notProvided : notProvided, createdAt: 0 }];
+  }
+  return records.sort((a, b) => b.year.localeCompare(a.year, undefined, { numeric: true }) || b.createdAt - a.createdAt);
+}
+
+function AcademicSessionManager({ serialized, currentSession, currentSemester, onPersist }: { serialized: string; currentSession: string; currentSemester: string; onPersist: (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string) => Promise<void> }) {
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AcademicSessionRecord | null>(null);
+  const [draft, setDraft] = useState({ year: "", semester: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const records = readAcademicSessionRecords(serialized, currentSession, currentSemester);
+
+  function beginAdd() {
+    setDraft({ year: "", semester: "" });
+    setEditingId(null);
+    setError("");
+    setEditorOpen(true);
+  }
+
+  function beginEdit(record: AcademicSessionRecord) {
+    setDraft({ year: record.year, semester: semesterOptions.includes(record.semester) ? record.semester : "" });
+    setEditingId(record.id);
+    setDeleteTarget(null);
+    setError("");
+    setEditorOpen(true);
+  }
+
+  async function saveRecord(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const year = draft.year.trim();
+    if (!/^\d{4}\/\d{4}$/.test(year)) {
+      setError("Enter the session year in YYYY/YYYY format, such as 2026/2027.");
+      return;
+    }
+    const [startYear, endYear] = year.split("/").map(Number);
+    if (endYear !== startYear + 1) {
+      setError("The second year must immediately follow the first, such as 2026/2027.");
+      return;
+    }
+    if (!semesterOptions.includes(draft.semester)) {
+      setError("Choose a semester for this academic session.");
+      return;
+    }
+    if (records.some((record) => record.year === year && record.semester === draft.semester && record.id !== editingId)) {
+      setError("That academic year and semester are already saved. Edit the existing entry instead.");
+      return;
+    }
+    const existing = records.find((record) => record.id === editingId);
+    const nextRecord: AcademicSessionRecord = {
+      id: existing?.id ?? (typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
+      year,
+      semester: draft.semester,
+      createdAt: existing?.createdAt || Date.now(),
+    };
+    const nextRecords = [...records.filter((record) => record.id !== editingId), nextRecord]
+      .sort((a, b) => b.year.localeCompare(a.year, undefined, { numeric: true }) || b.createdAt - a.createdAt);
+    setBusy(true);
+    setError("");
+    const wasCurrent = existing?.year === currentSession && (existing.semester === currentSemester || !semesterOptions.includes(currentSemester));
+    const selectNewRecord = !existing && (currentSession === notProvided || !semesterOptions.includes(currentSemester));
+    const selectedSession = wasCurrent || selectNewRecord ? year : currentSession;
+    const selectedSemester = wasCurrent || selectNewRecord ? draft.semester : currentSemester;
+    try {
+      await onPersist(nextRecords, selectedSession, selectedSemester);
+      setEditorOpen(false);
+      setEditingId(null);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? `Session could not be saved: ${saveError.message}` : "Session could not be saved. Check device storage and retry.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteRecord() {
+    if (!deleteTarget) return;
+    const nextRecords = records.filter((record) => record.id !== deleteTarget.id);
+    const deletingCurrent = deleteTarget.year === currentSession && (deleteTarget.semester === currentSemester || !semesterOptions.includes(currentSemester));
+    const replacement = deletingCurrent ? nextRecords.find((record) => semesterOptions.includes(record.semester)) : undefined;
+    const selectedSession = deletingCurrent ? replacement?.year ?? notProvided : currentSession;
+    const selectedSemester = deletingCurrent ? replacement?.semester ?? notProvided : currentSemester;
+    setBusy(true);
+    setError("");
+    try {
+      await onPersist(nextRecords, selectedSession, selectedSemester);
+      setDeleteTarget(null);
+      setEditorOpen(false);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? `Session could not be removed: ${saveError.message}` : "Session could not be removed. Check device storage and retry.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function selectCurrentSession(record: AcademicSessionRecord) {
+    if (!semesterOptions.includes(record.semester)) {
+      setError("Edit this session and choose a semester before making it current.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await onPersist(records, record.year, record.semester);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? `Current session could not be updated: ${saveError.message}` : "Current session could not be updated. Check device storage and retry.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <section className="academic-session-history liquid-glass" aria-label="Academic session history">
+    <div className="academic-session-heading">
+      <div><h4>Academic session history</h4><p>Save the same academic year for different semesters, then select one year and semester as current.</p></div>
+      {!editorOpen && <button className="academic-session-add" type="button" onClick={beginAdd}>＋ Add session year</button>}
+    </div>
+    {records.length ? <ol className="academic-session-list">{records.map((record) => {
+      const isCurrent = record.year === currentSession && record.semester === currentSemester;
+      return <li className={`academic-session-item ${isCurrent ? "is-current" : ""}`} key={record.id}>
+      <div className="academic-session-copy"><div className="academic-session-title"><strong>{record.year}</strong>{isCurrent && <span className="academic-session-current">Current session</span>}</div><span className="academic-session-semester">{semesterOptions.includes(record.semester) ? record.semester : "Semester not set"}</span></div>
+      <div className="academic-session-actions">{!isCurrent && <button type="button" className="academic-session-select" disabled={busy} onClick={() => void selectCurrentSession(record)} aria-label={`Set ${record.year} as the current academic session`}>Use as current</button>}<button type="button" onClick={() => beginEdit(record)} aria-label={`Edit ${record.year} session`}>Edit</button><button type="button" onClick={() => { setDeleteTarget(record); setEditorOpen(false); setError(""); }} aria-label={`Delete ${record.year} session`}>Delete</button></div>
+    </li>;
+    })}</ol> : <p className="academic-session-empty">No session years saved yet.</p>}
+    {editorOpen && <form className="academic-session-form liquid-glass" onSubmit={(event) => void saveRecord(event)}>
+      <div className="academic-session-form-grid">
+        <label>Session year<input value={draft.year} onChange={(event) => {
+          const digits = event.target.value.replace(/\D/g, "").slice(0, 8);
+          const year = digits.length > 4 ? `${digits.slice(0, 4)}/${digits.slice(4)}` : digits;
+          setDraft((current) => ({ ...current, year }));
+        }} placeholder="2026/2027" maxLength={9} autoComplete="off" inputMode="numeric" aria-describedby="academic-session-format" required /><small id="academic-session-format">Enter eight digits; the slash is added for you.</small></label>
+        <label>Semester<select value={draft.semester} onChange={(event) => setDraft((current) => ({ ...current, semester: event.target.value }))} required><option value="" disabled>Select semester</option>{semesterOptions.map((semester) => <option key={semester} value={semester}>{semester}</option>)}</select></label>
+      </div>
+      {error && <p className="academic-session-error" role="alert">{error}</p>}
+      <div className="academic-session-form-actions"><button className="primary-button" type="submit" disabled={busy}>{busy ? "Saving…" : editingId ? "Save session" : "Add session"}</button><button className="profile-cancel" type="button" disabled={busy} onClick={() => { setEditorOpen(false); setError(""); }}>Cancel</button></div>
+    </form>}
+    {deleteTarget && <div className="academic-session-confirm-backdrop" onClick={() => !busy && setDeleteTarget(null)}>
+      <section className="academic-session-confirm liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="academic-session-confirm-title" aria-describedby="academic-session-confirm-copy" onClick={(event) => event.stopPropagation()}>
+        <span className="academic-session-confirm-icon" aria-hidden="true">!</span><h4 id="academic-session-confirm-title">Delete this academic session?</h4><p id="academic-session-confirm-copy">Remove <strong>{deleteTarget.year}</strong> from your academic details?</p>
+        {error && <p className="academic-session-error" role="alert">{error}</p>}
+        <div className="academic-session-confirm-actions"><button type="button" className="profile-cancel" onClick={() => setDeleteTarget(null)} disabled={busy}>Keep session</button><button type="button" className="academic-session-delete" onClick={() => void deleteRecord()} disabled={busy}>{busy ? "Deleting…" : "Delete session"}</button></div>
+      </section>
+    </div>}
+  </section>;
+}
+
+function ProfileSection({ id, title, fields, values, editing, menuOpen, onMenu, onEdit, onChange, onSave, onCancel, onPersistAcademicSessions }: SectionProps) {
   const section = sectionFields.find((item) => item.id === id);
   const resolvedFields = fields ?? section?.fields ?? [];
   const visibleFields = resolvedFields.filter((field) => !(id === "personal" && field.key === "genderDescription" && values.gender !== "Rather not say"));
@@ -119,13 +289,17 @@ function ProfileSection({ id, title, fields, values, editing, menuOpen, onMenu, 
         {menuOpen && <div className="profile-section-menu"><button onClick={onEdit}>Edit section</button></div>}
       </div>}
     </header>
+    {id === "academic" && <div className="academic-period-summary liquid-glass"><span>Current academic period</span><strong>{values.session && values.session !== notProvided ? values.session : "Session not set"} · {values.semester && values.semester !== notProvided ? values.semester : "Semester not set"}</strong></div>}
     {editing ? <form className="profile-edit-form" onSubmit={onSave}>
       {visibleFields.map((field) => <label className={field.key === "genderDescription" ? "gender-description-field" : undefined} key={field.key}>{field.label}
         {field.key === "phone" && id === "contact" ? <div className="phone-number-field"><select className="phone-country-code" aria-label="Country calling code" value={values.phoneCountryCode ?? ""} onChange={(event) => onChange("phoneCountryCode", event.target.value)} required><option value="" disabled>Select country code</option>{phoneCountryOptions.map((country) => <option key={country.code} value={country.code}>+{country.callingCode} · {country.name}</option>)}</select><input type="tel" aria-label="Phone number" autoComplete="tel-national" inputMode="tel" value={phoneNationalNumber(values)} onFocus={() => { if (values.phone === notProvided) onChange("phone", ""); }} onChange={(event) => onChange("phone", event.target.value)} placeholder="Phone number" required /></div> : field.type === "textarea" ? <textarea value={values[field.key] === notProvided ? "" : values[field.key] ?? ""} placeholder={notProvided} readOnly={id === "courses"} onFocus={() => { if (values[field.key] === notProvided) onChange(field.key, ""); }} onChange={(event) => onChange(field.key, event.target.value)} required={id !== "courses"} rows={field.key === "registeredCourses" ? 4 : 2} /> : field.type === "select" ? <select value={values[field.key] ?? ""} onChange={(event) => { onChange(field.key, event.target.value); if (id === "personal" && field.key === "gender" && event.target.value !== "Rather not say") onChange("genderDescription", ""); }} required><option value="" disabled>Select {field.label.toLowerCase()}</option>{values[field.key] && !field.options?.includes(values[field.key]) && <option value={values[field.key]}>{values[field.key]}</option>}{field.options?.map((option) => <option key={option} value={option}>{option}</option>)}</select> : <input type={field.type ?? "text"} value={values[field.key] === notProvided ? "" : values[field.key] ?? ""} placeholder={values[field.key] === notProvided ? notProvided : undefined} readOnly={id === "contact" && field.key === "email"} onFocus={() => { if (values[field.key] === notProvided) onChange(field.key, ""); }} onChange={(event) => onChange(field.key, event.target.value)} required={!(["genderDescription", "dateOfBirth", "admissionDate", "programStart", "programEnd"].includes(field.key))} />}
       </label>)}
       {id === "contact" && values.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email) && <p className="profile-validation">Enter a valid email address.</p>}
       <div className="profile-form-actions"><button className="primary-button" type="submit">Save changes</button><button className="profile-cancel" type="button" onClick={onCancel}>Cancel</button></div>
-    </form> : <dl className="profile-fields">{visibleFields.map((field) => <div key={field.key}><dt>{field.label}</dt><dd>{field.key === "phone" ? phoneDisplayNumber(values) || "Not provided" : values[field.key]?.trim() || "Not provided"}</dd></div>)}</dl>}
+    </form> : <>
+      <dl className="profile-fields">{visibleFields.map((field) => <div key={field.key}><dt>{field.label}</dt><dd>{field.key === "phone" ? phoneDisplayNumber(values) || "Not provided" : values[field.key]?.trim() || "Not provided"}</dd></div>)}</dl>
+      {id === "academic" && onPersistAcademicSessions && <AcademicSessionManager serialized={values.sessionHistory ?? "[]"} currentSession={values.session ?? notProvided} currentSemester={values.semester ?? notProvided} onPersist={onPersistAcademicSessions} />}
+    </>}
   </section>;
 }
 
@@ -215,6 +389,11 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
       onChange: (key, value) => setData((current) => ({ ...current, [id]: { ...current[id], [key]: value } })),
       onSave: (event) => { void saveSection(event, id); },
       onCancel: () => setEditing(null),
+      ...(id === "academic" ? { onPersistAcademicSessions: async (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string) => {
+        const updatedAcademic = { ...data.academic, session: selectedSession, semester: selectedSemester, sessionHistory: JSON.stringify(records) };
+        await saveStudentSection(studentUid, "academic", updatedAcademic);
+        setData((current) => ({ ...current, academic: updatedAcademic }));
+      } } : {}),
     };
   }
 

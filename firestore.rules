@@ -70,7 +70,7 @@ service cloud.firestore {
 
     function validCourse() {
       return request.resource.data.keys().hasOnly([
-          'code', 'name', 'color', 'creditUnits', 'createdAt', 'updatedAt'
+          'code', 'name', 'color', 'creditUnits', 'archived', 'academicSession', 'semester', 'createdAt', 'updatedAt'
         ])
         && request.resource.data.code is string
         && request.resource.data.code.size() > 0
@@ -81,7 +81,15 @@ service cloud.firestore {
         && (!request.resource.data.keys().hasAny(['creditUnits'])
           || (request.resource.data.creditUnits is int
             && request.resource.data.creditUnits >= 1
-            && request.resource.data.creditUnits <= 5));
+            && request.resource.data.creditUnits <= 5))
+        && (!request.resource.data.keys().hasAny(['archived'])
+          || request.resource.data.archived is bool)
+        && (!request.resource.data.keys().hasAny(['academicSession'])
+          || (request.resource.data.academicSession is string
+            && request.resource.data.academicSession.size() == 9
+            && request.resource.data.academicSession.matches('^[0-9]{4}/[0-9]{4}$')))
+        && (!request.resource.data.keys().hasAny(['semester'])
+          || request.resource.data.semester in ['First semester', 'Second semester', 'Extended semester']);
     }
 
     function validAssignment(assignmentId) {

@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { EmailAuthProvider, getIdToken, onIdTokenChanged, reauthenticateWithCredential, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
 import { firebaseAuth, firebaseConfigured } from "./firebase";
 import {
+  migrateLegacyRecordsToOldestAcademicPeriod,
   deleteAssignment as deleteAssignmentRecord,
   deleteCourse as deleteCourseRecord,
   deleteExam as deleteExamRecord,
@@ -42,7 +43,14 @@ type Course = {
   name: string;
   color: string;
   creditUnits?: number;
+  lecturerName?: string;
+  lectureVenue?: string;
+  archived?: boolean;
+  academicSession?: string;
+  semester?: string;
+  storageId?: string;
 };
+type AcademicPeriod = { session: string; semester: string };
 
 type Schedule = {
   id: string;
@@ -50,6 +58,8 @@ type Schedule = {
   day: string;
   start: string;
   end: string;
+  academicSession?: string;
+  semester?: string;
 };
 
 type Assignment = {
@@ -64,6 +74,8 @@ type Assignment = {
   studentId?: string;
   createdAt?: number | string | { seconds?: number };
   updatedAt?: number | string | { seconds?: number };
+  academicSession?: string;
+  semester?: string;
 };
 
 type Exam = {
@@ -73,6 +85,8 @@ type Exam = {
   date: string;
   start: string;
   location: string;
+  academicSession?: string;
+  semester?: string;
 };
 type SavedTimetableReminder = { sourceType: "weekly" | "exam"; sourceId: string; leadMinutes: number };
 type SavedAssignmentReminder = { assignmentId: string; dueDate: string; dueTime: string; leadMinutes: number };
@@ -143,6 +157,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [searchMaterials, setSearchMaterials] = useState<StudyMaterial[]>([]);
   const [searchTargetId, setSearchTargetId] = useState<string | null>(null);
   const [studentMatriculationNo, setStudentMatriculationNo] = useState("Not provided");
+  const [academicPeriod, setAcademicPeriod] = useState<AcademicPeriod>({ session: "Not provided", semester: "Not provided" });
   const quickSearchRef = useRef<HTMLDivElement>(null);
   const quickSearchInputRef = useRef<HTMLInputElement>(null);
   const quickSearchPopoverRef = useRef<HTMLElement>(null);
@@ -152,15 +167,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [reminderMessage, setReminderMessage] = useState("");
   const [reminderConfirmation, setReminderConfirmation] = useState<"desktop" | "email" | null>(null);
   const [emailReminderSending, setEmailReminderSending] = useState(false);
-  const [assignments, setAssignments] = useState(initialAssignments);
+  const [allAssignments, setAllAssignments] = useState(initialAssignments);
   const [editingAssignmentId, setEditingAssignmentId] = useState<string | null>(null);
   const [assignmentDraft, setAssignmentDraft] = useState({ title: "", question: "", course: "", due: "" });
-  const [courses, setCourses] = useState(initialCourses);
+  const [allCourses, setAllCourses] = useState(initialCourses);
   const [recentCourseCodes, setRecentCourseCodes] = useState<string[]>([]);
   const [openCourseMenu, setOpenCourseMenu] = useState<string | null>(null);
   const [assignmentMenuPosition, setAssignmentMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const [courseDeleteRequest, setCourseDeleteRequest] = useState<Course | null>(null);
   const [courseDeleteBusy, setCourseDeleteBusy] = useState(false);
+  const [courseRestoreRequest, setCourseRestoreRequest] = useState<Course | null>(null);
+  const [courseRestoreBusy, setCourseRestoreBusy] = useState(false);
   const [assignmentDeleteRequest, setAssignmentDeleteRequest] = useState<Assignment | null>(null);
   const [assignmentDeleteBusy, setAssignmentDeleteBusy] = useState(false);
   const [assignmentReminderRequest, setAssignmentReminderRequest] = useState<Assignment | null>(null);
@@ -180,8 +197,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [timetableReminderRemovalBusy, setTimetableReminderRemovalBusy] = useState(false);
   const [timetableReminders, setTimetableReminders] = useState<SavedTimetableReminder[]>([]);
   const [timetableQueueVersion, setTimetableQueueVersion] = useState(0);
-  const [schedules, setSchedules] = useState(initialSchedules);
-  const [exams, setExams] = useState<Exam[]>([]);
+  const [allSchedules, setAllSchedules] = useState(initialSchedules);
+  const [allExams, setAllExams] = useState<Exam[]>([]);
   const [examFormOpen, setExamFormOpen] = useState(false);
   const [editingExamId, setEditingExamId] = useState<string | null>(null);
   const [examDraft, setExamDraft] = useState({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
@@ -202,6 +219,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [showCourseForm, setShowCourseForm] = useState(false);
   const [newCourseCode, setNewCourseCode] = useState("");
   const [newCourseName, setNewCourseName] = useState("");
+  const [newCourseLecturer, setNewCourseLecturer] = useState("");
+  const [newCourseVenue, setNewCourseVenue] = useState("");
   const [newCourseCreditUnits, setNewCourseCreditUnits] = useState(1);
   const [showCourseCredits, setShowCourseCredits] = useState(false);
   const courseCreditPickerRef = useRef<HTMLDivElement>(null);
@@ -211,6 +230,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [newCourse, setNewCourse] = useState("COS 102");
   const [newDue, setNewDue] = useState("");
   const [newAssignmentCompleted, setNewAssignmentCompleted] = useState(false);
+
+  const activeAcademicSession = /^\d{4}\/\d{4}$/.test(academicPeriod.session) ? academicPeriod.session : "Not provided";
+  const activeAcademicSemester = ["First semester", "Second semester", "Extended semester"].includes(academicPeriod.semester) ? academicPeriod.semester : "Not provided";
+  const hasActiveAcademicPeriod = activeAcademicSession !== "Not provided" && activeAcademicSemester !== "Not provided";
+  const activeAcademicPeriodRef = useRef({ session: activeAcademicSession, semester: activeAcademicSemester });
+  activeAcademicPeriodRef.current = { session: activeAcademicSession, semester: activeAcademicSemester };
+  const matchesActivePeriod = (record: { academicSession?: string; semester?: string }) => record.academicSession === activeAcademicSession && record.semester === activeAcademicSemester;
+  const courses = allCourses.filter(matchesActivePeriod);
+  const assignments = allAssignments.filter(matchesActivePeriod);
+  const schedules = allSchedules.filter(matchesActivePeriod);
+  const exams = allExams.filter(matchesActivePeriod);
 
   useEffect(() => {
     if (!showCourseCredits) return;
@@ -227,6 +257,35 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [showCourseCredits]);
+
+  useEffect(() => {
+    setShowForm(false);
+    setEditingAssignmentId(null);
+    setAssignmentDraft({ title: "", question: "", course: courses[0]?.code ?? "", due: "" });
+    setNewTitle("");
+    setNewQuestion("");
+    setNewCourse(courses[0]?.code ?? "");
+    setNewDue("");
+    setNewAssignmentCompleted(false);
+    setScheduleFormOpen(false);
+    setEditingScheduleId(null);
+    setScheduleCode("");
+    setScheduleName("");
+    setExamFormOpen(false);
+    setEditingExamId(null);
+    setExamDraft({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
+    setEditingCourseCode(null);
+    setShowCourseForm(false);
+    setOpenCourseMenu(null);
+  }, [activeAcademicSession, activeAcademicSemester]);
+
+  useEffect(() => {
+    if (hasActiveAcademicPeriod) void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined);
+  }, [user.uid, activeAcademicSession, activeAcademicSemester, hasActiveAcademicPeriod]);
+
+  useEffect(() => {
+    if (courses.length && !courses.some((course) => course.code === newCourse)) setNewCourse(courses[0].code);
+  }, [courses, newCourse]);
 
   useEffect(() => {
     let active = true;
@@ -485,15 +544,25 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       }).catch(() => undefined);
     };
     const unsubscribe = [
-      watchLocalRecords(user.uid, "courses", (records) => setCourses(normalizeCourseRecords(records))),
-      watchLocalRecords(user.uid, "assignments", (records) => setAssignments(records as Assignment[])),
-      watchLocalRecords(user.uid, "schedules", (records) => setSchedules(records as Schedule[])),
-      watchLocalRecords(user.uid, "exams", (records) => setExams(records as Exam[])),
+      watchLocalRecords(user.uid, "courses", (records) => { setAllCourses(normalizeCourseRecords(records)); void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined); }),
+      watchLocalRecords(user.uid, "assignments", (records) => { setAllAssignments(records as Assignment[]); void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined); }),
+      watchLocalRecords(user.uid, "schedules", (records) => { setAllSchedules(records as Schedule[]); void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined); }),
+      watchLocalRecords(user.uid, "exams", (records) => { setAllExams(records as Exam[]); void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined); }),
       watchLocalRecords(user.uid, "studentSections", (records) => {
-        const value = records.find((record) => record.id === "studyNotes")?.["value"];
+        const { session, semester: activeSemester } = activeAcademicPeriodRef.current;
+        const semesterKey = activeSemester.toLowerCase().replace(/\s+/g, "-");
+        const notesId = /^\d{4}\/\d{4}$/.test(session) && activeSemester !== "Not provided" ? `studyNotes__${session.replace("/", "-")}__${semesterKey}` : "__no_current_academic_period__";
+        const value = records.find((record) => record.id === notesId)?.["value"];
         setSearchMaterials(Array.isArray(value) ? value.filter(isStudyMaterial).map((item) => ({ id: item.id, title: item.title, category: item.category ?? "Study material", content: item.content ?? "", resourceUrl: item.resourceUrl ?? "" })) : []);
         const profile = records.find((record) => record.id === "profile");
         setStudentMatriculationNo(typeof profile?.studentId === "string" && profile.studentId.trim() && profile.studentId !== "Not provided" ? profile.studentId.trim() : "Not provided");
+        const academic = records.find((record) => record.id === "academic");
+        const semester = academic?.["semester"];
+        setAcademicPeriod({
+          session: typeof academic?.["session"] === "string" && academic["session"].trim() ? academic["session"].trim() : "Not provided",
+          semester: typeof semester === "string" && ["First semester", "Second semester", "Extended semester"].includes(semester) ? semester : "Not provided",
+        });
+        void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined);
       }),
     ];
     const resumeSync = () => {
@@ -598,9 +667,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           markReady("profile", fromCache);
         }, () => failed("profile")),
         watchStudentCollection(user.uid, "courses", (records, fromCache) => {
-          const normalized = records.map((item) => ({ ...item, code: item.id }));
+          const normalized = records.map((item) => ({ ...item, code: typeof item.code === "string" ? item.code : item.id }));
           // Keep the course code in the cached record as well as using it as its local ID.
-          void replaceWithRemoteRecords(user.uid, "courses", normalized, !fromCache);
+          void replaceWithRemoteRecords(user.uid, "courses", normalized, !fromCache).catch(() => undefined);
           setRecentCourseCodes(records
             .slice()
             .sort((left, right) => {
@@ -612,15 +681,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           markReady("courses", fromCache);
         }, () => failed("courses")),
         watchStudentCollection(user.uid, "assignments", (records, fromCache) => {
-          void replaceWithRemoteRecords(user.uid, "assignments", records, !fromCache);
+          void replaceWithRemoteRecords(user.uid, "assignments", records, !fromCache).catch(() => undefined);
           markReady("assignments", fromCache);
         }, () => failed("assignments")),
         watchStudentCollection(user.uid, "schedules", (records, fromCache) => {
-          void replaceWithRemoteRecords(user.uid, "schedules", records, !fromCache);
+          void replaceWithRemoteRecords(user.uid, "schedules", records, !fromCache).catch(() => undefined);
           markReady("schedules", fromCache);
         }, () => failed("schedules")),
         watchStudentCollection(user.uid, "exams", (records, fromCache) => {
-          void replaceWithRemoteRecords(user.uid, "exams", records, !fromCache);
+          void replaceWithRemoteRecords(user.uid, "exams", records, !fromCache).catch(() => undefined);
           markReady("exams", fromCache);
         }, () => failed("exams")),
     ];
@@ -696,6 +765,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }, [courseDeleteRequest, courseDeleteBusy]);
 
   useEffect(() => {
+    if (!courseRestoreRequest) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !courseRestoreBusy) setCourseRestoreRequest(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [courseRestoreRequest, courseRestoreBusy]);
+
+  useEffect(() => {
     if (!assignmentDeleteRequest) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !assignmentDeleteBusy) setAssignmentDeleteRequest(null);
@@ -743,20 +821,67 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   async function saveCourse(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!hasActiveAcademicPeriod) { setCloudMessage("Set a current academic year and semester in Student Account → Academic Details before adding academic records."); return; }
     const code = newCourseCode.trim().toUpperCase();
     const name = newCourseName.trim();
     if (!code || !name || courses.some((course) => course.code === code && course.code !== editingCourseCode)) return;
-    const course = { code, name, color: "leather", creditUnits: newCourseCreditUnits };
+    const previousCourse = editingCourseCode ? courses.find((item) => item.code === editingCourseCode) : undefined;
+    const coursePeriod = academicPeriod;
+    const session = /^\d{4}\/\d{4}$/.test(coursePeriod.session) ? coursePeriod.session : undefined;
+    const semester = ["First semester", "Second semester", "Extended semester"].includes(coursePeriod.semester) ? coursePeriod.semester : undefined;
+    const course: Course = {
+      code,
+      name,
+      color: previousCourse?.color ?? "leather",
+      creditUnits: newCourseCreditUnits,
+      ...(newCourseLecturer.trim() ? { lecturerName: newCourseLecturer.trim() } : {}),
+      ...(newCourseVenue.trim() ? { lectureVenue: newCourseVenue.trim() } : {}),
+      ...(previousCourse?.academicSession || session ? { academicSession: previousCourse?.academicSession ?? session } : {}),
+      ...(previousCourse?.semester || semester ? { semester: previousCourse?.semester ?? semester } : {}),
+      ...(previousCourse?.storageId ? { storageId: previousCourse.storageId } : {}),
+    };
     const saved = await persistCloudRecord(() => editingCourseCode
-      ? renameCourseRecord(user.uid, editingCourseCode, code, course)
+      ? renameCourseRecord(user.uid, editingCourseCode, code, course, previousCourse?.storageId)
       : saveCourseRecord(user.uid, code, course));
     if (!saved) return;
     setNewCourseCode("");
     setNewCourseName("");
+    setNewCourseLecturer("");
+    setNewCourseVenue("");
     setNewCourseCreditUnits(1);
     setShowCourseCredits(false);
     setEditingCourseCode(null);
     setShowCourseForm(false);
+  }
+
+  async function setCourseArchived(code: string, archived: boolean) {
+    const course = courses.find((item) => item.code === code);
+    if (!course) return;
+    setOpenCourseMenu(null);
+    const { archived: _archived, ...courseData } = course;
+    await persistCloudRecord(() => saveCourseRecord(user.uid, code, { ...courseData, archived, storageId: course.storageId }, false));
+  }
+
+  async function confirmCourseRestore() {
+    const request = courseRestoreRequest;
+    if (!request || courseRestoreBusy) return;
+    setCourseRestoreBusy(true);
+    try {
+      const saved = await persistCloudRecord(() => saveCourseRecord(user.uid, request.code, {
+        code: request.code,
+        name: request.name,
+        color: request.color,
+        creditUnits: request.creditUnits,
+        ...(request.lecturerName ? { lecturerName: request.lecturerName } : {}),
+        ...(request.lectureVenue ? { lectureVenue: request.lectureVenue } : {}),
+        ...(request.academicSession ? { academicSession: request.academicSession } : {}),
+        ...(request.semester ? { semester: request.semester } : {}),
+        ...(request.storageId ? { storageId: request.storageId } : {}),
+      }, false));
+      if (saved) setCourseRestoreRequest(null);
+    } finally {
+      setCourseRestoreBusy(false);
+    }
   }
 
   function resetAssignmentForm() {
@@ -767,6 +892,11 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setNewAssignmentCompleted(false);
   }
 
+  function cancelAssignmentForm() {
+    resetAssignmentForm();
+    setShowForm(false);
+  }
+
   function startNewCourse() {
     if (showCourseForm && !editingCourseCode) {
       setShowCourseForm(false);
@@ -775,9 +905,22 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingCourseCode(null);
     setNewCourseCode("");
     setNewCourseName("");
+    setNewCourseLecturer("");
+    setNewCourseVenue("");
     setNewCourseCreditUnits(1);
     setShowCourseCredits(false);
     setShowCourseForm(true);
+  }
+
+  function cancelCourseForm() {
+    setNewCourseCode("");
+    setNewCourseName("");
+    setNewCourseLecturer("");
+    setNewCourseVenue("");
+    setNewCourseCreditUnits(1);
+    setShowCourseCredits(false);
+    setEditingCourseCode(null);
+    setShowCourseForm(false);
   }
 
   function beginEditCourse(code: string) {
@@ -786,6 +929,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingCourseCode(course?.code ?? null);
     setNewCourseCode(course?.code ?? normalizedCode);
     setNewCourseName(course?.name ?? normalizedCode);
+    setNewCourseLecturer(course?.lecturerName ?? "");
+    setNewCourseVenue(course?.lectureVenue ?? "");
     setNewCourseCreditUnits(course?.creditUnits ?? 1);
     setShowCourseCredits(false);
     setShowCourseForm(true);
@@ -795,14 +940,19 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   async function saveSchedule(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!hasActiveAcademicPeriod) { setCloudMessage("Set a current academic year and semester in Student Account → Academic Details before adding academic records."); return; }
     const code = scheduleCode.trim().toUpperCase();
     const name = scheduleName.trim();
     if (!code || !name || scheduleStart >= scheduleEnd) return;
     const existing = courses.find((course) => course.code === code);
     const id = editingScheduleId ?? createRecordId();
     const saved = await persistCloudRecord(async () => {
-      if (!existing) await saveCourseRecord(user.uid, code, { code, name, color: "leather" });
-      await saveScheduleRecord(user.uid, id, { courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd }, !editingScheduleId);
+      if (!existing) {
+        const session = /^\d{4}\/\d{4}$/.test(academicPeriod.session) ? academicPeriod.session : undefined;
+        const semester = ["First semester", "Second semester", "Extended semester"].includes(academicPeriod.semester) ? academicPeriod.semester : undefined;
+        await saveCourseRecord(user.uid, code, { code, name, color: "leather", ...(session ? { academicSession: session } : {}), ...(semester ? { semester } : {}) });
+      }
+      await saveScheduleRecord(user.uid, id, { courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd, academicSession: activeAcademicSession, semester: activeAcademicSemester }, !editingScheduleId);
     });
     if (!saved) return;
     const activeReminder = timetableReminders.find((item) => item.sourceType === "weekly" && item.sourceId === id);
@@ -817,6 +967,16 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingScheduleId(null);
     setScheduleCode("");
     setScheduleName("");
+  }
+
+  function cancelScheduleForm() {
+    setScheduleFormOpen(false);
+    setEditingScheduleId(null);
+    setScheduleCode("");
+    setScheduleName("");
+    setScheduleDay("Monday");
+    setScheduleStart("09:00");
+    setScheduleEnd("10:00");
   }
 
   function beginEditSchedule(schedule: Schedule) {
@@ -860,7 +1020,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         const entry = item.sourceType === "weekly" ? schedules.find((schedule) => schedule.id === item.sourceId) : exams.find((exam) => exam.id === item.sourceId);
         return entry?.courseCode !== request.code;
       }));
-      const saved = await persistCloudRecord(() => deleteCourseRecord(user.uid, request.code));
+      const saved = await persistCloudRecord(() => deleteCourseRecord(user.uid, request.code, request.academicSession, request.storageId, request.semester));
       if (saved) setCourseDeleteRequest(null);
     } finally {
       setCourseDeleteBusy(false);
@@ -892,6 +1052,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   async function saveExam(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!hasActiveAcademicPeriod) { setCloudMessage("Set a current academic year and semester in Student Account → Academic Details before adding academic records."); return; }
     const title = examDraft.title.trim();
     const courseCode = examDraft.courseCode.trim().toUpperCase();
     const date = examDraft.date;
@@ -899,7 +1060,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const location = examDraft.location.trim();
     if (!title || !courseCode || !date || !start || !location) return;
     const id = editingExamId ?? createRecordId();
-    const saved = await persistCloudRecord(() => saveExamRecord(user.uid, id, { title, courseCode, date, start, location }, !editingExamId));
+    const saved = await persistCloudRecord(() => saveExamRecord(user.uid, id, { title, courseCode, date, start, location, academicSession: activeAcademicSession, semester: activeAcademicSemester }, !editingExamId));
     if (saved) {
       const activeReminder = timetableReminders.find((item) => item.sourceType === "exam" && item.sourceId === id);
       if (activeReminder) {
@@ -913,6 +1074,12 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       setEditingExamId(null);
       setExamFormOpen(false);
     }
+  }
+
+  function cancelExamForm() {
+    setExamDraft({ title: "", courseCode: "", date: "", start: "09:00", location: "" });
+    setEditingExamId(null);
+    setExamFormOpen(false);
   }
 
   function beginEditExam(exam: Exam) {
@@ -1078,7 +1245,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const assignment = assignments.find((item) => item.id === id);
     if (!assignment) return;
     if (completed && assignmentReminders.some((item) => item.assignmentId === id)) await removeAssignmentReminder(id, false);
-    await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, { ...assignment, completed, studentId: assignment.studentId ?? studentMatriculationNo }, false));
+    await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, { ...assignment, completed, studentId: assignment.studentId ?? studentMatriculationNo, academicSession: activeAcademicSession, semester: activeAcademicSemester }, false));
   }
 
   async function postAssignmentReminder(operation: Record<string, unknown>) {
@@ -1174,7 +1341,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const existing = assignments.find((item) => item.id === editingAssignmentId);
     const description = assignmentDraft.question.trim();
     const assignment = { ...assignmentDraft, title: assignmentDraft.title.trim(), question: description, description, due: formatAssignmentDueDate(assignmentDraft.due), dueDate: assignmentDraft.due, completed: existing?.completed ?? false, studentId: existing?.studentId ?? studentMatriculationNo, ...(existing?.createdAt !== undefined ? { createdAt: existing.createdAt } : {}) };
-    const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, editingAssignmentId, assignment, false));
+    const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, editingAssignmentId, { ...assignment, academicSession: activeAcademicSession, semester: activeAcademicSemester }, false));
     if (saved) {
       const activeReminder = assignmentReminders.find((item) => item.assignmentId === editingAssignmentId);
       if (activeReminder) {
@@ -1190,6 +1357,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   async function addAssignment(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!hasActiveAcademicPeriod) { setCloudMessage("Set a current academic year and semester in Student Account → Academic Details before adding academic records."); return; }
+    if (!courses.some((course) => course.code === newCourse)) { setCloudMessage("Add a course to the current academic period before creating an assignment."); return; }
 
     if (!newTitle.trim() || !newDue) return;
 
@@ -1198,7 +1367,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const id = createRecordId();
     const saved = await persistCloudRecord(() => saveAssignmentRecord(user.uid, id, {
       title: newTitle.trim(), question: newQuestion.trim(), description: newQuestion.trim(), course: newCourse, due: formattedDate, dueDate: newDue, completed: newAssignmentCompleted,
-      studentId: studentMatriculationNo, createdAt: Date.now(),
+      studentId: studentMatriculationNo, createdAt: Date.now(), academicSession: activeAcademicSession, semester: activeAcademicSemester,
     }, true));
     if (!saved) return;
 
@@ -1361,6 +1530,24 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     }
   }
   const activeTheme = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
+  const currentCourseSession = /^\d{4}\/\d{4}$/.test(academicPeriod.session) ? academicPeriod.session : "Session not set";
+  const currentCourseSemester = ["First semester", "Second semester", "Extended semester"].includes(academicPeriod.semester) ? academicPeriod.semester : "Semester not set";
+  const currentCoursePeriodKey = `${currentCourseSession}::${currentCourseSemester}`;
+  const newCoursePeriod = { session: currentCourseSession, semester: currentCourseSemester };
+  const coursePeriodGroups = Array.from(courses.filter((course) => !course.archived).reduce((groups, course) => {
+    const session = course.academicSession ?? currentCourseSession;
+    const semester = course.semester ?? currentCourseSemester;
+    const key = `${session}::${semester}`;
+    const group = groups.get(key) ?? { key, session, semester, courses: [] as Course[] };
+    group.courses.push(course);
+    groups.set(key, group);
+    return groups;
+  }, new Map<string, { key: string; session: string; semester: string; courses: Course[] }>()).values())
+    .sort((a, b) => Number(b.key === currentCoursePeriodKey) - Number(a.key === currentCoursePeriodKey)
+      || b.session.localeCompare(a.session, undefined, { numeric: true })
+      || (["First semester", "Second semester", "Extended semester"].indexOf(a.semester) - ["First semester", "Second semester", "Extended semester"].indexOf(b.semester))
+      || a.semester.localeCompare(b.semester));
+  const visibleCoursePeriodGroups = coursePeriodGroups;
 
   useEffect(() => {
     const color = activeTheme === "dark" ? "#1d2024" : "#f7f8fc";
@@ -1537,6 +1724,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           </div>
         )}
         {courseDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!courseDeleteBusy && event.target === event.currentTarget) setCourseDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="course-delete-title" aria-describedby="course-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">COURSE REMOVAL</p><h2 id="course-delete-title">Delete this course?</h2><p id="course-delete-description"><strong>{courseDeleteRequest.code} · {courseDeleteRequest.name}</strong> and its linked weekly and exam timetable entries will be removed. Assignment records will remain in your list.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={courseDeleteBusy} onClick={() => setCourseDeleteRequest(null)}>Keep course</button><button type="button" className="attachment-delete-confirm" disabled={courseDeleteBusy} onClick={() => void confirmCourseDelete()}>{courseDeleteBusy ? "Deleting…" : "Delete course"}</button></div></section></div>}
+        {courseRestoreRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!courseRestoreBusy && event.target === event.currentTarget) setCourseRestoreRequest(null); }}><section className="attachment-delete-dialog liquid-glass course-restore-dialog" role="alertdialog" aria-modal="true" aria-labelledby="course-restore-title" aria-describedby="course-restore-description"><div className="attachment-delete-icon course-restore-icon" aria-hidden="true">↶</div><p className="profile-kicker">COURSE ARCHIVE</p><h2 id="course-restore-title">Restore this course?</h2><p id="course-restore-description"><strong>{courseRestoreRequest.code} · {courseRestoreRequest.name}</strong> will return to your active courses and remain saved to your account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={courseRestoreBusy} onClick={() => setCourseRestoreRequest(null)}>Keep archived</button><button type="button" className="attachment-delete-confirm course-restore-confirm" disabled={courseRestoreBusy} onClick={() => void confirmCourseRestore()}>{courseRestoreBusy ? "Restoring…" : "Restore course"}</button></div></section></div>}
         {assignmentDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!assignmentDeleteBusy && event.target === event.currentTarget) setAssignmentDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="assignment-delete-title" aria-describedby="assignment-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">ASSIGNMENT REMOVAL</p><h2 id="assignment-delete-title">Delete this assignment?</h2><p id="assignment-delete-description"><strong>{assignmentDeleteRequest.title}</strong> will be removed from your assignment list and deleted from this device and account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={assignmentDeleteBusy} onClick={() => setAssignmentDeleteRequest(null)}>Keep assignment</button><button type="button" className="attachment-delete-confirm" disabled={assignmentDeleteBusy} onClick={() => void confirmAssignmentDelete()}>{assignmentDeleteBusy ? "Deleting…" : "Delete assignment"}</button></div></section></div>}
         {timetableDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!timetableDeleteBusy && event.target === event.currentTarget) setTimetableDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="timetable-delete-title" aria-describedby="timetable-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">TIMETABLE REMOVAL</p><h2 id="timetable-delete-title">Delete this timetable entry?</h2><p id="timetable-delete-description">{timetableDeleteRequest.type === "weekly" ? <><strong>{timetableDeleteRequest.entry.courseCode}</strong> · {timetableDeleteRequest.entry.day}, {timetableDeleteRequest.entry.start}–{timetableDeleteRequest.entry.end} will be removed from your weekly timetable.</> : <><strong>{timetableDeleteRequest.entry.title}</strong> · {timetableDeleteRequest.entry.courseCode}, {timetableDeleteRequest.entry.date} at {timetableDeleteRequest.entry.start} will be removed from your exam timetable.</>}</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={timetableDeleteBusy} onClick={() => setTimetableDeleteRequest(null)}>Keep entry</button><button type="button" className="attachment-delete-confirm" disabled={timetableDeleteBusy} onClick={() => void confirmTimetableDelete()}>{timetableDeleteBusy ? "Deleting…" : "Delete timetable"}</button></div></section></div>}
         {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
@@ -1585,13 +1773,6 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                   <h2>New assignment</h2>
                   <p>Add an assignment to your academic planner.</p>
                 </div>
-                <button
-                  className="close-button"
-                  onClick={() => { resetAssignmentForm(); setShowForm(false); }}
-                  aria-label="Close form"
-                >
-                  ×
-                </button>
               </div>
 
               <form className="assignment-form" onSubmit={addAssignment}>
@@ -1655,9 +1836,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
                 <p className="assignment-id-note">A unique assignment ID and creation date are added automatically when you save.</p>
 
-                <button className="primary-button" type="submit">
-                  Save assignment
-                </button>
+                <div className="assignment-entry-actions">
+                  <button className="primary-button" type="submit">Save assignment</button>
+                  <button className="assignment-entry-cancel liquid-glass" type="button" onClick={cancelAssignmentForm}>Cancel</button>
+                </div>
               </form>
             </section>
           )}
@@ -1787,16 +1969,18 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               <div className="section-heading">
                 <div>
                   <h2>Your courses</h2>
-                  <p>Courses currently displayed in your workspace.</p>
+                  <p>Your courses are saved for the current academic period: {newCoursePeriod.session} · {newCoursePeriod.semester}.</p>
                 </div>
                 <button className="primary-button" onClick={startNewCourse}>
                   <span>＋</span> Add course
                 </button>
               </div>
               {showCourseForm && (
-                <form className="assignment-form course-form" onSubmit={saveCourse}>
+                <form className="assignment-form course-form liquid-glass" onSubmit={saveCourse}>
                   <label>Course code<input value={newCourseCode} onChange={(event) => setNewCourseCode(event.target.value)} placeholder="e.g. BIO 104" required /></label>
                   <label>Course name<input value={newCourseName} onChange={(event) => setNewCourseName(event.target.value)} placeholder="e.g. Introductory Biology" required /></label>
+                  <label><span>Lecturer name <small className="course-field-optional">(optional)</small></span><input value={newCourseLecturer} onChange={(event) => setNewCourseLecturer(event.target.value)} placeholder="e.g. Dr. Ada Okafor" maxLength={100} autoComplete="name" /></label>
+                  <label><span>Lecture venue <small className="course-field-optional">(optional)</small></span><input value={newCourseVenue} onChange={(event) => setNewCourseVenue(event.target.value)} placeholder="e.g. Science Lecture Hall 2" maxLength={120} autoComplete="off" /></label>
                   <div className="course-credit-field" ref={courseCreditPickerRef}>
                     <span>Course credit units</span>
                     <button type="button" className="course-credit-trigger liquid-glass" aria-haspopup="dialog" aria-expanded={showCourseCredits} onClick={() => setShowCourseCredits((open) => !open)}>
@@ -1809,40 +1993,64 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                       </div>
                     </div>}
                   </div>
-                  <button className="primary-button" type="submit">{editingCourseCode ? "Save changes" : "Save course"}</button>
+                  <div className="course-form-actions">
+                    <button className="primary-button" type="submit">{editingCourseCode ? "Save changes" : "Save course"}</button>
+                    <button className="course-form-cancel liquid-glass" type="button" onClick={cancelCourseForm}>Cancel</button>
+                  </div>
                   {newCourseCode.trim() && courses.some((course) => course.code === newCourseCode.trim().toUpperCase() && course.code !== editingCourseCode) && <p className="form-error">A course with this code already exists.</p>}
                 </form>
               )}
-              <div className="course-grid">
-                {courses.map((course) => (
-                  <article className="course-card" key={course.code} data-search-id={course.code}>
-                    <div className="course-card-top">
-                      <div className={`course-icon ${course.color}`}>
-                        {course.code.slice(0, 3)}
-                      </div>
-                      <div className="course-menu-wrap">
-                        <button
-                          className="course-menu-button"
-                          aria-label={`Course options for ${course.code}`}
-                          aria-expanded={openCourseMenu === course.code}
-                          onClick={() => setOpenCourseMenu((current) => current === course.code ? null : course.code)}
-                        >
-                          ⋯
-                        </button>
-                        {openCourseMenu === course.code && (
-                          <div className="course-menu">
-                            <button onClick={() => beginEditCourse(course.code)}>Edit course</button>
-                            <button onClick={() => void removeCourse(course.code)}>Delete course</button>
+              {showCourseForm && !editingCourseCode && <p className="course-period-note liquid-glass">This course will be saved under {newCoursePeriod.session} · {newCoursePeriod.semester}.</p>}
+              <div className="course-period-list">
+                {visibleCoursePeriodGroups.map((group) => (
+                  <section className="course-period-group" key={group.key} aria-label={`${group.session}, ${group.semester}`}>
+                    <header className="course-period-heading liquid-glass">
+                      <div><span>Academic period</span><h3>{group.session} · {group.semester}</h3></div>
+                      {group.key === currentCoursePeriodKey && <span className="course-period-current">Current period</span>}
+                    </header>
+                    <div className="course-grid">
+                      {group.courses.map((course) => (
+                        <article className="course-card" key={course.code} data-search-id={course.code}>
+                          <div className="course-card-top">
+                            <div className={`course-icon ${course.color}`}>{course.code.slice(0, 3)}</div>
+                            <div className="course-menu-wrap">
+                              <button className="course-menu-button" aria-label={`Course options for ${course.code}`} aria-expanded={openCourseMenu === course.code} onClick={() => setOpenCourseMenu((current) => current === course.code ? null : course.code)}>⋯</button>
+                              {openCourseMenu === course.code && <div className="course-menu liquid-glass"><button onClick={() => beginEditCourse(course.code)}>Edit course</button><button onClick={() => void setCourseArchived(course.code, true)}>Archive course</button><button onClick={() => void removeCourse(course.code)}>Delete course</button></div>}
+                            </div>
                           </div>
-                        )}
-                      </div>
+                          <h3>{course.name}</h3>
+                          <p>{course.code}</p>
+                          <span className="course-credit-badge">{course.creditUnits ? `${course.creditUnits} ${course.creditUnits === 1 ? "credit" : "credits"}` : "Credits not set"}</span>
+                          {(course.lecturerName || course.lectureVenue) && <div className="course-details">{course.lecturerName && <p><span>Lecturer</span>{course.lecturerName}</p>}{course.lectureVenue && <p><span>Venue</span>{course.lectureVenue}</p>}</div>}
+                        </article>
+                      ))}
                     </div>
-                    <h3>{course.name}</h3>
-                    <p>{course.code}</p>
-                    <span className="course-credit-badge">{course.creditUnits ? `${course.creditUnits} ${course.creditUnits === 1 ? "credit" : "credits"}` : "Credits not set"}</span>
-                  </article>
+                  </section>
                 ))}
+                {coursePeriodGroups.length === 0 && <p className="empty-state">No courses are saved for {newCoursePeriod.session} · {newCoursePeriod.semester} yet. Add a course or restore one from this academic period.</p>}
               </div>
+              {courses.some((course) => course.archived) && (
+                <section className="archived-courses" aria-labelledby="archived-courses-title">
+                  <div className="section-heading">
+                    <div><h2 id="archived-courses-title">Archived courses</h2><p>Archived courses stay saved and can be restored at any time.</p></div>
+                  </div>
+                  <div className="course-grid">
+                    {courses.filter((course) => course.archived).map((course) => (
+                      <article className="course-card archived-course-card liquid-glass" key={course.code} data-search-id={course.code}>
+                        <div className="course-card-top">
+                          <div className={`course-icon ${course.color}`}>{course.code.slice(0, 3)}</div>
+                          <span className="archived-course-label">Archived</span>
+                        </div>
+                        <h3>{course.name}</h3>
+                        <p>{course.code}</p>
+                        <span className="course-credit-badge">{course.creditUnits ? `${course.creditUnits} ${course.creditUnits === 1 ? "credit" : "credits"}` : "Credits not set"}</span>
+                        {(course.lecturerName || course.lectureVenue) && <div className="course-details">{course.lecturerName && <p><span>Lecturer</span>{course.lecturerName}</p>}{course.lectureVenue && <p><span>Venue</span>{course.lectureVenue}</p>}</div>}
+                        <button className="restore-course-button liquid-glass" type="button" onClick={() => setCourseRestoreRequest(course)}>Restore course</button>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
               {recentCourseCodes.length > 0 && (
                 <section className="recent-courses" aria-labelledby="recent-courses-title">
                   <div className="section-heading">
@@ -1959,7 +2167,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <label>End time<input type="time" value={scheduleEnd} onChange={(event) => setScheduleEnd(event.target.value)} required /></label>
                   </div>
                   {scheduleStart >= scheduleEnd && <p className="form-error">End time must be later than start time.</p>}
-                  <button className="primary-button" type="submit">{editingScheduleId ? "Save schedule" : "Add to timetable"}</button>
+                  <div className="schedule-form-actions">
+                    <button className="primary-button" type="submit">{editingScheduleId ? "Save schedule" : "Add to timetable"}</button>
+                    <button className="schedule-form-cancel" type="button" onClick={cancelScheduleForm}>Cancel</button>
+                  </div>
                 </form>
               )}
               <div className="timetable-list">
@@ -1999,7 +2210,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 <label>Exam date<input type="date" value={examDraft.date} onChange={(event) => setExamDraft((draft) => ({ ...draft, date: event.target.value }))} required /></label>
                 <label>Start time<input type="time" value={examDraft.start} onChange={(event) => setExamDraft((draft) => ({ ...draft, start: event.target.value }))} required /></label>
                 <label>Venue<input value={examDraft.location} onChange={(event) => setExamDraft((draft) => ({ ...draft, location: event.target.value }))} placeholder="e.g. Main auditorium" maxLength={160} required /></label>
-                <div className="exam-form-actions"><button className="primary-button" type="submit">{editingExamId ? "Save exam" : "Add to exam timetable"}</button>{editingExamId && <button className="profile-cancel" type="button" onClick={() => { setEditingExamId(null); setExamFormOpen(false); }}>Cancel</button>}</div>
+                <div className="exam-form-actions">
+                  <button className="primary-button" type="submit">{editingExamId ? "Save exam" : "Add to exam timetable"}</button>
+                  <button className="exam-form-cancel liquid-glass" type="button" onClick={cancelExamForm}>Cancel</button>
+                </div>
               </form>}
               <div className="exam-list">
                 {[...exams].sort((a, b) => `${a.date}T${a.start}`.localeCompare(`${b.date}T${b.start}`)).map((exam) => {
@@ -2026,6 +2240,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             page={activePage}
             searchTargetId={activePage === "Notes & Resources" ? searchTargetId : null}
             studentUid={user.uid}
+            currentAcademicSession={activeAcademicSession}
+            currentAcademicSemester={activeAcademicSemester}
+            courses={courses}
             connected={cloudConnected && isOnline}
             online={isOnline}
             syncPending={queuedWriteCount > 0}
