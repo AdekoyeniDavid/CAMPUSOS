@@ -1604,6 +1604,9 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .grade-record > div { display: grid; gap: 4px; min-width: 0; }
 .grade-record strong { color: #303044; font-size: 12px; overflow-wrap: anywhere; }
 .grade-record span { color: #85899c; font-size: 10px; }
+.grade-record .study-action { min-width: 72px; min-height: 44px; touch-action: manipulation; }
+.grade-delete-dialog { width: min(420px,calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))); max-height: calc(100dvh - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.grade-delete-dialog .attachment-delete-actions button { min-width: 0; }
 .grade-badge { padding: 6px 9px; border: 1px solid rgba(185,149,112,.2); border-radius: 9px; background: rgba(232,214,191,.38); color: #735438 !important; font-weight: 800; white-space: nowrap; }
 .database-explainer, .backup-card { display: flex; align-items: flex-start; gap: 15px; padding: 18px; border-radius: 17px; animation: glassDrop .35s cubic-bezier(.2,.8,.2,1) both; }
 .database-explainer h3, .backup-card h3 { margin: 0 0 6px; color: #303044; font-size: 14px; }
@@ -1660,6 +1663,9 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 @media (min-width: 561px) and (max-width: 1100px) { .grade-form .grade-period-field, .grade-form > button { grid-column: 1 / -1; } }
 @media (min-width: 1100px) { .course-material-course-grid { grid-template-columns: repeat(auto-fit,minmax(min(100%,230px),1fr)); } }
 @media (max-width: 560px) { .study-form, .grade-form { grid-template-columns: 1fr; } .study-wide, .study-form-actions, .grade-form button { grid-column: auto; } .study-filter-row { grid-template-columns: 1fr; } .cgpa-summary { padding: 12px 7px; gap: 5px; } .cgpa-summary strong { font-size: 20px; } .cgpa-summary span, .cgpa-summary small { font-size: 8px; } .grade-record { grid-template-columns: minmax(0,1fr) auto; gap: 8px; } .grade-record .study-action { grid-column: 2; justify-self: end; } .database-count-grid { grid-template-columns: 1fr 1fr; } .restore-confirm-warning { grid-template-columns: 1fr 1fr; } .restore-confirm-warning p { grid-column: 1 / -1; } }
+@media (max-width: 380px) { .grade-delete-dialog .attachment-delete-actions { grid-template-columns: minmax(0,1fr); } .grade-delete-dialog .attachment-delete-actions button { width: 100%; min-height: 46px; } }
+@media (pointer: coarse) { .grade-record .study-action, .grade-delete-dialog .attachment-delete-actions button { min-height: 48px; touch-action: manipulation; } }
+@media (orientation: landscape) and (max-height: 520px) { .grade-delete-dialog { max-height: calc(100dvh - 16px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); margin-block: 8px; } }
 @media (max-width: 560px) { .study-form-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; } .study-form-actions > button { width: 100%; min-height: 46px; padding-inline: 8px; white-space: normal; } }
 @media (max-width: 560px) { .course-material-library { padding: 12px; } .course-material-course-grid { grid-template-columns: minmax(0,1fr); } .course-material-library-heading { align-items: center; } }
 @media (pointer: coarse) { .course-material-add { min-height: 48px; font-size: 12px; } }
@@ -3350,6 +3356,7 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .event-form-context { margin: 0; color: #777b91; font-size: 12px; }
 .event-info p { margin: 0; color: #777b91; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .event-row { min-width: 0; }
+.event-row .event-info { flex: 1 1 0%; min-width: 0; overflow-wrap: anywhere; }
 .event-row .task-menu-wrap { flex: 0 0 auto; }
 .event-row .course-menu-button { min-width: 42px; min-height: 42px; }
 .timetable-conflict-alert { grid-column: 1 / -1; display: grid; gap: 5px; min-width: 0; padding: 12px 14px; border: 1px solid rgba(169,72,62,.22); border-radius: 14px; color: #7c3f3a; background: linear-gradient(145deg, rgba(255,246,243,.82), rgba(244,225,220,.68)); box-shadow: inset 0 1px 1px rgba(255,255,255,.86), 0 8px 22px rgba(120,56,48,.07); animation: glassDrop .28s cubic-bezier(.2,.8,.2,1) both; }
@@ -3372,6 +3379,10 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 }
 
 @media (max-width: 360px) {
+  .event-row { grid-template-columns: 38px minmax(0, 1fr) 44px; gap: 6px; padding-inline: 0; }
+  .event-row .event-date-tile { width: 38px; height: 44px; border-radius: 11px; }
+  .event-row .event-date-tile strong { font-size: 15px; }
+  .event-row .event-date-tile span { font-size: 9px; }
   .event-form-actions { grid-template-columns: minmax(0, 1fr); }
 }
 

@@ -16,6 +16,7 @@ const attachmentStore = "attachments";
 const cloudOperationStore = "operations";
 const pendingWritesByUserAndTimeIndex = "by-user-and-queue-time";
 const watchers = new Map<string, Set<(records: Array<Record<string, unknown> & { id: string }>) => void>>();
+const remoteSnapshotWrites = new Map<string, Promise<void>>();
 let databasePromise: Promise<StoreDatabase> | undefined;
 let cloudOperationsDatabasePromise: Promise<StoreDatabase> | undefined;
 const flushRunning = new Set<string>();
@@ -517,7 +518,20 @@ function remoteValueMatchesExpected(remoteValue: unknown, expectedValue: unknown
   return Object.is(remote, expected);
 }
 
-export async function replaceWithRemoteRecords(uid: string, collection: OfflineCollection, remote: Array<Record<string, unknown> & { id: string }>, authoritative = true) {
+export function replaceWithRemoteRecords(uid: string, collection: OfflineCollection, remote: Array<Record<string, unknown> & { id: string }>, authoritative = true) {
+  // Firestore may deliver a second snapshot while IndexedDB is still applying
+  // the first one. Serialize per collection so an older, slower reconciliation
+  // can never overwrite a newer realtime snapshot on this device.
+  const key = watcherKey(uid, collection);
+  const previous = remoteSnapshotWrites.get(key) ?? Promise.resolve();
+  const task = previous.catch(() => undefined).then(() => applyRemoteSnapshot(uid, collection, remote, authoritative));
+  remoteSnapshotWrites.set(key, task);
+  return task.finally(() => {
+    if (remoteSnapshotWrites.get(key) === task) remoteSnapshotWrites.delete(key);
+  });
+}
+
+async function applyRemoteSnapshot(uid: string, collection: OfflineCollection, remote: Array<Record<string, unknown> & { id: string }>, authoritative: boolean) {
   const db = await openDatabase();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction([recordStore, outboxStore], "readwrite");
@@ -577,14 +591,23 @@ export async function replaceWithRemoteRecords(uid: string, collection: OfflineC
 }
 
 export async function pendingWriteCount(uid: string, collection?: OfflineCollection) {
-  const writes = (await readAllByKeyPrefix<PendingWrite>(outboxStore, `${uid}/`))
-    .filter((item) => !collection || item.collection === collection).length;
+  // The common status/retry path needs only a count. Use IndexedDB's compound
+  // index so the one-second reconnect fallback does not deserialize a growing
+  // queue on low-memory mobile devices.
+  const writes = collection
+    ? (await readAllByKeyPrefix<PendingWrite>(outboxStore, `${uid}/`)).filter((item) => item.collection === collection).length
+    : await pendingWritesCountForUser(uid);
   if (collection && collection !== "studentSections") return writes;
   const [attachmentOps, cloudOperations] = await Promise.all([
     countPendingAttachmentOperations(uid),
     listPendingCloudOperations(uid),
   ]);
   return writes + attachmentOps + cloudOperations.length;
+}
+
+/** Fast indexed count for the Firestore record outbox only. */
+export function pendingRecordWriteCount(uid: string) {
+  return pendingWritesCountForUser(uid);
 }
 
 /** Count upload/delete markers with a cursor so status refreshes never materialize saved PDFs. */

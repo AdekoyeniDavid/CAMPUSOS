@@ -9,6 +9,10 @@ export type ReconnectOptions<T> = {
   isHealthy?: (value: T) => boolean;
 };
 
+// Mobile browsers can suspend Firestore's transport as soon as a tab is
+// backgrounded. Treat even a short app switch as a possible stale connection.
+const suspendedConnectionThresholdMs = 2_000;
+
 /** Rebuild a live subscription after errors and when a suspended browser resumes. */
 export function watchWithReconnect<T>(
   factory: WatchFactory<T>,
@@ -131,14 +135,15 @@ export function watchWithReconnect<T>(
   };
 
   const onFocus = () => {
-    const wasSuspended = hiddenAt !== undefined && Date.now() - hiddenAt >= 15_000;
+    const wasSuspended = hiddenAt !== undefined && Date.now() - hiddenAt >= suspendedConnectionThresholdMs;
     hiddenAt = undefined;
     if (wasSuspended) restart();
     else resume();
   };
   const onPageShow = (event: PageTransitionEvent) => {
+    const wasSuspended = hiddenAt !== undefined && Date.now() - hiddenAt >= suspendedConnectionThresholdMs;
     hiddenAt = undefined;
-    if (event.persisted) restart();
+    if (event.persisted || wasSuspended) restart();
     else resume();
   };
   const onVisibilityChange = () => {
@@ -146,7 +151,7 @@ export function watchWithReconnect<T>(
       hiddenAt ??= Date.now();
       return;
     }
-    const wasSuspended = hiddenAt !== undefined && Date.now() - hiddenAt >= 15_000;
+    const wasSuspended = hiddenAt !== undefined && Date.now() - hiddenAt >= suspendedConnectionThresholdMs;
     hiddenAt = undefined;
     if (wasSuspended) restart();
     else resume();

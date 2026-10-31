@@ -7,7 +7,7 @@ import { watchWithReconnect } from "./reconnect";
 export type StudentSection = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress";
 export type CourseRecord = { code: string; name: string; color: string; creditUnits?: number; lecturerName?: string; lectureVenue?: string; archived?: boolean; academicSession?: string; semester?: string; storageId?: string };
 export type AssignmentRecord = { title: string; question: string; description?: string; course: string; due: string; dueDate?: string; completed: boolean; studentId?: string; academicSession?: string; semester?: string; createdAt?: number | string | { seconds?: number }; updatedAt?: number | string | { seconds?: number } };
-export type ScheduleRecord = { courseCode: string; day: string; start: string; end: string; academicSession?: string; semester?: string };
+export type ScheduleRecord = { courseCode: string; courseName?: string; day: string; start: string; end: string; academicSession?: string; semester?: string };
 export type ExamRecord = { title: string; courseCode: string; date: string; start: string; end?: string; location: string; academicSession?: string; semester?: string };
 export type EventRecord = { title: string; description: string; date?: string; start?: string; end?: string; location?: string; scheduled: boolean; academicSession?: string; semester?: string };
 export type TimetableReminderPreference = { sourceType: "weekly" | "exam" | "event"; sourceId: string; courseCode: string; leadMinutes: number };
@@ -290,33 +290,33 @@ export async function deleteLegacyStudyRecord(uid: string, field: "studyNotes" |
 
 export function watchStudentDocument(
   uid: string,
-  listener: (student: Record<string, unknown> | undefined, fromCache: boolean) => void,
+  listener: (student: Record<string, unknown> | undefined, fromCache: boolean, hasPendingWrites: boolean) => void,
   onError: (error: unknown) => void,
 ) {
-  return watchWithReconnect<[Record<string, unknown> | undefined, boolean]>(async (next, error) => {
+  return watchWithReconnect<[Record<string, unknown> | undefined, boolean, boolean]>(async (next, error) => {
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { doc, onSnapshot } = await import("firebase/firestore");
     return onSnapshot(doc(db, "students", uid), { includeMetadataChanges: true }, (snapshot) => {
-      next([snapshot.exists() ? snapshot.data() : undefined, snapshot.metadata.fromCache]);
+      next([snapshot.exists() ? snapshot.data() : undefined, snapshot.metadata.fromCache, snapshot.metadata.hasPendingWrites]);
     }, error);
-  }, ([student, fromCache]) => listener(student, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
+  }, ([student, fromCache, hasPendingWrites]) => listener(student, fromCache, hasPendingWrites), onError, { isHealthy: ([, fromCache]) => !fromCache });
 }
 
 export function watchStudentCollection(
   uid: string,
   collectionName: Exclude<OfflineCollection, "studentSections">,
-  listener: (records: Array<Record<string, unknown> & { id: string }>, fromCache: boolean) => void,
+  listener: (records: Array<Record<string, unknown> & { id: string }>, fromCache: boolean, hasPendingWrites: boolean) => void,
   onError: (error: unknown) => void,
 ) {
-  return watchWithReconnect<[Array<Record<string, unknown> & { id: string }>, boolean]>(async (next, error) => {
+  return watchWithReconnect<[Array<Record<string, unknown> & { id: string }>, boolean, boolean]>(async (next, error) => {
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { collection, onSnapshot } = await import("firebase/firestore");
     return onSnapshot(collection(db, "students", uid, collectionName), { includeMetadataChanges: true }, (snapshot) => {
-      next([snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache]);
+      next([snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache, snapshot.metadata.hasPendingWrites]);
     }, error);
-  }, ([records, fromCache]) => listener(records, fromCache), onError, { isHealthy: ([, fromCache]) => !fromCache });
+  }, ([records, fromCache, hasPendingWrites]) => listener(records, fromCache, hasPendingWrites), onError, { isHealthy: ([, fromCache]) => !fromCache });
 }
 
 export function watchTimetableReminderPreferences(
@@ -591,6 +591,7 @@ function validateCloudRecord(collection: OfflineCollection, data: Record<string,
       && (data.dueDate === undefined || dateIsValid(data.dueDate)) && periodIsValid;
   } else if (collection === "schedules") {
     valid = text("courseCode", 1, 32) && ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].includes(String(data.day))
+      && (data.courseName === undefined || (typeof data.courseName === "string" && data.courseName.trim().length > 0 && data.courseName.length <= 160))
       && timeIsValid(data.start) && timeIsValid(data.end) && String(data.start) < String(data.end) && periodIsValid;
   } else if (collection === "exams") {
     valid = text("title", 1, 160) && text("courseCode", 1, 32)

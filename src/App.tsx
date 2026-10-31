@@ -31,7 +31,7 @@ import {
   syncPendingStudyAttachments,
   type EventRecord,
 } from "./firestore";
-import { acknowledgePendingCloudOperation, listPendingCloudOperations, pendingWriteCount, queuePendingCloudOperation, replaceWithRemoteRecords, syncPendingWrites, watchLocalRecords } from "./offlineStore";
+import { acknowledgePendingCloudOperation, listPendingCloudOperations, pendingRecordWriteCount, pendingWriteCount, queuePendingCloudOperation, replaceWithRemoteRecords, syncPendingWrites, watchLocalRecords } from "./offlineStore";
 import "./App.css";
 import { createRecordId, readStoredValue, removeStoredValue, writeStoredValue } from "./browser";
 import { normalizeCourseRecords } from "./courseRecords";
@@ -59,6 +59,7 @@ type AcademicPeriod = { session: string; semester: string };
 type Schedule = {
   id: string;
   courseCode: string;
+  courseName?: string;
   day: string;
   start: string;
   end: string;
@@ -279,6 +280,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const [isOnline, setIsOnline] = useState(() => navigator.onLine);
   const [scheduleCode, setScheduleCode] = useState("");
   const [scheduleName, setScheduleName] = useState("");
+  const [scheduleSaveError, setScheduleSaveError] = useState("");
   const [scheduleDay, setScheduleDay] = useState("Monday");
   const [scheduleStart, setScheduleStart] = useState("09:00");
   const [scheduleEnd, setScheduleEnd] = useState("10:00");
@@ -321,7 +323,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   function findTimetableConflicts(candidate: TimetableConflictSlot): TimetableConflictSlot[] {
     const existing: TimetableConflictSlot[] = [
-      ...schedules.map((schedule) => ({ type: "weekly" as const, id: schedule.id, title: courses.find((course) => course.code === schedule.courseCode)?.name ?? schedule.courseCode, day: schedule.day, start: schedule.start, end: schedule.end })),
+      ...schedules.map((schedule) => ({ type: "weekly" as const, id: schedule.id, title: courses.find((course) => course.code === schedule.courseCode)?.name ?? schedule.courseName ?? schedule.courseCode, day: schedule.day, start: schedule.start, end: schedule.end })),
       ...exams.map((exam) => ({ type: "exam" as const, id: exam.id, title: `${exam.title} (${exam.courseCode})`, date: exam.date, start: exam.start, end: exam.end || defaultExamEnd(exam.start) })),
       ...events.filter((entry) => entry.scheduled && !!entry.date && !!entry.start && !!entry.end).map((entry) => ({ type: "event" as const, id: entry.id, title: entry.title, date: entry.date!, start: entry.start!, end: entry.end! })),
     ];
@@ -668,6 +670,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   useEffect(() => {
     let pendingReadVersion = 0;
+    let retryCheckRunning = false;
     let attachmentRetryDelayMs = 1_000;
     let attachmentRetryTimer: number | undefined;
     const refreshPending = (event?: Event) => {
@@ -765,16 +768,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     // online/focus/visibility paths as cross-browser fallbacks.
     const networkInformation = (navigator as Navigator & { connection?: EventTarget }).connection;
     const retryQueuedWrites = () => {
-      if (!navigator.onLine || !firebaseConfigured) return;
-      const readVersion = ++pendingReadVersion;
-      void pendingWriteCount(user.uid).then((count) => {
-        if (readVersion !== pendingReadVersion) return;
+      // The one-second fallback is for an active app whose browser missed a
+      // reconnect event. Hidden mobile tabs are suspended by the OS anyway, so
+      // avoid waking their storage/network stack until the app resumes.
+      if (!navigator.onLine || !firebaseConfigured || document.visibilityState !== "visible") return;
+      if (retryCheckRunning) return;
+      retryCheckRunning = true;
+      void pendingRecordWriteCount(user.uid).then((count) => {
         if (count > 0) {
           void syncPendingWrites(user.uid).finally(refreshPending);
-          setTimetableQueueVersion((version) => version + 1);
-          retryAttachmentsInBackground();
         }
-      }).catch(() => undefined);
+      }).catch(() => undefined).finally(() => { retryCheckRunning = false; });
     };
     const onSyncRequest = (event: Event) => {
       refreshPending();
@@ -786,7 +790,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         setTimetableQueueVersion((version) => version + 1);
       }
     };
-    const retryInterval = window.setInterval(retryQueuedWrites, 30_000);
+    // Online events are missed by some mobile browsers after radio handoffs or
+    // app suspension. Keep the fallback short so durable local edits drain
+    // promptly without requiring a manual refresh; it only reads the queue.
+    const retryInterval = window.setInterval(retryQueuedWrites, 1_000);
     window.addEventListener("online", updateConnection);
     window.addEventListener("offline", updateConnection);
     window.addEventListener("focus", resumeSync);
@@ -854,11 +861,15 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       collection: "courses" | "assignments" | "schedules" | "exams" | "events",
       records: Array<Record<string, unknown> & { id: string }>,
       fromCache: boolean,
+      hasPendingWrites: boolean,
     ) => {
       // Only report this collection ready after its remote snapshot is safely
       // applied to the on-device store. This keeps Connected from racing ahead
       // of the data shown by the UI on slower mobile devices.
-      void replaceWithRemoteRecords(user.uid, collection, records, !fromCache)
+      // Firestore can emit our own optimistic local write in an online snapshot.
+      // It is not durable on the server until hasPendingWrites clears; treating
+      // it as authoritative can remove a queued item if the server rejects it.
+      void replaceWithRemoteRecords(user.uid, collection, records, !fromCache && !hasPendingWrites)
         .then(() => markReady(key, fromCache))
         .catch(() => failed(key));
     };
@@ -870,13 +881,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     };
     window.addEventListener("offline", clearLiveStatusWhenOffline);
     unsubscribers = [
-        watchStudentDocument(user.uid, (studentData, fromCache) => {
+        watchStudentDocument(user.uid, (studentData, fromCache, hasPendingWrites) => {
           const profileName = (studentData?.profile as Record<string, unknown> | undefined)?.fullName;
           if (typeof profileName === "string" && profileName.trim()) setStudentName(profileName);
           if (studentData) {
-            void cacheStudentDocument(user.uid, studentData, !fromCache)
+            void cacheStudentDocument(user.uid, studentData, !fromCache && !hasPendingWrites)
               .then(() => {
-                if (!fromCache) authoritativeStudentDocumentLoaded = true;
+                if (!fromCache && !hasPendingWrites) authoritativeStudentDocumentLoaded = true;
                 markReady("profile", fromCache);
                 // Grades and notes/resources are stored inside the student profile's
                 // progress data, so wait for that hydration before reporting Connected.
@@ -884,13 +895,13 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
               })
               .catch(() => { failed("profile"); failed("studyRecords"); });
           } else {
-            if (!fromCache) authoritativeStudentDocumentLoaded = false;
+            if (!fromCache && !hasPendingWrites) authoritativeStudentDocumentLoaded = false;
             academicPeriodHistoryReadyRef.current = false;
             markReady("profile", fromCache);
             markReady("studyRecords", fromCache);
           }
         }, () => { failed("profile"); failed("studyRecords"); }),
-        watchStudentCollection(user.uid, "courses", (records, fromCache) => {
+        watchStudentCollection(user.uid, "courses", (records, fromCache, hasPendingWrites) => {
           const normalized = records.map((item) => ({ ...item, code: typeof item.code === "string" ? item.code : item.id }));
           // Keep the course code in the cached record as well as using it as its local ID.
           setRecentCourseCodes(records
@@ -901,19 +912,19 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             })
             .map((item) => item.id)
             .slice(0, 6));
-          applyCollectionSnapshot("courses", "courses", normalized, fromCache);
+          applyCollectionSnapshot("courses", "courses", normalized, fromCache, hasPendingWrites);
         }, () => failed("courses")),
-        watchStudentCollection(user.uid, "assignments", (records, fromCache) => {
-          applyCollectionSnapshot("assignments", "assignments", records, fromCache);
+        watchStudentCollection(user.uid, "assignments", (records, fromCache, hasPendingWrites) => {
+          applyCollectionSnapshot("assignments", "assignments", records, fromCache, hasPendingWrites);
         }, () => failed("assignments")),
-        watchStudentCollection(user.uid, "schedules", (records, fromCache) => {
-          applyCollectionSnapshot("schedules", "schedules", records, fromCache);
+        watchStudentCollection(user.uid, "schedules", (records, fromCache, hasPendingWrites) => {
+          applyCollectionSnapshot("schedules", "schedules", records, fromCache, hasPendingWrites);
         }, () => failed("schedules")),
-        watchStudentCollection(user.uid, "exams", (records, fromCache) => {
-          applyCollectionSnapshot("exams", "exams", records, fromCache);
+        watchStudentCollection(user.uid, "exams", (records, fromCache, hasPendingWrites) => {
+          applyCollectionSnapshot("exams", "exams", records, fromCache, hasPendingWrites);
         }, () => failed("exams")),
-        watchStudentCollection(user.uid, "events", (records, fromCache) => {
-          applyCollectionSnapshot("events", "events", records, fromCache);
+        watchStudentCollection(user.uid, "events", (records, fromCache, hasPendingWrites) => {
+          applyCollectionSnapshot("events", "events", records, fromCache, hasPendingWrites);
         }, () => failed("events")),
     ];
     // Do not hold up live subscriptions on the optional first-login profile write.
@@ -1214,21 +1225,39 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
 
   async function saveSchedule(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!hasActiveAcademicPeriod) { setCloudMessage("Set a current academic year and semester in Student Account → Academic Details before adding academic records."); return; }
+    setScheduleSaveError("");
+    if (!hasActiveAcademicPeriod) {
+      setScheduleSaveError("Select a current academic year and semester in Student Account → Academic Details first.");
+      return;
+    }
     const code = scheduleCode.trim().toUpperCase();
     const name = scheduleName.trim();
-    if (!code || !name || scheduleStart >= scheduleEnd || scheduleConflicts.length) return;
-    const existing = courses.find((course) => course.code === code);
+    if (!code || !name) {
+      setScheduleSaveError("Enter both the course code and course name.");
+      return;
+    }
+    if (scheduleStart >= scheduleEnd) {
+      setScheduleSaveError("Choose an end time later than the start time.");
+      return;
+    }
+    if (scheduleConflicts.length) {
+      setScheduleSaveError("This time overlaps another timetable entry. Change the day or time to save it.");
+      return;
+    }
     const id = editingScheduleId ?? createRecordId();
-    const saved = await persistCloudRecord(async () => {
-      if (!existing) {
-        const session = /^\d{4}\/\d{4}$/.test(academicPeriod.session) ? academicPeriod.session : undefined;
-        const semester = ["First semester", "Second semester", "Extended semester"].includes(academicPeriod.semester) ? academicPeriod.semester : undefined;
-        await saveCourseRecord(user.uid, code, { code, name, color: "leather", ...(session ? { academicSession: session } : {}), ...(semester ? { semester } : {}) });
-      }
-      await saveScheduleRecord(user.uid, id, { courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd, academicSession: activeAcademicSession, semester: activeAcademicSemester }, !editingScheduleId);
-    });
-    if (!saved) return;
+    const saved = await persistCloudRecord(() => saveScheduleRecord(user.uid, id, {
+      courseCode: code,
+      courseName: name,
+      day: scheduleDay,
+      start: scheduleStart,
+      end: scheduleEnd,
+      academicSession: activeAcademicSession,
+      semester: activeAcademicSemester,
+    }, !editingScheduleId));
+    if (!saved) {
+      setScheduleSaveError("The schedule could not be saved on this device. Check available storage and try again.");
+      return;
+    }
     const activeReminder = timetableReminders.find((item) => item.sourceType === "weekly" && item.sourceId === id);
     if (activeReminder) {
       try { await persistTimetableReminder({ type: "weekly", entry: { id, courseCode: code, day: scheduleDay, start: scheduleStart, end: scheduleEnd } }, activeReminder.leadMinutes); }
@@ -1240,6 +1269,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingScheduleId(null);
     setScheduleCode("");
     setScheduleName("");
+    setScheduleSaveError("");
   }
 
   function cancelScheduleForm() {
@@ -1247,6 +1277,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setEditingScheduleId(null);
     setScheduleCode("");
     setScheduleName("");
+    setScheduleSaveError("");
     setScheduleDay("Monday");
     setScheduleStart("09:00");
     setScheduleEnd("10:00");
@@ -1255,8 +1286,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   function beginEditSchedule(schedule: Schedule) {
     const course = courses.find((item) => item.code === schedule.courseCode);
     setEditingScheduleId(schedule.id);
+    setScheduleSaveError("");
     setScheduleCode(schedule.courseCode);
-    setScheduleName(course?.name ?? schedule.courseCode);
+    setScheduleName(schedule.courseName ?? course?.name ?? schedule.courseCode);
     setScheduleDay(schedule.day);
     setScheduleStart(schedule.start);
     setScheduleEnd(schedule.end);
@@ -1320,6 +1352,10 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             title: request.entry.title,
             description: request.entry.description,
             scheduled: false,
+            date: "",
+            start: "",
+            end: "",
+            location: "",
             academicSession: request.entry.academicSession,
             semester: request.entry.semester,
           }, false))
@@ -1885,7 +1921,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     ...assignments.map((assignment) => ({ id: assignment.id, title: assignment.title, detail: `${assignment.course} · due ${assignment.due}`, category: "Assignment", page: "Assignments", searchable: `${assignment.title} ${assignment.question} ${assignment.course} ${assignment.due}` })),
     ...schedules.map((schedule) => {
       const course = courses.find((item) => item.code === schedule.courseCode);
-      return { id: schedule.id, title: course?.name ?? schedule.courseCode, detail: `${schedule.courseCode} · ${schedule.day} · ${schedule.start}–${schedule.end}`, category: "Timetable", page: "Timetable", searchable: `${course?.name ?? ""} ${schedule.courseCode} ${schedule.day} ${schedule.start} ${schedule.end}` };
+      const courseName = course?.name ?? schedule.courseName ?? schedule.courseCode;
+      return { id: schedule.id, title: courseName, detail: `${schedule.courseCode} · ${schedule.day} · ${schedule.start}–${schedule.end}`, category: "Timetable", page: "Timetable", searchable: `${courseName} ${schedule.courseCode} ${schedule.day} ${schedule.start} ${schedule.end}` };
     }),
     ...exams.map((exam) => ({ id: exam.id, title: exam.title, detail: `${exam.courseCode} · ${exam.date} · ${exam.location}`, category: "Exam timetable", page: "Timetable", searchable: `${exam.title} ${exam.courseCode} ${exam.date} ${exam.location}` })),
     ...events.map((entry) => ({ id: entry.id, title: entry.title, detail: entry.scheduled ? `${entry.date} · ${entry.start} · ${entry.location ?? ""}` : "No schedule", category: "Event timetable", page: "Timetable", searchable: `${entry.title} ${entry.description} ${entry.date ?? ""} ${entry.location ?? ""}` })),
@@ -2574,21 +2611,22 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                   <h2>Your weekly timetable</h2>
                   <p>Add courses with their weekly meeting day and time.</p>
                 </div>
-                <button className="primary-button" onClick={() => { setEditingScheduleId(null); setScheduleCode(""); setScheduleName(""); setScheduleDay("Monday"); setScheduleStart("09:00"); setScheduleEnd("10:00"); setScheduleFormOpen((open) => !open); }}>
+                <button className="primary-button" onClick={() => { setEditingScheduleId(null); setScheduleCode(""); setScheduleName(""); setScheduleDay("Monday"); setScheduleStart("09:00"); setScheduleEnd("10:00"); setScheduleSaveError(""); setScheduleFormOpen((open) => !open); }}>
                   <span>＋</span> Add course & schedule
                 </button>
               </div>
               {scheduleFormOpen && (
                 <form className="assignment-form schedule-form" onSubmit={saveSchedule}>
-                  <label>Course code<input value={scheduleCode} onChange={(event) => setScheduleCode(event.target.value)} placeholder="e.g. BIO 104" required /></label>
-                  <label>Course name<input value={scheduleName} onChange={(event) => setScheduleName(event.target.value)} placeholder="e.g. Introductory Biology" required /></label>
-                  <label>Day<select value={scheduleDay} onChange={(event) => setScheduleDay(event.target.value)}>{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map((day) => <option key={day}>{day}</option>)}</select></label>
+                  <label>Course code<input value={scheduleCode} onChange={(event) => { setScheduleCode(event.target.value); setScheduleSaveError(""); }} placeholder="e.g. BIO 104" required /></label>
+                  <label>Course name<input value={scheduleName} onChange={(event) => { setScheduleName(event.target.value); setScheduleSaveError(""); }} placeholder="e.g. Introductory Biology" required /></label>
+                  <label>Day<select value={scheduleDay} onChange={(event) => { setScheduleDay(event.target.value); setScheduleSaveError(""); }}>{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map((day) => <option key={day}>{day}</option>)}</select></label>
                   <div className="schedule-time-fields">
-                    <label>Start time<input type="time" value={scheduleStart} onChange={(event) => setScheduleStart(event.target.value)} required /></label>
-                    <label>End time<input type="time" value={scheduleEnd} onChange={(event) => setScheduleEnd(event.target.value)} required /></label>
+                    <label>Start time<input type="time" value={scheduleStart} onChange={(event) => { setScheduleStart(event.target.value); setScheduleSaveError(""); }} required /></label>
+                    <label>End time<input type="time" value={scheduleEnd} onChange={(event) => { setScheduleEnd(event.target.value); setScheduleSaveError(""); }} required /></label>
                   </div>
                   {scheduleStart >= scheduleEnd && <p className="form-error">End time must be later than start time.</p>}
                   <TimetableConflictNotice conflicts={scheduleConflicts} />
+                  {scheduleSaveError && <p className="form-error" role="alert">{scheduleSaveError}</p>}
                   <div className="schedule-form-actions">
                     <button className="primary-button" type="submit" disabled={scheduleConflicts.length > 0}>{editingScheduleId ? "Save schedule" : "Add to timetable"}</button>
                     <button className="schedule-form-cancel" type="button" onClick={cancelScheduleForm}>Cancel</button>
@@ -2603,7 +2641,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                     <div className="lecture-row" key={schedule.id} data-search-id={schedule.id}>
                       <span className="lecture-day">{schedule.day.slice(0, 3).toUpperCase()}</span>
                       <div className="lecture-info">
-                        <strong>{course?.name ?? schedule.courseCode}</strong>
+                        <strong>{course?.name ?? schedule.courseName ?? schedule.courseCode}</strong>
                         <span>{schedule.start} – {schedule.end} · {schedule.courseCode}</span>
                       </div>
                       <div className="course-menu-wrap task-menu-wrap">
@@ -2613,8 +2651,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                           {hasReminder && <button type="button" role="menuitem" onClick={() => requestTimetableReminderRemoval({ type: "weekly", entry: schedule })}>Remove notification reminder</button>}
                           <button type="button" role="menuitem" onClick={() => { setOpenCourseMenu(null); setAssignmentMenuPosition(null); beginEditSchedule(schedule); }}>Edit schedule</button>
                           <button type="button" role="menuitem" onClick={() => { setOpenCourseMenu(null); setAssignmentMenuPosition(null); void removeSchedule(schedule.id); }}>Delete schedule</button>
-                          <button type="button" role="menuitem" onClick={() => { setOpenCourseMenu(null); setAssignmentMenuPosition(null); beginEditCourse(schedule.courseCode); }}>Edit course</button>
-                          <button type="button" role="menuitem" onClick={() => { setOpenCourseMenu(null); setAssignmentMenuPosition(null); void removeCourse(schedule.courseCode); }}>Delete course</button>
+                          {course && <button type="button" role="menuitem" onClick={() => { setOpenCourseMenu(null); setAssignmentMenuPosition(null); beginEditCourse(schedule.courseCode); }}>Edit course</button>}
+                          {course && <button type="button" role="menuitem" onClick={() => { setOpenCourseMenu(null); setAssignmentMenuPosition(null); void removeCourse(schedule.courseCode); }}>Delete course</button>}
                         </div>, document.body)}
                       </div>
                     </div>

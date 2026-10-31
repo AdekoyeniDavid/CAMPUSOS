@@ -132,11 +132,14 @@ service cloud.firestore {
 
     function validSchedule() {
       return request.resource.data.keys().hasOnly([
-          'courseCode', 'day', 'start', 'end', 'createdAt', 'updatedAt', 'academicSession', 'semester'
+          'courseCode', 'courseName', 'day', 'start', 'end', 'createdAt', 'updatedAt', 'academicSession', 'semester'
         ])
         && request.resource.data.courseCode is string
         && request.resource.data.courseCode.size() > 0
         && request.resource.data.courseCode.size() <= 32
+        && (!('courseName' in request.resource.data)
+          || (request.resource.data.courseName is string
+            && request.resource.data.courseName.size() <= 160))
         && request.resource.data.day in [
           'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
         ]
