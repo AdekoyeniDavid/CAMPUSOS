@@ -307,7 +307,7 @@ export async function syncPendingWrites(uid: string) {
           failed = true;
           if (!failureCode && error && typeof error === "object" && "code" in error) {
             const code = (error as { code?: unknown }).code;
-            if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
+            if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
           }
         }
       }
@@ -321,7 +321,7 @@ export async function syncPendingWrites(uid: string) {
           failed = true;
           if (!failureCode && error && typeof error === "object" && "code" in error) {
             const code = (error as { code?: unknown }).code;
-            if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
+            if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
           }
         }
       }
@@ -334,7 +334,7 @@ export async function syncPendingWrites(uid: string) {
     failed = true;
     if (error && typeof error === "object" && "code" in error) {
       const code = (error as { code?: unknown }).code;
-      if (typeof code === "string" && /^[a-z0-9-]+\/[a-z0-9-]+$/.test(code)) failureCode = code;
+      if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
     }
   } finally {
     flushRunning.delete(uid);

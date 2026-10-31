@@ -68,9 +68,18 @@ service cloud.firestore {
       && request.resource.data.createdAt == resource.data.createdAt;
     }
 
+    function validAcademicPeriodFields() {
+      return (!request.resource.data.keys().hasAny(['academicSession'])
+          || (request.resource.data.academicSession is string
+            && request.resource.data.academicSession.size() == 9
+            && request.resource.data.academicSession.matches('^[0-9]{4}/[0-9]{4}$')))
+        && (!request.resource.data.keys().hasAny(['semester'])
+          || request.resource.data.semester in ['First semester', 'Second semester', 'Extended semester']);
+    }
+
     function validCourse() {
       return request.resource.data.keys().hasOnly([
-          'code', 'name', 'color', 'creditUnits', 'archived', 'academicSession', 'semester', 'createdAt', 'updatedAt'
+          'code', 'name', 'color', 'creditUnits', 'lecturerName', 'lectureVenue', 'archived', 'academicSession', 'semester', 'createdAt', 'updatedAt'
         ])
         && request.resource.data.code is string
         && request.resource.data.code.size() > 0
@@ -84,18 +93,17 @@ service cloud.firestore {
             && request.resource.data.creditUnits <= 5))
         && (!request.resource.data.keys().hasAny(['archived'])
           || request.resource.data.archived is bool)
-        && (!request.resource.data.keys().hasAny(['academicSession'])
-          || (request.resource.data.academicSession is string
-            && request.resource.data.academicSession.size() == 9
-            && request.resource.data.academicSession.matches('^[0-9]{4}/[0-9]{4}$')))
-        && (!request.resource.data.keys().hasAny(['semester'])
-          || request.resource.data.semester in ['First semester', 'Second semester', 'Extended semester']);
+        && (!request.resource.data.keys().hasAny(['lecturerName'])
+          || (request.resource.data.lecturerName is string && request.resource.data.lecturerName.size() <= 160))
+        && (!request.resource.data.keys().hasAny(['lectureVenue'])
+          || (request.resource.data.lectureVenue is string && request.resource.data.lectureVenue.size() <= 160))
+        && validAcademicPeriodFields();
     }
 
     function validAssignment(assignmentId) {
       return request.resource.data.keys().hasOnly([
           'id', 'title', 'question', 'description', 'studentId', 'course', 'due',
-          'completed', 'createdAt', 'updatedAt', 'dueDate'
+          'completed', 'createdAt', 'updatedAt', 'dueDate', 'academicSession', 'semester'
         ])
         && (!('id' in request.resource.data)
           || request.resource.data.id == assignmentId)
@@ -118,12 +126,13 @@ service cloud.firestore {
         && (!('dueDate' in request.resource.data)
           || (request.resource.data.dueDate is string
             && request.resource.data.dueDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')))
-        && request.resource.data.completed is bool;
+        && request.resource.data.completed is bool
+        && validAcademicPeriodFields();
     }
 
     function validSchedule() {
       return request.resource.data.keys().hasOnly([
-          'courseCode', 'day', 'start', 'end', 'createdAt', 'updatedAt'
+          'courseCode', 'day', 'start', 'end', 'createdAt', 'updatedAt', 'academicSession', 'semester'
         ])
         && request.resource.data.courseCode is string
         && request.resource.data.courseCode.size() > 0
@@ -133,12 +142,13 @@ service cloud.firestore {
         ]
         && request.resource.data.start is string
         && request.resource.data.end is string
-        && request.resource.data.start < request.resource.data.end;
+        && request.resource.data.start < request.resource.data.end
+        && validAcademicPeriodFields();
     }
 
     function validExam() {
       return request.resource.data.keys().hasOnly([
-          'title', 'courseCode', 'date', 'start', 'location', 'createdAt', 'updatedAt'
+          'title', 'courseCode', 'date', 'start', 'location', 'createdAt', 'updatedAt', 'academicSession', 'semester'
         ])
         && request.resource.data.title is string
         && request.resource.data.title.size() > 0
@@ -152,7 +162,8 @@ service cloud.firestore {
         && request.resource.data.start.size() == 5
         && request.resource.data.location is string
         && request.resource.data.location.size() > 0
-        && request.resource.data.location.size() <= 160;
+        && request.resource.data.location.size() <= 160
+        && validAcademicPeriodFields();
     }
 
     match /students/{studentUid} {

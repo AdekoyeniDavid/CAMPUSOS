@@ -526,7 +526,8 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     const refreshPending = (event?: Event) => {
       if (event instanceof CustomEvent && event.detail?.uid === user.uid) {
         if (event.detail.failed) {
-          const code = event.detail.code as string | undefined;
+          const rawCode = event.detail.code as string | undefined;
+          const code = rawCode?.split("/").pop();
           const reason = code === "permission-denied"
             ? "Firestore rejected the sync. Check account access and database rules."
             : code === "unauthenticated"
@@ -871,6 +872,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         code: request.code,
         name: request.name,
         color: request.color,
+        archived: false,
         creditUnits: request.creditUnits,
         ...(request.lecturerName ? { lecturerName: request.lecturerName } : {}),
         ...(request.lectureVenue ? { lectureVenue: request.lectureVenue } : {}),

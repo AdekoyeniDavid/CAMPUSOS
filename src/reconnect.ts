@@ -80,8 +80,20 @@ export function watchWithReconnect<T>(
     void connect();
   };
 
+  const suspend = () => {
+    if (stopped) return;
+    // Invalidate a subscription that may still be connecting so its eventual handle is closed.
+    epoch += 1;
+    connecting = false;
+    clearRetry();
+    const activeStop = unsubscribe;
+    unsubscribe = undefined;
+    try { activeStop?.(); } catch { /* Recreate the listener when the browser reports connectivity again. */ }
+  };
+
   if (typeof window !== "undefined") {
     window.addEventListener("online", resume);
+    window.addEventListener("offline", suspend);
     window.addEventListener("focus", resume);
     window.addEventListener("pageshow", resume);
   }
@@ -96,6 +108,7 @@ export function watchWithReconnect<T>(
     unsubscribe = undefined;
     if (typeof window !== "undefined") {
       window.removeEventListener("online", resume);
+      window.removeEventListener("offline", suspend);
       window.removeEventListener("focus", resume);
       window.removeEventListener("pageshow", resume);
     }
