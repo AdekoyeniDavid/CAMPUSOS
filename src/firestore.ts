@@ -1,17 +1,101 @@
 import type { User } from "firebase/auth";
 import type { DocumentData, QuerySnapshot } from "firebase/firestore";
-import { getFirestoreDb } from "./firebase";
-import { deleteLocalRecord, listLocalRecords, replaceWithRemoteRecords, saveLocalRecord, syncPendingWrites, type OfflineCollection } from "./offlineStore";
+import { getFirebaseAppInstance, getFirebaseStorageBucket, getFirestoreDb } from "./firebase";
+import { clearPendingAttachmentDelete, clearUnreferencedAttachmentUpload, deleteLocalRecord, listLocalAttachments, listLocalRecords, listPendingAttachmentDeletes, markLocalAttachmentCloudSynced, pendingWriteKeys, queueLocalAttachmentUpload, replaceWithRemoteRecords, saveLocalRecord, type OfflineCollection } from "./offlineStore";
 import { watchWithReconnect } from "./reconnect";
 
 export type StudentSection = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress";
 export type CourseRecord = { code: string; name: string; color: string; creditUnits?: number; lecturerName?: string; lectureVenue?: string; archived?: boolean; academicSession?: string; semester?: string; storageId?: string };
 export type AssignmentRecord = { title: string; question: string; description?: string; course: string; due: string; dueDate?: string; completed: boolean; studentId?: string; academicSession?: string; semester?: string; createdAt?: number | string | { seconds?: number }; updatedAt?: number | string | { seconds?: number } };
 export type ScheduleRecord = { courseCode: string; day: string; start: string; end: string; academicSession?: string; semester?: string };
-export type ExamRecord = { title: string; courseCode: string; date: string; start: string; location: string; academicSession?: string; semester?: string };
-export type TimetableReminderPreference = { sourceType: "weekly" | "exam"; sourceId: string; courseCode: string; leadMinutes: number };
+export type ExamRecord = { title: string; courseCode: string; date: string; start: string; end?: string; location: string; academicSession?: string; semester?: string };
+export type EventRecord = { title: string; description: string; date?: string; start?: string; end?: string; location?: string; scheduled: boolean; academicSession?: string; semester?: string };
+export type TimetableReminderPreference = { sourceType: "weekly" | "exam" | "event"; sourceId: string; courseCode: string; leadMinutes: number };
 export type AssignmentReminderPreference = { sourceType: "assignment"; sourceId: string; courseCode: string; dueDate: string; dueTime: string; leadMinutes: number };
 const studentSections: StudentSection[] = ["profile", "institution", "personal", "contact", "academic", "enrolment", "courses", "progress"];
+
+function validateStudyAttachmentPath(uid: string, attachmentId: string) {
+  if (!uid || !/^[A-Za-z0-9_-]{1,128}$/.test(attachmentId)) throw new Error("This study document has an invalid identifier.");
+  const app = getFirebaseAppInstance();
+  const bucket = getFirebaseStorageBucket();
+  if (!app || !bucket) throw new Error("Firebase file storage is not configured for this project.");
+  return { app, bucket, path: `students/${uid}/study-materials/${attachmentId}` };
+}
+
+export async function uploadStudyAttachment(uid: string, attachmentId: string, file: Blob) {
+  if (!file.size || file.size > 20 * 1024 * 1024) throw new Error("Documents must be smaller than 20 MB.");
+  const { app, bucket, path } = validateStudyAttachmentPath(uid, attachmentId);
+  const { getStorage, ref, uploadBytes } = await import("firebase/storage");
+  const allowedContentTypes = new Set([
+    "application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.oasis.opendocument.text", "application/rtf", "text/rtf", "text/plain", "application/zip", "application/octet-stream",
+  ]);
+  const contentType = allowedContentTypes.has(file.type) ? file.type : "application/octet-stream";
+  await uploadBytes(ref(getStorage(app, `gs://${bucket}`), path), file, { contentType });
+}
+
+export async function downloadStudyAttachmentFromCloud(uid: string, attachmentId: string) {
+  const { app, bucket, path } = validateStudyAttachmentPath(uid, attachmentId);
+  const { getStorage, getBytes, ref } = await import("firebase/storage");
+  const bytes = await getBytes(ref(getStorage(app, `gs://${bucket}`), path), 20 * 1024 * 1024);
+  return new Blob([bytes]);
+}
+
+export async function deleteStudyAttachmentFromCloud(uid: string, attachmentId: string) {
+  const { app, bucket, path } = validateStudyAttachmentPath(uid, attachmentId);
+  const { deleteObject, getStorage, ref } = await import("firebase/storage");
+  await deleteObject(ref(getStorage(app, `gs://${bucket}`), path));
+}
+
+const activeStudyAttachmentSyncs = new Map<string, Promise<void>>();
+
+/** Retry saved document uploads/deletions in the background on any signed-in page. */
+export function syncPendingStudyAttachments(uid: string) {
+  if (!uid || (typeof navigator !== "undefined" && !navigator.onLine)) return Promise.resolve();
+  const existing = activeStudyAttachmentSyncs.get(uid);
+  if (existing) return existing;
+  const task = (async () => {
+    const [records, attachments, pendingDeletes] = await Promise.all([
+      listLocalRecords(uid, "studentSections"),
+      listLocalAttachments(uid),
+      listPendingAttachmentDeletes(uid),
+    ]);
+    for (const id of pendingDeletes) {
+      try { await deleteStudyAttachmentFromCloud(uid, id); }
+      catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? String((error as { code: unknown }).code) : "";
+        if (code !== "storage/object-not-found") throw error;
+      }
+      await clearPendingAttachmentDelete(uid, id);
+    }
+    const referenced = new Set<string>();
+    for (const record of records) {
+      if (!record.id.startsWith("studyNotes") || !Array.isArray(record["value"])) continue;
+      for (const note of record["value"]) {
+        if (!note || typeof note !== "object" || !("attachment" in note)) continue;
+        const attachment = (note as { attachment?: { id?: unknown } }).attachment;
+        if (typeof attachment?.id === "string") referenced.add(attachment.id);
+      }
+    }
+    for (const attachment of attachments) {
+      if (!referenced.has(attachment.id)) {
+        if (attachment.cloudUploadPending) await clearUnreferencedAttachmentUpload(uid, attachment.id);
+        continue;
+      }
+      if (attachment.cloudSynced) continue;
+      if (typeof navigator !== "undefined" && !navigator.onLine) return;
+      if (!attachment.cloudUploadPending) {
+        await queueLocalAttachmentUpload(uid, attachment.id);
+      }
+      await uploadStudyAttachment(uid, attachment.id, attachment.blob);
+      await markLocalAttachmentCloudSynced(uid, attachment.id);
+    }
+  })();
+  activeStudyAttachmentSyncs.set(uid, task);
+  return task.finally(() => {
+    if (activeStudyAttachmentSyncs.get(uid) === task) activeStudyAttachmentSyncs.delete(uid);
+  });
+}
 
 export async function ensureStudentRecord(user: User) {
   const db = await getFirestoreDb();
@@ -41,7 +125,6 @@ export async function ensureStudentRecord(user: User) {
 
 export async function saveStudentSection(uid: string, section: StudentSection, values: Record<string, string>) {
   await saveLocalRecord(uid, "studentSections", section, values);
-  if (navigator.onLine) void syncPendingWrites(uid);
 }
 
 export function studyRecordId(field: "studyNotes" | "gradeRecords", session: string, semester?: string) {
@@ -55,13 +138,29 @@ export async function saveStudyRecord(uid: string, field: "studyNotes" | "gradeR
   }
   const id = studyRecordId(field, session, semester);
   await saveLocalRecord(uid, "studentSections", id, { value, academicSession: session, semester });
-  if (navigator.onLine) void syncPendingWrites(uid);
 }
 
 const semesterOptions = ["First semester", "Second semester", "Extended semester"] as const;
 const periodMigrationRuns = new Map<string, Promise<number>>();
 
 type AcademicPeriod = { session: string; semester: typeof semesterOptions[number]; createdAt: number };
+
+function timestampMilliseconds(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (value && typeof value === "object") {
+    const timestamp = value as { seconds?: unknown; toMillis?: () => number };
+    if (typeof timestamp.toMillis === "function") {
+      const parsed = timestamp.toMillis();
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+    if (typeof timestamp.seconds === "number" && Number.isFinite(timestamp.seconds)) return timestamp.seconds * 1000;
+  }
+  return 0;
+}
 
 function oldestSavedAcademicPeriod(academic: Record<string, unknown> | undefined): AcademicPeriod | undefined {
   if (!academic) return undefined;
@@ -74,7 +173,7 @@ function oldestSavedAcademicPeriod(academic: Record<string, unknown> | undefined
       const year = typeof item["year"] === "string" ? item["year"].trim() : "";
       const semester = item["semester"];
       if (!/^\d{4}\/\d{4}$/.test(year) || !semesterOptions.includes(semester as typeof semesterOptions[number])) return [];
-      return [{ session: year, semester: semester as typeof semesterOptions[number], createdAt: typeof item["createdAt"] === "number" && Number.isFinite(item["createdAt"]) ? item["createdAt"] : 0 }];
+      return [{ session: year, semester: semester as typeof semesterOptions[number], createdAt: timestampMilliseconds(item["createdAt"]) }];
     });
   } catch { /* Fall back to the saved current period for older profile documents. */ }
 
@@ -106,9 +205,10 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
   if (running) return running;
 
   const task = (async () => {
-    const [courses, assignments, schedules, exams, sections] = await Promise.all([
+    const [courses, assignments, schedules, exams, events, sections, pendingKeys] = await Promise.all([
       listLocalRecords(uid, "courses"), listLocalRecords(uid, "assignments"), listLocalRecords(uid, "schedules"),
-      listLocalRecords(uid, "exams"), listLocalRecords(uid, "studentSections"),
+      listLocalRecords(uid, "exams"), listLocalRecords(uid, "events"), listLocalRecords(uid, "studentSections"),
+      pendingWriteKeys(uid),
     ]);
     const academic = sections.find((record) => record.id === "academic");
     const destination = oldestSavedAcademicPeriod(academic);
@@ -119,12 +219,24 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
     const isUnscoped = (record: Record<string, unknown>) =>
       typeof record["academicSession"] !== "string" || !/^\d{4}\/\d{4}$/.test(record["academicSession"])
       || !semesterOptions.includes(record["semester"] as typeof semesterOptions[number]);
+    // Older builds may already have placed legacy records in the session that
+    // happened to be current at the time. If the record predates the user's
+    // first saved academic period, rehome it to that original period too.
+    const belongsToOldestPeriod = (collection: OfflineCollection, record: Record<string, unknown>) => {
+      const id = typeof record["id"] === "string" ? record["id"] : "";
+      if (!id || pendingKeys.has(`${collection}/${id}`)) return false;
+      if (isUnscoped(record)) return true;
+      if (record["academicSession"] === session && record["semester"] === semester) return false;
+      const createdAt = timestampMilliseconds(record["createdAt"]);
+      return destination.createdAt > 0 && createdAt > 0 && createdAt < destination.createdAt;
+    };
     let migrated = 0;
     for (const record of courses) {
-      if (!isUnscoped(record)) continue;
+      if (!belongsToOldestPeriod("courses", record)) continue;
       const code = typeof record["code"] === "string" && record["code"].trim() ? record["code"].trim().toUpperCase() : record.id;
       const targetId = sessionCourseId(session, semester, code);
       const existing = courses.find((candidate) => candidate.id === targetId);
+      if (existing && pendingKeys.has(`courses/${targetId}`)) continue;
       const { id: oldId, storageId: _storageId, ...sourceData } = record;
       const targetData = existing ? Object.fromEntries(Object.entries(existing).filter(([key]) => key !== "id" && key !== "storageId")) : {};
       await saveAndQueue(uid, "courses", targetId, { ...sourceData, ...targetData, code, academicSession: session, semester });
@@ -132,9 +244,9 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
       migrated += 1;
     }
 
-    for (const [collection, records] of [["assignments", assignments], ["schedules", schedules], ["exams", exams]] as const) {
+    for (const [collection, records] of [["assignments", assignments], ["schedules", schedules], ["exams", exams], ["events", events]] as const) {
       for (const record of records) {
-        if (!isUnscoped(record)) continue;
+        if (!belongsToOldestPeriod(collection, record)) continue;
         const { id, ...data } = record;
         await saveAndQueue(uid, collection, id, { ...data, academicSession: session, semester });
         migrated += 1;
@@ -142,6 +254,7 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
     }
 
     for (const record of sections) {
+      if (!belongsToOldestPeriod("studentSections", record)) continue;
       const legacyStudyId = /^(studyNotes|gradeRecords)(?:__(\d{4}-\d{4}))?$/.exec(record.id);
       if (!legacyStudyId || !Array.isArray(record["value"])) continue;
       const hasCompletePeriod = typeof record["academicSession"] === "string"
@@ -153,6 +266,7 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
       const field = legacyStudyId[1] as "studyNotes" | "gradeRecords";
       const targetId = studyRecordId(field, session, semester);
       const existing = sections.find((candidate) => candidate.id === targetId);
+      if (existing && pendingKeys.has(`studentSections/${targetId}`)) continue;
       const existingValue = Array.isArray(existing?.["value"]) ? existing["value"] as unknown[] : [];
       const { id: oldId, ...sourceData } = record;
       const targetValue = mergeStudyValues(existingValue, record["value"] as unknown[]);
@@ -172,7 +286,6 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
 
 export async function deleteLegacyStudyRecord(uid: string, field: "studyNotes" | "gradeRecords") {
   await deleteLocalRecord(uid, "studentSections", field);
-  if (navigator.onLine) void syncPendingWrites(uid);
 }
 
 export function watchStudentDocument(
@@ -218,7 +331,7 @@ export function watchTimetableReminderPreferences(
     return onSnapshot(collection(db, "students", uid, "notificationReminders"), (snapshot) => {
       const records = snapshot.docs.flatMap((item) => {
         const data = item.data();
-        if ((data.sourceType !== "weekly" && data.sourceType !== "exam") || typeof data.sourceId !== "string" || typeof data.courseCode !== "string" || ![5, 15, 30, 60].includes(data.leadMinutes)) return [];
+        if (!(["weekly", "exam", "event"].includes(data.sourceType)) || typeof data.sourceId !== "string" || typeof data.courseCode !== "string" || ![5, 15, 30, 60].includes(data.leadMinutes)) return [];
         return [{ sourceType: data.sourceType, sourceId: data.sourceId, courseCode: data.courseCode, leadMinutes: data.leadMinutes } as TimetableReminderPreference];
       });
       next([records, snapshot.metadata.fromCache]);
@@ -233,7 +346,7 @@ export async function saveTimetableReminderPreference(uid: string, preference: T
   await setDoc(doc(db, "students", uid, "notificationReminders", `${preference.sourceType}_${preference.sourceId}`), preference);
 }
 
-export async function removeTimetableReminderPreference(uid: string, sourceType: "weekly" | "exam", sourceId: string) {
+export async function removeTimetableReminderPreference(uid: string, sourceType: "weekly" | "exam" | "event", sourceId: string) {
   const db = await getFirestoreDb();
   if (!db) throw new Error("Firebase is not configured.");
   const { deleteDoc, doc } = await import("firebase/firestore");
@@ -437,17 +550,65 @@ export async function deleteExam(uid: string, id: string) {
   await deleteAndQueue(uid, "exams", id);
 }
 
+export async function saveEvent(uid: string, id: string, event: EventRecord, isNew: boolean) {
+  await saveAndQueue(uid, "events", id, event, isNew);
+}
+
+export async function deleteEvent(uid: string, id: string) {
+  await deleteAndQueue(uid, "events", id);
+}
+
 async function saveAndQueue(uid: string, collection: OfflineCollection, id: string, data: Record<string, unknown>, isNew = false) {
+  validateCloudRecord(collection, data);
   const now = Date.now();
   // The document ID belongs in the Firestore path, not in its data payload.
   const recordData = Object.fromEntries(Object.entries(data).filter(([key]) => key !== "id"));
   await saveLocalRecord(uid, collection, id, { ...recordData, ...(isNew && !("createdAt" in recordData) ? { createdAt: now } : {}), updatedAt: now });
-  if (navigator.onLine) void syncPendingWrites(uid);
+}
+
+function validateCloudRecord(collection: OfflineCollection, data: Record<string, unknown>) {
+  const text = (key: string, min: number, max: number) => typeof data[key] === "string" && (data[key] as string).trim().length >= min && (data[key] as string).length <= max;
+  const dateIsValid = (value: unknown) => {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const date = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  };
+  const periodIsValid = (data.academicSession === undefined || (typeof data.academicSession === "string" && /^\d{4}\/\d{4}$/.test(data.academicSession)))
+    && (data.semester === undefined || ["First semester", "Second semester", "Extended semester"].includes(String(data.semester)));
+  const timeIsValid = (value: unknown) => typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+  let valid = true;
+  if (collection === "courses") {
+    valid = text("code", 1, 32) && text("name", 1, 160)
+      && (data.creditUnits === undefined || (Number.isInteger(data.creditUnits) && Number(data.creditUnits) >= 1 && Number(data.creditUnits) <= 5))
+      && (data.archived === undefined || typeof data.archived === "boolean")
+      && (data.lecturerName === undefined || (typeof data.lecturerName === "string" && data.lecturerName.length <= 160))
+      && (data.lectureVenue === undefined || (typeof data.lectureVenue === "string" && data.lectureVenue.length <= 160)) && periodIsValid;
+  } else if (collection === "assignments") {
+    valid = text("title", 1, 200) && typeof data.question === "string" && data.question.length <= 10_000
+      && (data.description === undefined || (typeof data.description === "string" && data.description.length <= 10_000))
+      && (data.studentId === undefined || (typeof data.studentId === "string" && data.studentId.length <= 80))
+      && text("course", 1, 32) && text("due", 1, 80) && typeof data.completed === "boolean"
+      && (data.dueDate === undefined || dateIsValid(data.dueDate)) && periodIsValid;
+  } else if (collection === "schedules") {
+    valid = text("courseCode", 1, 32) && ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].includes(String(data.day))
+      && timeIsValid(data.start) && timeIsValid(data.end) && String(data.start) < String(data.end) && periodIsValid;
+  } else if (collection === "exams") {
+    valid = text("title", 1, 160) && text("courseCode", 1, 32)
+      && dateIsValid(data.date)
+      && timeIsValid(data.start) && (data.end === undefined || (timeIsValid(data.end) && String(data.end) > String(data.start)))
+      && text("location", 1, 160) && periodIsValid;
+  } else if (collection === "events") {
+    valid = text("title", 1, 160) && typeof data.description === "string" && data.description.length <= 4_000
+      && typeof data.scheduled === "boolean"
+      && (!data.scheduled || (dateIsValid(data.date)
+        && timeIsValid(data.start) && timeIsValid(data.end) && String(data.start) < String(data.end)
+        && typeof data.location === "string" && data.location.length <= 160)) && periodIsValid;
+  }
+  if (!valid) throw new Error(`This ${collection === "studentSections" ? "student detail" : collection.slice(0, -1)} has invalid or incomplete fields. Review the highlighted values and try again.`);
 }
 
 async function deleteAndQueue(uid: string, collection: OfflineCollection, id: string) {
   await deleteLocalRecord(uid, collection, id);
-  if (navigator.onLine) void syncPendingWrites(uid);
 }
 
 export function recordData(snapshot: QuerySnapshot<DocumentData>) {

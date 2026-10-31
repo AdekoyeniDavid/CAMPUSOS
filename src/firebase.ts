@@ -23,8 +23,20 @@ const firebaseApp = firebaseConfigured
   : null;
 
 export const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
-const firestoreWorkerHost = import.meta.env?.VITE_FIRESTORE_WORKER_HOST?.trim();
+// Keep Firestore on its native Firebase transport for direct realtime updates.
+// The Worker proxy remains opt-in for environments that specifically need it.
+const firestoreWorkerHost = import.meta.env?.VITE_USE_FIRESTORE_WORKER_PROXY === "true"
+  ? import.meta.env?.VITE_FIRESTORE_WORKER_HOST?.trim()
+  : "";
 let firestoreDbPromise: Promise<Firestore | null> | undefined;
+
+export function getFirebaseAppInstance() {
+  return firebaseApp;
+}
+
+export function getFirebaseStorageBucket() {
+  return firebaseConfig.storageBucket || "";
+}
 
 /** Load Firestore only after a user enters the signed-in workspace. */
 export function getFirestoreDb(): Promise<Firestore | null> {

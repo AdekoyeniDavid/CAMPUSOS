@@ -274,7 +274,7 @@ function localDateTimeToUtc(dateText, timeText, timeZone) {
 function nextTimetableNotification(row, now = Date.now()) {
   const zone = row.time_zone;
   const fireOffset = Number(row.lead_minutes) * 60_000;
-  if (row.source_type === "exam") return localDateTimeToUtc(row.local_date, row.local_time, zone) - fireOffset;
+  if (row.source_type !== "weekly") return localDateTimeToUtc(row.local_date, row.local_time, zone) - fireOffset;
   const current = zonedParts(new Date(now), zone);
   const currentDate = new Date(Date.UTC(current.year, current.month - 1, current.day));
   const targetWeekday = Number(row.day_of_week);
@@ -304,7 +304,7 @@ async function saveTimetableReminder(env, user, body) {
   }
   const sourceType = body?.action === "remove" ? body.sourceType : body?.sourceType;
   const sourceId = body?.sourceId;
-  if (!["weekly", "exam"].includes(sourceType) || typeof sourceId !== "string" || !/^[\w-]{1,128}$/.test(sourceId)) return apiJson({ error: "Select a valid timetable entry." }, 400);
+  if (!["weekly", "exam", "event"].includes(sourceType) || typeof sourceId !== "string" || !/^[\w-]{1,128}$/.test(sourceId)) return apiJson({ error: "Select a valid timetable entry." }, 400);
   if (body.action === "remove") {
     await env.CAMPUSOS_DB.prepare("DELETE FROM timetable_notification_reminders WHERE uid = ? AND source_type = ? AND source_id = ?").bind(user.uid, sourceType, sourceId).run();
     return apiJson({ ok: true, removed: true });
@@ -320,12 +320,12 @@ async function saveTimetableReminder(env, user, body) {
   if (typeof title !== "string" || !title.trim() || title.length > 160 || typeof courseCode !== "string" || !/^[\w -]{1,32}$/.test(courseCode)) return apiJson({ error: "The timetable reminder details are invalid." }, 400);
   const row = { source_type: sourceType, local_time: localTime, local_date: body.date, day_of_week: body.dayOfWeek, time_zone: timeZone, lead_minutes: leadMinutes };
   if (sourceType === "weekly" && (!Number.isInteger(body.dayOfWeek) || body.dayOfWeek < 0 || body.dayOfWeek > 6)) return apiJson({ error: "Choose a valid class day." }, 400);
-  if (sourceType === "exam") {
+  if (sourceType !== "weekly") {
     const date = typeof body.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? new Date(`${body.date}T00:00:00Z`) : null;
-    if (!date || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== body.date) return apiJson({ error: "Choose a valid exam date." }, 400);
+    if (!date || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== body.date) return apiJson({ error: `Choose a valid ${sourceType} date.` }, 400);
   }
   const nextFireAt = nextTimetableNotification(row);
-  if (!nextFireAt || (sourceType === "exam" && nextFireAt <= Date.now())) return apiJson({ error: "This exam reminder time has already passed." }, 400);
+  if (!nextFireAt || (sourceType !== "weekly" && nextFireAt <= Date.now())) return apiJson({ error: "This reminder time has already passed." }, 400);
   const existing = await env.CAMPUSOS_DB.prepare("SELECT 1 FROM timetable_notification_reminders WHERE uid = ? AND source_type = ? AND source_id = ? LIMIT 1").bind(user.uid, sourceType, sourceId).first();
   if (!existing) {
     const count = await env.CAMPUSOS_DB.prepare("SELECT COUNT(*) AS count FROM timetable_notification_reminders WHERE uid = ?").bind(user.uid).first();
@@ -338,7 +338,7 @@ async function saveTimetableReminder(env, user, body) {
     ON CONFLICT(uid, source_type, source_id) DO UPDATE SET title = excluded.title, course_code = excluded.course_code,
       local_date = excluded.local_date, day_of_week = excluded.day_of_week, local_time = excluded.local_time, time_zone = excluded.time_zone,
       location = excluded.location, lead_minutes = excluded.lead_minutes, next_fire_at = excluded.next_fire_at, locked_until = 0, updated_at = unixepoch()
-    RETURNING source_id`).bind(id, user.uid, sourceType, sourceId, title.trim(), courseCode, sourceType === "exam" ? body.date : null, sourceType === "weekly" ? body.dayOfWeek : null, localTime, timeZone, location, leadMinutes, nextFireAt).all();
+    RETURNING source_id`).bind(id, user.uid, sourceType, sourceId, title.trim(), courseCode, sourceType !== "weekly" ? body.date : null, sourceType === "weekly" ? body.dayOfWeek : null, localTime, timeZone, location, leadMinutes, nextFireAt).all();
   if (!result.success || !result.results?.length) return apiJson({ error: "Could not save this timetable reminder." }, 503);
   return apiJson({ ok: true, sourceType, sourceId, leadMinutes, nextFireAt });
 }
@@ -392,11 +392,13 @@ async function deliverScheduledTimetableReminder(env, row) {
   const result = await env.CAMPUSOS_DB.prepare("SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE uid = ?").bind(row.uid).all();
   const subscriptions = result.results ?? [];
   let delivered = 0;
-  const title = row.source_type === "exam" ? `Exam reminder: ${row.title}` : `Class reminder: ${row.title}`;
+  const title = row.source_type === "weekly" ? `Class reminder: ${row.title}` : row.source_type === "exam" ? `Exam reminder: ${row.title}` : `Event reminder: ${row.title}`;
   const place = row.location ? ` · ${row.location}` : "";
-  const body = row.source_type === "exam"
-    ? `${row.course_code} · Exam starts in ${row.lead_minutes} minutes${place}.`
-    : `${row.course_code} · Class starts in ${row.lead_minutes} minutes.`;
+  const body = row.source_type === "weekly"
+    ? `${row.course_code} · Class starts in ${row.lead_minutes} minutes.`
+    : row.source_type === "exam"
+      ? `${row.course_code} · Exam starts in ${row.lead_minutes} minutes${place}.`
+      : `Starts in ${row.lead_minutes} minutes${place}.`;
   const payload = { title, body, tag: `timetable-${row.source_type}-${row.source_id}`, url: "/" };
   await Promise.all(subscriptions.map(async (subscription) => {
     try {
@@ -424,7 +426,7 @@ async function processDueTimetableReminders(env) {
     const claim = await env.CAMPUSOS_DB.prepare("UPDATE timetable_notification_reminders SET locked_until = ? WHERE id = ? AND next_fire_at = ? AND locked_until <= ? RETURNING id").bind(now + 90_000, row.id, row.next_fire_at, now).all();
     if (!claim.success || !claim.results?.length) return;
     if (now - Number(row.next_fire_at) > 10 * 60_000) {
-      if (row.source_type === "exam") await env.CAMPUSOS_DB.prepare("DELETE FROM timetable_notification_reminders WHERE id = ?").bind(row.id).run();
+      if (row.source_type !== "weekly") await env.CAMPUSOS_DB.prepare("DELETE FROM timetable_notification_reminders WHERE id = ?").bind(row.id).run();
       else {
         const nextFireAt = nextTimetableNotification(row, now);
         await env.CAMPUSOS_DB.prepare("UPDATE timetable_notification_reminders SET next_fire_at = ?, locked_until = 0, updated_at = unixepoch() WHERE id = ?").bind(nextFireAt, row.id).run();
@@ -433,7 +435,7 @@ async function processDueTimetableReminders(env) {
     }
     const delivery = await deliverScheduledTimetableReminder(env, row);
     if (delivery.delivered > 0) {
-      if (row.source_type === "exam") await env.CAMPUSOS_DB.prepare("DELETE FROM timetable_notification_reminders WHERE id = ?").bind(row.id).run();
+      if (row.source_type !== "weekly") await env.CAMPUSOS_DB.prepare("DELETE FROM timetable_notification_reminders WHERE id = ?").bind(row.id).run();
       else {
         const nextFireAt = nextTimetableNotification(row, now);
         await env.CAMPUSOS_DB.prepare("UPDATE timetable_notification_reminders SET next_fire_at = ?, locked_until = 0, updated_at = unixepoch() WHERE id = ?").bind(nextFireAt, row.id).run();

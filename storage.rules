@@ -1,0 +1,28 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function ownsVerifiedStudySpace(studentUid) {
+      return request.auth != null
+        && request.auth.uid == studentUid
+        && request.auth.token.email_verified == true;
+    }
+
+    match /students/{studentUid}/study-materials/{attachmentId} {
+      allow read, delete: if ownsVerifiedStudySpace(studentUid);
+      allow create, update: if ownsVerifiedStudySpace(studentUid)
+        && request.resource.size > 0
+        && request.resource.size <= 20 * 1024 * 1024
+        && request.resource.contentType in [
+          'application/pdf',
+          'application/msword',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'application/vnd.oasis.opendocument.text',
+          'application/rtf',
+          'text/rtf',
+          'text/plain',
+          'application/zip',
+          'application/octet-stream'
+        ];
+    }
+  }
+}

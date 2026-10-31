@@ -18,6 +18,7 @@ const collectionNames = {
   assignments: "Assignments",
   schedules: "Weekly timetable",
   exams: "Exam timetable",
+  events: "Event timetable",
 };
 
 function labelFor(key: string) {
@@ -80,8 +81,8 @@ export async function createBackupPdf(backup: Backup) {
     }
   }
 
-  for (const name of ["courses", "assignments", "schedules", "exams"] as const) {
-    sections.push({ title: collectionNames[name], rows: rowsFromCollection(backup.collections[name]) });
+  for (const name of ["courses", "assignments", "schedules", "exams", "events"] as const) {
+    sections.push({ title: collectionNames[name], rows: rowsFromCollection(backup.collections[name] ?? []) });
   }
   const report = createGlassReportPdf("CampusOS Academic Backup", "Private student data | account backup", `Created ${backup.createdAt}   |   Keep this file secure`, sections);
   return makeRestorablePdf(report, backup);
