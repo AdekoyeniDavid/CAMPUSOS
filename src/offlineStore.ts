@@ -502,6 +502,62 @@ export async function deleteLocalRecord(uid: string, collection: OfflineCollecti
   requestImmediateSync(uid);
 }
 
+/** Remove this account's cached records, attachments, and queued writes after remote account deletion. */
+export async function purgeLocalUserData(uid: string) {
+  if (!uid || uid.includes("/")) throw new Error("This account identifier is invalid.");
+  const [recordsDb, operationsDb] = await Promise.all([openDatabase(), openCloudOperationsDatabase()]);
+  await Promise.all([
+    new Promise<void>((resolve, reject) => {
+      const tx = recordsDb.transaction([recordStore, outboxStore, attachmentStore], "readwrite");
+      for (const storeName of [recordStore, outboxStore, attachmentStore]) {
+        const store = tx.objectStore(storeName);
+        const request = store.openCursor();
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return;
+          const value = cursor.value as { uid?: string };
+          if (value.uid === uid) cursor.delete();
+          cursor.continue();
+        };
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("Could not clear this device's saved account data."));
+      tx.onabort = () => reject(tx.error ?? new Error("Could not clear this device's saved account data."));
+    }),
+    new Promise<void>((resolve, reject) => {
+      const tx = operationsDb.transaction(cloudOperationStore, "readwrite");
+      const request = tx.objectStore(cloudOperationStore).openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if ((cursor.value as { uid?: string }).uid === uid) cursor.delete();
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("Could not clear this device's saved account updates."));
+      tx.onabort = () => reject(tx.error ?? new Error("Could not clear this device's saved account updates."));
+    }),
+  ]);
+  for (const collection of ["courses", "assignments", "schedules", "exams", "events", "studentSections"] as const) {
+    for (const listener of watchers.get(watcherKey(uid, collection)) ?? []) listener([]);
+    watchers.delete(watcherKey(uid, collection));
+  }
+  flushRunning.delete(uid);
+  syncScheduled.delete(uid);
+  retryDelayMs.delete(uid);
+  const timer = retryTimers.get(uid);
+  if (timer) clearTimeout(timer);
+  retryTimers.delete(uid);
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.removeItem("campusos-remembered-email");
+      window.localStorage.removeItem("campusos-remember-me");
+      window.localStorage.removeItem("campusos-pending-email-verification");
+      window.localStorage.removeItem(`campusos-timetable-reminder-sync:${uid}`);
+    } catch { /* Local preferences are best-effort after remote deletion succeeds. */ }
+  }
+}
+
 function remoteValueMatchesExpected(remoteValue: unknown, expectedValue: unknown): boolean {
   const remote = normalizeLocalValue(remoteValue);
   const expected = normalizeLocalValue(expectedValue);

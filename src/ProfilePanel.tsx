@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import type { FormEvent } from "react";
+import type { CSSProperties, FormEvent } from "react";
 import { firebaseConfigured } from "./firebase";
 import { saveStudentSection } from "./firestore";
 import { watchLocalRecords } from "./offlineStore";
+import { clearDeferredInstallPrompt, getDeferredInstallPrompt, subscribeToInstallPrompt, type DeferredInstallPrompt } from "./pwaInstall";
 
 type CourseSummary = { code: string; name: string; creditUnits?: number };
 type SectionId = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress" | "security";
@@ -303,7 +304,7 @@ function ProfileSection({ id, title, fields, values, editing, menuOpen, onMenu, 
   </section>;
 }
 
-export function ProfilePanel({ studentUid, registeredEmail, courses, studentName, onNameChange, onChangePassword, onSignOut, onSignOutOtherSessions, onClose }: { studentUid: string; registeredEmail: string; courses: CourseSummary[]; studentName: string; onNameChange: (name: string) => void; onChangePassword: (current: string, next: string) => Promise<void>; onSignOut: () => Promise<void>; onSignOutOtherSessions: () => Promise<void>; onClose: () => void }) {
+export function ProfilePanel({ studentUid, registeredEmail, requiresPasswordForDeletion, courses, studentName, onNameChange, onChangePassword, onDeleteAccount, onSignOut, onSignOutOtherSessions, onClose }: { studentUid: string; registeredEmail: string; requiresPasswordForDeletion: boolean; courses: CourseSummary[]; studentName: string; onNameChange: (name: string) => void; onChangePassword: (current: string, next: string) => Promise<void>; onDeleteAccount: (currentPassword: string) => Promise<void>; onSignOut: () => Promise<void>; onSignOutOtherSessions: () => Promise<void>; onClose: () => void }) {
   const [data, setData] = useState<ProfileData>(() => ({ ...initialData, profile: { ...initialData.profile, fullName: studentName }, contact: { ...initialData.contact, email: registeredEmail }, courses: { registeredCourses: registeredCoursesText(courses) } }));
   const [editing, setEditing] = useState<SectionId | null>(null);
   const [openMenu, setOpenMenu] = useState<SectionId | null>(null);
@@ -311,32 +312,86 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
   const [securityFormOpen, setSecurityFormOpen] = useState(false);
   const [revokingOtherSessions, setRevokingOtherSessions] = useState(false);
   const [signOutConfirmation, setSignOutConfirmation] = useState<"current" | "others" | null>(null);
+  const [accountDeletionOpen, setAccountDeletionOpen] = useState(false);
+  const [accountDeletionBusy, setAccountDeletionBusy] = useState(false);
+  const [accountDeletionEmail, setAccountDeletionEmail] = useState("");
+  const [accountDeletionPassword, setAccountDeletionPassword] = useState("");
+  const [accountDeletionError, setAccountDeletionError] = useState("");
+  const [accountDialogViewport, setAccountDialogViewport] = useState({ height: 0, top: 0 });
   const [passwordFields, setPasswordFields] = useState({ current: "", next: "", confirm: "" });
-  const [installPrompt, setInstallPrompt] = useState<{ prompt: () => Promise<{ outcome: "accepted" | "dismissed" }>; } | null>(null);
+  const [installPrompt, setInstallPrompt] = useState<DeferredInstallPrompt | null>(() => getDeferredInstallPrompt());
   const [installMessage, setInstallMessage] = useState("");
   const [isInstalled, setIsInstalled] = useState(() => typeof window !== "undefined" && (window.matchMedia?.("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true));
 
   useEffect(() => {
-    const captureInstallPrompt = (event: Event) => {
-      event.preventDefault();
-      setInstallPrompt(event as Event & { prompt: () => Promise<{ outcome: "accepted" | "dismissed" }> });
-    };
+    const unsubscribe = subscribeToInstallPrompt(setInstallPrompt);
     const installed = () => { setIsInstalled(true); setInstallPrompt(null); setInstallMessage("CampusOS is installed on this device."); };
-    window.addEventListener("beforeinstallprompt", captureInstallPrompt);
+    const displayMode = window.matchMedia?.("(display-mode: standalone)");
+    const updateInstalledState = () => setIsInstalled(displayMode?.matches === true || (navigator as Navigator & { standalone?: boolean }).standalone === true);
     window.addEventListener("appinstalled", installed);
-    return () => { window.removeEventListener("beforeinstallprompt", captureInstallPrompt); window.removeEventListener("appinstalled", installed); };
+    if (displayMode?.addEventListener) displayMode.addEventListener("change", updateInstalledState);
+    // Safari versions before MediaQueryList.addEventListener use addListener.
+    else displayMode?.addListener?.(updateInstalledState);
+    updateInstalledState();
+    return () => {
+      unsubscribe();
+      window.removeEventListener("appinstalled", installed);
+      if (displayMode?.removeEventListener) displayMode.removeEventListener("change", updateInstalledState);
+      else displayMode?.removeListener?.(updateInstalledState);
+    };
   }, []);
+
+  useEffect(() => {
+    if (!accountDeletionOpen) return;
+    const viewport = window.visualViewport;
+    const updateViewport = () => setAccountDialogViewport({
+      height: viewport?.height ?? window.innerHeight,
+      top: viewport?.offsetTop ?? 0,
+    });
+    updateViewport();
+    viewport?.addEventListener("resize", updateViewport);
+    viewport?.addEventListener("scroll", updateViewport);
+    window.addEventListener("resize", updateViewport);
+    return () => {
+      viewport?.removeEventListener("resize", updateViewport);
+      viewport?.removeEventListener("scroll", updateViewport);
+      window.removeEventListener("resize", updateViewport);
+    };
+  }, [accountDeletionOpen]);
 
   async function installCampusOS() {
     if (installPrompt) {
-      const result = await installPrompt.prompt();
-      setInstallPrompt(null);
-      if (result.outcome === "accepted") { setIsInstalled(true); setInstallMessage("CampusOS was added to your device."); }
-      else setInstallMessage("Installation was cancelled. You can install CampusOS later from your browser menu.");
+      try {
+        const promptResult = await installPrompt.prompt();
+        const result = promptResult ?? await installPrompt.userChoice;
+        clearDeferredInstallPrompt(installPrompt);
+        setInstallPrompt(null);
+        if (result?.outcome === "accepted") { setIsInstalled(true); setInstallMessage("CampusOS was added to your device."); }
+        else setInstallMessage("Installation was cancelled. You can install CampusOS later from your browser menu.");
+      } catch {
+        clearDeferredInstallPrompt(installPrompt);
+        setInstallPrompt(null);
+        setInstallMessage("Your browser could not open its install prompt. Use the browser menu and choose Install app or Add to Home Screen.");
+      }
       return;
     }
-    const isAppleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-    setInstallMessage(isAppleMobile ? "In Safari, tap Share, then Add to Home Screen. Open the installed CampusOS app to enable web push notifications." : "Use your browser’s Install app or Add to Home Screen option to install CampusOS.");
+    const userAgent = navigator.userAgent;
+    const isAppleMobile = /iPad|iPhone|iPod/i.test(userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const isSafari = /Safari/i.test(userAgent) && !/(CriOS|FxiOS|EdgiOS|OPiOS|Chrome|Chromium|Android)/i.test(userAgent);
+    const isMacSafari = /Macintosh|Mac OS X/i.test(userAgent) && isSafari;
+    const isAndroid = /Android/i.test(userAgent);
+
+    if (isAppleMobile && isSafari) {
+      setInstallMessage("Tap Share in Safari, choose Add to Home Screen, then tap Add. If you do not see it, scroll the Share menu or add the action from Edit Actions.");
+    } else if (isAppleMobile) {
+      setInstallMessage("Tap your browser’s Share or menu button and choose Add to Home Screen. If that option is not available here, open this page in Safari, then tap Share → Add to Home Screen → Add.");
+    } else if (isMacSafari) {
+      setInstallMessage("In Safari, choose File → Add to Dock, then confirm Add. CampusOS will be available from your Dock and Launchpad.");
+    } else if (isAndroid) {
+      setInstallMessage("Open the browser menu (⋮ or ☰) and choose Install app or Add to Home screen, then confirm. The exact wording depends on your browser.");
+    } else {
+      setInstallMessage("Open the browser menu or install icon near the address bar and choose Install CampusOS, Install app, or Add to Home Screen. If no install option appears, try Chrome or Edge on desktop, or Safari on iPhone/iPad.");
+    }
   }
 
   useEffect(() => {
@@ -452,6 +507,30 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
     }
   }
 
+  async function confirmDeleteAccount(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const confirmationValue = registeredEmail.trim() || "DELETE";
+    if (accountDeletionEmail.trim().toLowerCase() !== confirmationValue.toLowerCase()) {
+      setAccountDeletionError(registeredEmail.trim()
+        ? "The email does not match this account. Check it and try again."
+        : "Type DELETE exactly to confirm account deletion.");
+      return;
+    }
+    setAccountDeletionBusy(true);
+    setAccountDeletionError("");
+    setMessage("");
+    try {
+      await onDeleteAccount(accountDeletionPassword);
+      setMessage("Your account and saved records have been deleted.");
+      setAccountDeletionOpen(false);
+    } catch (error) {
+      setAccountDeletionError(error instanceof Error ? error.message : "The account could not be deleted. Sign in again and retry.");
+    } finally {
+      setAccountDeletionBusy(false);
+      setAccountDeletionPassword("");
+    }
+  }
+
   return <>
     <button className="profile-overlay" aria-label="Close student profile" onClick={onClose} />
     <aside className="profile-panel liquid-glass" aria-label="Student profile" role="dialog" aria-modal="true">
@@ -468,9 +547,10 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
         <section className="profile-card liquid-glass profile-section-security">
           <header className="profile-card-heading"><h3>Account &amp; Security</h3><div className="profile-menu-wrap"><button className="profile-menu-trigger" aria-label="Account security options" aria-expanded={openMenu === "security"} onClick={() => setOpenMenu((current) => current === "security" ? null : "security")}>⋯</button>{openMenu === "security" && <div className="profile-section-menu"><button onClick={() => { setSecurityFormOpen(true); setOpenMenu(null); }}>Edit security</button></div>}</div></header>
           <dl className="profile-fields"><div><dt>Active sessions</dt><dd>This device stays signed in when you revoke other sessions.</dd></div><div><dt>Security settings</dt><dd>Managed by your campus account</dd></div></dl>
-          <div className="profile-install-card liquid-glass"><div><strong>CampusOS on this device</strong><p>Install CampusOS for a home screen shortcut and eligible background reminders.</p></div><button className="primary-button" type="button" onClick={() => void installCampusOS()} disabled={isInstalled}>{isInstalled ? "Installed" : "Install CampusOS"}</button>{installMessage && <p className="profile-install-message" role="status">{installMessage}</p>}</div>
+          <div className="profile-install-card liquid-glass"><div><strong>CampusOS on this device</strong><p>{isInstalled ? "CampusOS is ready from your Home Screen or app launcher." : "Install CampusOS for a home screen shortcut and eligible background reminders. Your browser will ask you to confirm."}</p></div><button className="primary-button" type="button" onClick={() => void installCampusOS()} disabled={isInstalled}>{isInstalled ? "Installed" : "Install CampusOS"}</button>{installMessage && <p className="profile-install-message" role="status">{installMessage}</p>}</div>
           <button className="profile-session-revoke" type="button" onClick={() => setSignOutConfirmation("others")} disabled={revokingOtherSessions}>{revokingOtherSessions ? "Signing out other devices…" : "Sign out of all other sessions"}</button>
           <button className="profile-signout-button" onClick={() => setSignOutConfirmation("current")}>Sign out of this session</button>
+          <button className="profile-delete-account" type="button" onClick={() => { setAccountDeletionEmail(""); setAccountDeletionPassword(""); setAccountDeletionError(""); setMessage(""); setAccountDeletionOpen(true); }}>Delete account and student data</button>
           {securityFormOpen && <form className="profile-edit-form" onSubmit={savePassword}><label>Current password<input type="password" autoComplete="current-password" value={passwordFields.current} onChange={(event) => setPasswordFields((current) => ({ ...current, current: event.target.value }))} required /></label><label>New password<input type="password" autoComplete="new-password" value={passwordFields.next} onChange={(event) => setPasswordFields((current) => ({ ...current, next: event.target.value }))} required minLength={8} /></label><label>Confirm new password<input type="password" autoComplete="new-password" value={passwordFields.confirm} onChange={(event) => setPasswordFields((current) => ({ ...current, confirm: event.target.value }))} required /></label><div className="profile-form-actions"><button className="primary-button" type="submit">Update password</button><button className="profile-cancel" type="button" onClick={() => setSecurityFormOpen(false)}>Cancel</button></div></form>}
         </section>
       </div>
@@ -486,6 +566,21 @@ export function ProfilePanel({ studentUid, registeredEmail, courses, studentName
           <button type="button" className="signout-confirm-submit" onClick={() => void confirmSignOut()}>{signOutConfirmation === "current" ? "Sign out" : "Sign out other devices"}</button>
         </div>
       </section>
+    </div>}
+    {accountDeletionOpen && <div className="signout-confirm-backdrop account-delete-backdrop" style={{ "--account-delete-viewport-height": `${accountDialogViewport.height || window.innerHeight}px`, "--account-delete-viewport-top": `${accountDialogViewport.top}px` } as CSSProperties} onClick={() => { if (!accountDeletionBusy) setAccountDeletionOpen(false); }}>
+      <form className="signout-confirm liquid-glass account-delete-confirm" role="alertdialog" aria-modal="true" aria-labelledby="account-delete-title" aria-describedby="account-delete-description" onSubmit={(event) => void confirmDeleteAccount(event)} onClick={(event) => event.stopPropagation()}>
+        <div className="signout-confirm-icon" aria-hidden="true">!</div>
+        <h3 id="account-delete-title">Delete your CampusOS account?</h3>
+        <p id="account-delete-description">This permanently removes your student records, uploaded study materials, reminders, and account. This cannot be undone.</p>
+        <label>{registeredEmail.trim() ? "Type your registered email to confirm" : "Type DELETE to confirm"}<input type={registeredEmail.trim() ? "email" : "text"} autoComplete={registeredEmail.trim() ? "email" : "off"} value={accountDeletionEmail} onChange={(event) => { setAccountDeletionEmail(event.target.value); setAccountDeletionError(""); }} required maxLength={320} /></label>
+        {requiresPasswordForDeletion && <label>Current password<input type="password" autoComplete="current-password" value={accountDeletionPassword} onChange={(event) => setAccountDeletionPassword(event.target.value)} required /></label>}
+        <div className="signout-confirm-actions">
+          <button type="button" className="profile-cancel" onClick={() => setAccountDeletionOpen(false)} disabled={accountDeletionBusy}>Cancel</button>
+          <button type="submit" className="signout-confirm-submit" disabled={accountDeletionBusy}>{accountDeletionBusy ? "Deleting account…" : "Permanently delete"}</button>
+        </div>
+        {accountDeletionError && <p className="account-delete-error" role="alert">{accountDeletionError}</p>}
+        {accountDeletionBusy && <p role="status">Securing and removing your account data…</p>}
+      </form>
     </div>}
   </>;
 }

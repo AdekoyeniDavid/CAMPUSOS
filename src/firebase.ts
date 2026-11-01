@@ -1,5 +1,6 @@
 import { getApp, getApps, initializeApp, type FirebaseOptions } from "firebase/app";
 import { getAuth } from "firebase/auth";
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from "firebase/app-check";
 import type { Firestore } from "firebase/firestore";
 
 const firebaseConfig: FirebaseOptions = {
@@ -21,6 +22,18 @@ export const firebaseConfigured = Boolean(
 const firebaseApp = firebaseConfigured
   ? getApps().length ? getApp() : initializeApp(firebaseConfig)
   : null;
+
+// Optional until the web app is registered in Firebase App Check and its
+// reCAPTCHA Enterprise site key is provided by the deployment environment.
+// Initialize before Auth/Firestore can issue network requests.
+const appCheckSiteKey = import.meta.env?.VITE_FIREBASE_APPCHECK_RECAPTCHA_ENTERPRISE_KEY?.trim();
+export const firebaseAppCheckEnabled = Boolean(firebaseApp && appCheckSiteKey);
+if (firebaseApp && appCheckSiteKey) {
+  initializeAppCheck(firebaseApp, {
+    provider: new ReCaptchaEnterpriseProvider(appCheckSiteKey),
+    isTokenAutoRefreshEnabled: true,
+  });
+}
 
 export const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
 // Keep Firestore on its native Firebase transport for direct realtime updates.

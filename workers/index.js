@@ -42,6 +42,7 @@ function securityHeaders() {
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "X-Frame-Options": "DENY",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Strict-Transport-Security": "max-age=31536000",
   };
 }
 
@@ -96,8 +97,8 @@ async function verifiedFirebaseUser(request, projectId) {
     const key = await crypto.subtle.importKey("jwk", keyData, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
     const validSignature = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, decodeBase64Url(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
     const now = Math.floor(Date.now() / 1000);
-    if (!validSignature || claims.aud !== projectId || claims.iss !== `https://securetoken.google.com/${projectId}` || typeof claims.sub !== "string" || !claims.sub || claims.sub.length > 128 || !Number.isInteger(claims.exp) || claims.exp <= now || !Number.isInteger(claims.iat) || claims.iat > now + 60 || claims.email_verified !== true || typeof claims.email !== "string" || !claims.email.trim() || claims.email.length > 320) return null;
-    return { email: claims.email, uid: claims.sub };
+    if (!validSignature || claims.aud !== projectId || claims.iss !== `https://securetoken.google.com/${projectId}` || typeof claims.sub !== "string" || !claims.sub || claims.sub.length > 128 || !Number.isInteger(claims.exp) || claims.exp <= now || !Number.isInteger(claims.iat) || claims.iat > now + 60 || !Number.isInteger(claims.auth_time) || claims.auth_time > now + 60 || claims.email_verified !== true || typeof claims.email !== "string" || !claims.email.trim() || claims.email.length > 320) return null;
+    return { email: claims.email, uid: claims.sub, authTime: claims.auth_time };
   } catch {
     return null;
   }
@@ -199,6 +200,41 @@ async function sendEmailReminders(request, env) {
     return apiJson({ ok: true, count: reminders.length }, 200, origin === requestOrigin ? origin : undefined);
   } catch {
     return apiJson({ error: "The email service could not be reached. Try again later." }, 502, origin === requestOrigin ? origin : undefined);
+  }
+}
+
+async function deleteAccountData(request, env) {
+  const origin = request.headers.get("Origin");
+  const requestOrigin = new URL(request.url).origin;
+  if (origin && origin !== requestOrigin && !allowedOrigins(env).includes(origin)) {
+    return apiJson({ error: "Origin is not allowed." }, 403);
+  }
+  const corsOrigin = origin && (origin === requestOrigin || allowedOrigins(env).includes(origin)) ? origin : undefined;
+  let user;
+  try {
+    user = await verifiedFirebaseUser(request, env.FIREBASE_PROJECT_ID);
+  } catch {
+    return apiJson({ error: "Authentication could not be checked right now. Try again shortly." }, 503, corsOrigin);
+  }
+  if (!user) return apiJson({ error: "Sign in with a verified email account to delete this account." }, 401, corsOrigin);
+  if (Math.floor(Date.now() / 1000) - user.authTime > 300) return apiJson({ error: "Reauthenticate, then retry account deletion." }, 401, corsOrigin);
+  if (!env.CAMPUSOS_DB) return apiJson({ error: "Account reminder data could not be reached. Retry shortly." }, 503, corsOrigin);
+
+  try {
+    // Bind the verified Firebase UID to every delete. No client-supplied UID or
+    // privileged Firebase credential is accepted by this endpoint.
+    for (const table of [
+      "push_subscriptions",
+      "push_reminder_rate_limits",
+      "email_reminder_rate_limits",
+      "timetable_notification_reminders",
+      "assignment_notification_reminders",
+    ]) {
+      await env.CAMPUSOS_DB.prepare(`DELETE FROM ${table} WHERE uid = ?`).bind(user.uid).run();
+    }
+    return apiJson({ ok: true }, 200, corsOrigin);
+  } catch {
+    return apiJson({ error: "Reminder data could not be removed completely. Retry before closing the account." }, 503, corsOrigin);
   }
 }
 
@@ -560,6 +596,17 @@ async function pushRequest(request, env, action) {
 export default {
   async fetch(request, env) {
     const incomingUrl = new URL(request.url);
+    if (incomingUrl.pathname === "/api/account/delete") {
+      const origin = request.headers.get("Origin");
+      if (origin && origin !== incomingUrl.origin && !allowedOrigins(env).includes(origin)) return apiJson({ error: "Origin is not allowed." }, 403);
+      if (request.method === "OPTIONS") {
+        const headers = origin ? corsHeaders(origin) : new Headers();
+        for (const [name, value] of Object.entries(securityHeaders())) headers.set(name, value);
+        return new Response(null, { status: 204, headers });
+      }
+      if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store", ...securityHeaders() } });
+      return deleteAccountData(request, env);
+    }
     if (incomingUrl.pathname === "/api/reminders/email") {
       if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST", "Cache-Control": "no-store", ...securityHeaders() } });
       return sendEmailReminders(request, env);

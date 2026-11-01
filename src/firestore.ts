@@ -124,7 +124,48 @@ export async function ensureStudentRecord(user: User) {
 }
 
 export async function saveStudentSection(uid: string, section: StudentSection, values: Record<string, string>) {
+  validateStudentSection(section, values);
   await saveLocalRecord(uid, "studentSections", section, values);
+}
+
+const sectionFields: Record<StudentSection, Record<string, number>> = {
+  profile: { fullName: 160, studentId: 80, programme: 160, photo: 2048 },
+  institution: { name: 200 },
+  personal: { dateOfBirth: 10, gender: 40, genderDescription: 120, nationality: 80 },
+  contact: { email: 320, phone: 40, phoneCountryCode: 24, address: 1000 },
+  academic: { department: 160, programme: 160, level: 40, session: 20, semester: 40, sessionHistory: 20000, programStart: 10, programEnd: 10 },
+  enrolment: { admissionDate: 10, status: 80, graduation: 10 },
+  courses: { registeredCourses: 30000 },
+  progress: { gpa: 40, completedCredits: 40, standing: 100 },
+};
+
+function validateStudentSection(section: StudentSection, values: Record<string, string>) {
+  const allowed = sectionFields[section];
+  if (!values || typeof values !== "object" || Array.isArray(values)
+    || Object.keys(values).some((key) => !(key in allowed))) throw new Error("This student detail contains an unsupported field.");
+  for (const [key, value] of Object.entries(values)) {
+    const containsControlCharacter = typeof value === "string" && Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127;
+    });
+    if (typeof value !== "string" || value.length > allowed[key] || containsControlCharacter) {
+      throw new Error(`Check the ${key.replace(/([A-Z])/g, " $1").toLowerCase()} field and try again.`);
+    }
+  }
+  if (section === "contact" && values.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)) throw new Error("Enter a valid registered email address.");
+  if (section === "academic") {
+    if (values.session && values.session !== "Not provided" && !/^\d{4}\/\d{4}$/.test(values.session)) throw new Error("Enter the academic year as YYYY/YYYY.");
+    if (values.semester && !["First semester", "Second semester", "Extended semester", "Not provided"].includes(values.semester)) throw new Error("Choose an available semester.");
+    for (const key of ["programStart", "programEnd"]) if (values[key] && !/^\d{4}-\d{2}-\d{2}$/.test(values[key])) throw new Error("Enter a valid program date.");
+    if (values.sessionHistory) {
+      let sessions: unknown;
+      try { sessions = JSON.parse(values.sessionHistory); } catch { throw new Error("Academic sessions contain invalid data."); }
+      if (!Array.isArray(sessions) || sessions.length > 100 || sessions.some((entry) => !entry || typeof entry !== "object"
+        || typeof entry.year !== "string" || !/^\d{4}\/\d{4}$/.test(entry.year)
+        || !["First semester", "Second semester", "Extended semester", "Not provided"].includes(entry.semester)
+        || typeof entry.id !== "string" || entry.id.length > 100)) throw new Error("Review the saved academic sessions and try again.");
+    }
+  }
 }
 
 export function studyRecordId(field: "studyNotes" | "gradeRecords", session: string, semester?: string) {

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { EmailAuthProvider, getIdToken, onIdTokenChanged, reauthenticateWithCredential, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
+import { EmailAuthProvider, getIdToken, GoogleAuthProvider, onIdTokenChanged, OAuthProvider, reauthenticateWithCredential, reauthenticateWithPopup, signOut, updatePassword, updateProfile, type User } from "firebase/auth";
 import { firebaseAuth, firebaseConfigured } from "./firebase";
 import {
   migrateLegacyRecordsToOldestAcademicPeriod,
@@ -35,6 +35,9 @@ import { acknowledgePendingCloudOperation, listPendingCloudOperations, pendingRe
 import "./App.css";
 import { createRecordId, readStoredValue, removeStoredValue, writeStoredValue } from "./browser";
 import { normalizeCourseRecords } from "./courseRecords";
+import { deleteStudentAccount } from "./accountDeletion";
+// Capture the browser's one-shot PWA install event before the lazy account panel loads.
+import "./pwaInstall";
 
 const ProfilePanel = lazy(() => import("./ProfilePanel").then((module) => ({ default: module.ProfilePanel })));
 const StudyTools = lazy(() => import("./StudyTools").then((module) => ({ default: module.StudyTools })));
@@ -968,6 +971,22 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     await updatePassword(user, newPassword);
   }
 
+  async function deleteCurrentStudentAccount(currentPassword: string) {
+    if (!firebaseAuth || firebaseAuth.currentUser?.uid !== user.uid) throw new Error("Sign in again before deleting this account.");
+    const providers = user.providerData.map((provider) => provider.providerId);
+    if (providers.includes("password")) {
+      if (!user.email || !currentPassword) throw new Error("Enter your current password to confirm account deletion.");
+      await reauthenticateWithCredential(user, EmailAuthProvider.credential(user.email, currentPassword));
+    } else if (providers.includes("google.com")) {
+      await reauthenticateWithPopup(user, new GoogleAuthProvider());
+    } else if (providers.includes("apple.com")) {
+      await reauthenticateWithPopup(user, new OAuthProvider("apple.com"));
+    } else {
+      throw new Error("This sign-in method cannot securely reverify the account here. Sign in again, then retry account deletion.");
+    }
+    await deleteStudentAccount(user);
+  }
+
   async function signOutOtherSessions() {
     const { claims } = await user.getIdTokenResult();
     if (typeof claims.auth_time !== "number") throw new Error("The current sign-in session could not be verified.");
@@ -1801,6 +1820,36 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     (assignment) => !assignment.completed,
   ).length;
 
+  const savedNotificationItems = [
+    ...assignmentReminders.flatMap((reminder) => {
+      const assignment = allAssignments.find((item) => item.id === reminder.assignmentId);
+      if (!assignment || assignment.completed || reminder.dueDate < localToday || (reminder.dueDate === localToday && reminder.dueTime <= localTime)) return [];
+      return [{
+        id: `assignment-${reminder.assignmentId}`,
+        type: "Assignment reminder",
+        title: assignment.title,
+        detail: `Due ${reminder.dueDate} at ${reminder.dueTime} · ${reminder.leadMinutes} min before`,
+      }];
+    }),
+    ...timetableReminders.flatMap((reminder) => {
+      if (reminder.sourceType === "weekly") {
+        const entry = allSchedules.find((item) => item.id === reminder.sourceId);
+        if (!entry) return [];
+        const course = allCourses.find((item) => item.code === entry.courseCode);
+        return [{ id: `weekly-${entry.id}`, type: "Weekly class", title: course?.name ?? entry.courseName ?? entry.courseCode, detail: `Every ${entry.day} at ${entry.start} · ${reminder.leadMinutes} min before` }];
+      }
+      if (reminder.sourceType === "exam") {
+        const entry = allExams.find((item) => item.id === reminder.sourceId);
+        if (!entry || entry.date < localToday || (entry.date === localToday && entry.start <= localTime)) return [];
+        return [{ id: `exam-${entry.id}`, type: "Exam", title: entry.title, detail: `${entry.date} at ${entry.start}${entry.location ? ` · ${entry.location}` : ""} · ${reminder.leadMinutes} min before` }];
+      }
+      const entry = allEvents.find((item) => item.id === reminder.sourceId && item.scheduled);
+      if (!entry || !entry.date || !entry.start || entry.date < localToday || (entry.date === localToday && entry.start <= localTime)) return [];
+      return [{ id: `event-${entry.id}`, type: "Event", title: entry.title, detail: `${entry.date ?? ""} at ${entry.start ?? ""}${entry.location ? ` · ${entry.location}` : ""} · ${reminder.leadMinutes} min before` }];
+    }),
+  ];
+  const notificationCount = pendingCount + savedNotificationItems.filter((item) => item.type !== "Assignment reminder").length;
+
   const completedCount = assignments.filter(
     (assignment) => assignment.completed,
   ).length;
@@ -2012,7 +2061,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             <div className="notification-controls">
               <button className={`notification-toggle ${soundEnabled ? "sound-on" : "sound-muted"}`} aria-label={soundEnabled ? "Mute reminder sounds" : "Turn reminder sounds on"} aria-pressed={!soundEnabled} title={soundEnabled ? "Sound on" : "Muted"} onClick={() => setSoundEnabled((enabled) => !enabled)}>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />{!soundEnabled && <path d="m4 4 16 16" />}</svg>
-                {pendingCount > 0 && <span className="notification-count">{pendingCount}</span>}
+                {notificationCount > 0 && <span className="notification-count">{notificationCount}</span>}
               </button>
               <button className="notification-open-button" aria-label={notificationsOpen ? "Close assignment reminders" : "Open assignment reminders"} aria-expanded={notificationsOpen} onClick={() => { setMenuOpen(false); setQuickSearchOpen(false); setQuickSearchQuery(""); setThemeMenuOpen(false); setProfileOpen(false); setNotificationsOpen((open) => !open); setReminderMessage(""); }}>⌄</button>
             </div>
@@ -2029,13 +2078,18 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         </section>, document.body)}
         {notificationsOpen && (
           <>
-            <button className="reminder-backdrop" aria-label="Close assignment reminders" onClick={() => setNotificationsOpen(false)} />
-            <section className="notification-panel liquid-glass" aria-label="Pending assignment reminders">
-              <header className="notification-panel-heading"><div><p className="profile-kicker">CAMPUSOS REMINDERS</p><h2>Pending assignments</h2></div><button className="notification-panel-close" type="button" aria-label="Close CampusOS reminders" title="Close reminders" onClick={() => setNotificationsOpen(false)}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg></button></header>
+            <button className="reminder-backdrop" aria-label="Close CampusOS reminders" onClick={() => setNotificationsOpen(false)} />
+            <section className="notification-panel liquid-glass" aria-label="CampusOS reminders">
+              <header className="notification-panel-heading"><div><p className="profile-kicker">CAMPUSOS REMINDERS</p><h2>Your reminders</h2></div><button className="notification-panel-close" type="button" aria-label="Close CampusOS reminders" title="Close reminders" onClick={() => setNotificationsOpen(false)}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg></button></header>
+              <h3 className="reminder-section-title">Pending assignments</h3>
               <div className="reminder-task-list">
                 {assignments.filter((assignment) => !assignment.completed).map((assignment) => <article className="reminder-task" key={assignment.id}><strong>{assignment.title}</strong><span>{assignment.course} · Due {assignment.due}</span></article>)}
-                {pendingCount === 0 && <p className="empty-state">You are all caught up.</p>}
+                {pendingCount === 0 && <p className="empty-state">{savedNotificationItems.length ? "No pending assignments." : "You are all caught up."}</p>}
               </div>
+              <section className="saved-reminder-list" aria-label="Scheduled notification reminders">
+                <h3 className="reminder-section-title">Scheduled notifications</h3>
+                {savedNotificationItems.length ? savedNotificationItems.map((item) => <article className="reminder-task saved-reminder-item" key={item.id}><small>{item.type}</small><strong>{item.title}</strong><span>{item.detail}</span></article>) : <p className="reminder-list-empty">Add a reminder from an assignment or a weekly, exam, or event timetable entry to see it here.</p>}
+              </section>
               {reminderMessage && <p className="reminder-message" role="status">{reminderMessage}</p>}
               <div className="reminder-actions">
                 <button className="primary-button reminder-send-button" onClick={() => setReminderConfirmation("desktop")}>Device notification</button>
@@ -2150,7 +2204,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         {courseRestoreRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!courseRestoreBusy && event.target === event.currentTarget) setCourseRestoreRequest(null); }}><section className="attachment-delete-dialog liquid-glass course-restore-dialog" role="alertdialog" aria-modal="true" aria-labelledby="course-restore-title" aria-describedby="course-restore-description"><div className="attachment-delete-icon course-restore-icon" aria-hidden="true">↶</div><p className="profile-kicker">COURSE ARCHIVE</p><h2 id="course-restore-title">Restore this course?</h2><p id="course-restore-description"><strong>{courseRestoreRequest.code} · {courseRestoreRequest.name}</strong> will return to your active courses and remain saved to your account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={courseRestoreBusy} onClick={() => setCourseRestoreRequest(null)}>Keep archived</button><button type="button" className="attachment-delete-confirm course-restore-confirm" disabled={courseRestoreBusy} onClick={() => void confirmCourseRestore()}>{courseRestoreBusy ? "Restoring…" : "Restore course"}</button></div></section></div>}
         {assignmentDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!assignmentDeleteBusy && event.target === event.currentTarget) setAssignmentDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="assignment-delete-title" aria-describedby="assignment-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">ASSIGNMENT REMOVAL</p><h2 id="assignment-delete-title">Delete this assignment?</h2><p id="assignment-delete-description"><strong>{assignmentDeleteRequest.title}</strong> will be removed from your assignment list and deleted from this device and account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={assignmentDeleteBusy} onClick={() => setAssignmentDeleteRequest(null)}>Keep assignment</button><button type="button" className="attachment-delete-confirm" disabled={assignmentDeleteBusy} onClick={() => void confirmAssignmentDelete()}>{assignmentDeleteBusy ? "Deleting…" : "Delete assignment"}</button></div></section></div>}
         {timetableDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!timetableDeleteBusy && event.target === event.currentTarget) setTimetableDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="timetable-delete-title" aria-describedby="timetable-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">TIMETABLE REMOVAL</p><h2 id="timetable-delete-title">{timetableDeleteRequest.type === "event" ? timetableDeleteRequest.action === "schedule" ? "Delete this event schedule?" : "Delete this event?" : "Delete this timetable entry?"}</h2><p id="timetable-delete-description">{timetableDeleteRequest.type === "weekly" ? <><strong>{timetableDeleteRequest.entry.courseCode}</strong> · {timetableDeleteRequest.entry.day}, {timetableDeleteRequest.entry.start}–{timetableDeleteRequest.entry.end} will be removed from your weekly timetable.</> : timetableDeleteRequest.type === "exam" ? <><strong>{timetableDeleteRequest.entry.title}</strong> · {timetableDeleteRequest.entry.courseCode}, {timetableDeleteRequest.entry.date} at {timetableDeleteRequest.entry.start} will be removed from your exam timetable.</> : timetableDeleteRequest.action === "schedule" ? <>The date, time, venue, and notification reminder for <strong>{timetableDeleteRequest.entry.title}</strong> will be removed. The event details will remain.</> : <> <strong>{timetableDeleteRequest.entry.title}</strong> and its schedule will be removed from this academic session.</>}</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={timetableDeleteBusy} onClick={() => setTimetableDeleteRequest(null)}>Keep {timetableDeleteRequest.type === "event" ? timetableDeleteRequest.action === "schedule" ? "schedule" : "event" : "entry"}</button><button type="button" className="attachment-delete-confirm" disabled={timetableDeleteBusy} onClick={() => void confirmTimetableDelete()}>{timetableDeleteBusy ? "Deleting…" : timetableDeleteRequest.type === "event" ? timetableDeleteRequest.action === "schedule" ? "Delete schedule" : "Delete event" : "Delete timetable"}</button></div></section></div>}
-        {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
+        {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} requiresPasswordForDeletion={user.providerData.some((provider) => provider.providerId === "password")} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onDeleteAccount={deleteCurrentStudentAccount} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
         {menuOpen && (
           <>
             <button className="menu-backdrop" aria-label="Close navigation menu" onClick={() => setMenuOpen(false)} />

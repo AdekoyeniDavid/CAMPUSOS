@@ -4,12 +4,19 @@ service firebase.storage {
     function ownsVerifiedStudySpace(studentUid) {
       return request.auth != null
         && request.auth.uid == studentUid
-        && request.auth.token.email_verified == true;
+        && request.auth.token.email_verified == true
+        && firestore.exists(/databases/(default)/documents/students/$(studentUid));
+    }
+
+    function accountDeletionPending(studentUid) {
+      return firestore.exists(/databases/(default)/documents/students/$(studentUid)/security/account-deletion);
     }
 
     match /students/{studentUid}/study-materials/{attachmentId} {
-      allow read, delete: if ownsVerifiedStudySpace(studentUid);
+      allow read: if ownsVerifiedStudySpace(studentUid);
+      allow delete: if ownsVerifiedStudySpace(studentUid);
       allow create, update: if ownsVerifiedStudySpace(studentUid)
+        && !accountDeletionPending(studentUid)
         && request.resource.size > 0
         && request.resource.size <= 20 * 1024 * 1024
         && request.resource.contentType in [

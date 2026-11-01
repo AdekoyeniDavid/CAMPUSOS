@@ -5,6 +5,10 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.email_verified == true;
     }
 
+    function isVerifiedStudent(studentUid) {
+      return signedInAndVerified() && request.auth.uid == studentUid;
+    }
+
     function sessionIsActive(studentUid) {
       let controlPath = /databases/$(database)/documents/students/$(studentUid)/security/session-control;
       return !exists(controlPath)
@@ -13,9 +17,23 @@ service cloud.firestore {
     }
 
     function ownsStudent(studentUid) {
-      return signedInAndVerified()
-        && request.auth.uid == studentUid
+      return isVerifiedStudent(studentUid)
+        && exists(/databases/$(database)/documents/students/$(studentUid))
         && sessionIsActive(studentUid);
+    }
+
+    function deletionRequested(studentUid) {
+      return exists(/databases/$(database)/documents/students/$(studentUid)/security/account-deletion);
+    }
+
+    function canModifyStudent(studentUid) {
+      return ownsStudent(studentUid) && !deletionRequested(studentUid);
+    }
+
+    function validDeletionRequest() {
+      return request.resource.data.keys().hasOnly(['requestedAt'])
+        && request.resource.data.keys().hasAll(['requestedAt'])
+        && request.resource.data.requestedAt == request.time;
     }
 
     function validSessionControl() {
@@ -52,9 +70,61 @@ service cloud.firestore {
         ])
         && request.resource.data.uid == studentUid
         && request.resource.data.email == request.auth.token.email
-        && request.resource.data.profile is map
+        && validStudentSections(request.resource.data)
         && request.resource.data.authorizedStaffUids is list
         && request.resource.data.authorizedStaffUids.size() <= 20;
+    }
+
+    function optionalString(data, key, maxLength) {
+      return !data.keys().hasAny([key])
+        || (data[key] is string && data[key].size() <= maxLength);
+    }
+
+    function validStudentSections(data) {
+      return data.profile is map
+        && data.profile.keys().hasOnly(['fullName', 'studentId', 'programme', 'photo'])
+        && optionalString(data.profile, 'fullName', 160)
+        && optionalString(data.profile, 'studentId', 80)
+        && optionalString(data.profile, 'programme', 160)
+        && optionalString(data.profile, 'photo', 2048)
+        && data.institution is map
+        && data.institution.keys().hasOnly(['name'])
+        && optionalString(data.institution, 'name', 200)
+        && data.personal is map
+        && data.personal.keys().hasOnly(['dateOfBirth', 'gender', 'genderDescription', 'nationality'])
+        && optionalString(data.personal, 'dateOfBirth', 10)
+        && optionalString(data.personal, 'gender', 40)
+        && optionalString(data.personal, 'genderDescription', 120)
+        && optionalString(data.personal, 'nationality', 80)
+        && data.contact is map
+        && data.contact.keys().hasOnly(['email', 'phone', 'phoneCountryCode', 'address'])
+        && data.contact.email == data.email
+        && optionalString(data.contact, 'phone', 40)
+        && optionalString(data.contact, 'phoneCountryCode', 24)
+        && optionalString(data.contact, 'address', 1000)
+        && data.academic is map
+        && data.academic.keys().hasOnly(['department', 'programme', 'level', 'session', 'semester', 'sessionHistory', 'programStart', 'programEnd'])
+        && optionalString(data.academic, 'department', 160)
+        && optionalString(data.academic, 'programme', 160)
+        && optionalString(data.academic, 'level', 40)
+        && optionalString(data.academic, 'session', 20)
+        && optionalString(data.academic, 'semester', 40)
+        && optionalString(data.academic, 'sessionHistory', 20000)
+        && optionalString(data.academic, 'programStart', 10)
+        && optionalString(data.academic, 'programEnd', 10)
+        && data.enrolment is map
+        && data.enrolment.keys().hasOnly(['admissionDate', 'status', 'graduation'])
+        && optionalString(data.enrolment, 'admissionDate', 10)
+        && optionalString(data.enrolment, 'status', 80)
+        && optionalString(data.enrolment, 'graduation', 10)
+        && data.courses is map
+        && data.courses.keys().hasOnly(['registeredCourses'])
+        && optionalString(data.courses, 'registeredCourses', 30000)
+        && data.progress is map
+        && data.progress.keys().hasOnly(['gpa', 'completedCredits', 'standing'])
+        && optionalString(data.progress, 'gpa', 40)
+        && optionalString(data.progress, 'completedCredits', 40)
+        && optionalString(data.progress, 'standing', 100);
     }
 
     function studentEditableFieldsOnly() {
@@ -199,11 +269,11 @@ service cloud.firestore {
     match /students/{studentUid} {
       allow get: if canReadStudent(studentUid);
       allow list: if isAdmin();
-      allow create: if ownsStudent(studentUid) && validStudentDocument(studentUid)
+      allow create: if isVerifiedStudent(studentUid) && validStudentDocument(studentUid)
         && request.resource.data.authorizedStaffUids == [];
-      allow update: if (ownsStudent(studentUid) && validStudentDocument(studentUid) && studentEditableFieldsOnly())
+      allow update: if (canModifyStudent(studentUid) && validStudentDocument(studentUid) && studentEditableFieldsOnly())
         || isAdmin();
-      allow delete: if isAdmin();
+      allow delete: if (isAdmin() || (ownsStudent(studentUid) && deletionRequested(studentUid)));
 
       match /security/{securityDoc} {
         // Revoked sessions can still read this control document so the client can detect
@@ -213,44 +283,52 @@ service cloud.firestore {
           && request.auth.uid == studentUid;
         allow list: if false;
         allow create, update: if securityDoc == 'session-control'
-          && ownsStudent(studentUid)
+          && canModifyStudent(studentUid)
           && validSessionControl();
-        allow delete: if false;
+        allow create, update: if securityDoc == 'account-deletion'
+          && ownsStudent(studentUid)
+          && validDeletionRequest();
+        allow delete: if (securityDoc == 'session-control'
+            && ownsStudent(studentUid)
+            && deletionRequested(studentUid))
+          || (securityDoc == 'account-deletion'
+            && isVerifiedStudent(studentUid)
+            && !exists(/databases/$(database)/documents/students/$(studentUid)));
       }
 
       match /courses/{courseId} {
         allow read: if canReadStudent(studentUid);
-        allow create, update: if (ownsStudent(studentUid) && validCourse()) || isAdmin();
+        allow create, update: if (canModifyStudent(studentUid) && validCourse()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
 
       match /assignments/{assignmentId} {
         allow read: if canReadStudent(studentUid);
-        allow create, update: if (ownsStudent(studentUid) && validAssignment(assignmentId)) || isAdmin();
+        allow create, update: if (canModifyStudent(studentUid) && validAssignment(assignmentId)) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
 
       match /schedules/{scheduleId} {
         allow read: if canReadStudent(studentUid);
-        allow create, update: if (ownsStudent(studentUid) && validSchedule()) || isAdmin();
+        allow create, update: if (canModifyStudent(studentUid) && validSchedule()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
 
       match /exams/{examId} {
         allow read: if canReadStudent(studentUid);
-        allow create, update: if (ownsStudent(studentUid) && validExam()) || isAdmin();
+        allow create, update: if (canModifyStudent(studentUid) && validExam()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
 
       match /events/{eventId} {
         allow read: if canReadStudent(studentUid);
-        allow create, update: if (ownsStudent(studentUid) && validEvent()) || isAdmin();
+        allow create, update: if (canModifyStudent(studentUid) && validEvent()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
 
       match /notificationReminders/{reminderId} {
         allow read: if ownsStudent(studentUid);
-        allow create, update: if ownsStudent(studentUid)
+        allow create, update: if canModifyStudent(studentUid)
           && request.resource.data.keys().hasOnly(['sourceType', 'sourceId', 'courseCode', 'leadMinutes', 'dueDate', 'dueTime'])
           && request.resource.data.sourceType in ['weekly', 'exam', 'event', 'assignment']
           && request.resource.data.sourceId is string
