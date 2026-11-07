@@ -1401,6 +1401,8 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .saved-reminder-item small { width: fit-content; padding: 3px 7px; border: 1px solid rgba(185,149,112,.2); border-radius: 999px; background: rgba(232,214,191,.38); color: #735438; font-size: 9px; font-weight: 750; }
 .reminder-list-empty { margin: 8px 0 3px; color: #85899c; font-size: 10px; line-height: 1.5; }
 .app-shell[data-theme="dark"] .reminder-section-title { color: #e8c9a6; }
+.app-shell[data-theme="dark"] .reminder-task strong { color: #eee9e2; }
+.app-shell[data-theme="dark"] .reminder-task span { color: #b4b0a9; }
 .app-shell[data-theme="dark"] .saved-reminder-item strong { color: #eee9e2; }
 .app-shell[data-theme="dark"] .saved-reminder-item span, .app-shell[data-theme="dark"] .reminder-list-empty { color: #b4b0a9; }
 .app-shell[data-theme="dark"] .saved-reminder-item small { color: #e8c9a6; background: rgba(185,149,112,.14); border-color: rgba(210,174,137,.22); }
@@ -2070,6 +2072,20 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .quick-search-clear { min-width: 44px; min-height: 44px; }
 }
 
+/* Reduce GPU-heavy glass work and keep study actions reachable on touch devices. */
+@media (max-width: 700px), (pointer: coarse) {
+  .study-form, .course-material-library, .course-material-course,
+  .study-editor-surface, .study-attachment-preview, .study-attached-document,
+  .study-clear-button, .study-editor-export {
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+  }
+  .study-note-top { align-items: flex-start; flex-wrap: wrap; }
+  .study-note-top > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .study-note-top .study-action { min-height: 44px; touch-action: manipulation; }
+  .study-note, .grade-record { animation: none; }
+}
+
 @media (hover: none) {
   .stat-card:hover, .course-card:hover, .primary-button:hover,
   .menu-trigger:hover, .profile-avatar-button:hover, .course-menu-button:hover,
@@ -2197,6 +2213,7 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 
 /* Academic session history controls */
 .academic-session-history {
+  container: academic-session / inline-size;
   min-width: 0;
   margin-top: 16px;
   padding: 14px;
@@ -2216,6 +2233,10 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .academic-session-actions button { min-height: 36px; padding: 8px 11px; border: 1px solid rgba(185,149,112,.26); border-radius: 10px; background: rgba(255,255,255,.56); color: #735438; font-size: 10px; font-weight: 700; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,.76); transition: transform .2s ease, background .2s ease, box-shadow .2s ease; }
 .academic-session-add:hover,
 .academic-session-actions button:hover { transform: translateY(-1px); background: rgba(255,255,255,.82); box-shadow: 0 5px 14px rgba(54,46,37,.08); }
+.academic-session-add:focus-visible,
+.academic-session-actions button:focus-visible,
+.academic-session-form-actions button:focus-visible,
+.academic-session-confirm-actions button:focus-visible { outline: 3px solid rgba(128,93,61,.72); outline-offset: 3px; }
 .academic-session-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
 .academic-session-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding: 10px; border: 1px solid rgba(185,149,112,.14); border-radius: 12px; background: rgba(255,255,255,.34); animation: glassDrop .24s ease both; }
 .academic-session-copy { display: grid; gap: 4px; min-width: 0; }
@@ -2238,7 +2259,7 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .academic-session-form-actions button { min-height: 40px; }
 .academic-session-error { margin: 9px 0 0; color: #a33f3f; font-size: 10px; line-height: 1.5; }
 .academic-session-confirm-backdrop { position: fixed; inset: 0; z-index: 45; display: grid; place-items: center; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); background: rgba(38,34,30,.32); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); animation: glassFade .2s ease both; }
-.academic-session-confirm { width: min(390px,100%); max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; padding: 23px; border: 1px solid rgba(255,255,255,.82); border-radius: 22px; text-align: center; animation: glassDrop .3s cubic-bezier(.2,.8,.2,1) both; overscroll-behavior: contain; }
+.academic-session-confirm { width: min(390px,100%); max-height: calc(100vh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 23px; border: 1px solid rgba(255,255,255,.82); border-radius: 22px; text-align: center; animation: glassDrop .3s cubic-bezier(.2,.8,.2,1) both; overscroll-behavior: contain; }
 .academic-session-confirm-icon { width: 40px; height: 40px; display: grid; place-items: center; margin: 0 auto 12px; border: 1px solid rgba(181,65,65,.2); border-radius: 14px; background: rgba(255,235,232,.72); color: #9e3939; font-size: 21px; font-weight: 800; }
 .academic-session-confirm h4 { margin: 0; color: #303044; font-size: 16px; }
 .academic-session-confirm > p:not(.academic-session-error) { margin: 9px 0 18px; color: #656577; font-size: 12px; line-height: 1.55; }
@@ -2251,6 +2272,16 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .academic-session-delete:disabled,
 .academic-session-confirm-actions button:disabled,
 .academic-session-form-actions button:disabled { cursor: wait; opacity: .6; }
+/* Respond to the panel's actual width, including split-screen and narrow
+   desktop account panes where viewport media queries are misleading. */
+@container academic-session (max-width: 560px) {
+  .academic-session-heading { flex-direction: column; align-items: stretch; }
+  .academic-session-add { width: 100%; min-height: 44px; }
+  .academic-session-item { align-items: flex-start; flex-direction: column; }
+  .academic-session-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 84px), 1fr)); width: 100%; }
+  .academic-session-actions button { min-width: 0; min-height: 44px; white-space: normal; overflow-wrap: anywhere; }
+  .academic-session-confirm-actions { grid-template-columns: 1fr; }
+}
 .app-shell[data-theme="dark"] .academic-session-history,
 .app-shell[data-theme="dark"] .academic-session-form { border-color: rgba(255,255,255,.12); background: linear-gradient(145deg,rgba(39,40,43,.82),rgba(25,26,29,.78)); }
 .app-shell[data-theme="dark"] .academic-session-heading h4,
@@ -2318,6 +2349,13 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .academic-session-item { align-items: flex-start; flex-direction: column; }
   .academic-session-actions { width: 100%; flex-wrap: wrap; justify-content: flex-start; }
   .course-period-picker { grid-template-columns: minmax(0,1fr); gap: 7px; width: 100%; }
+}
+@media (max-width: 360px) {
+  .academic-session-history { padding: 11px; }
+  .academic-session-item { padding: 9px; }
+  .academic-session-actions { display: grid; grid-template-columns: repeat(auto-fit,minmax(76px,1fr)); }
+  .academic-session-actions button { white-space: normal; overflow-wrap: anywhere; }
+  .academic-session-confirm { padding: 18px; }
 }
 @media (pointer: coarse) {
   .academic-session-add,
@@ -2770,6 +2808,12 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   animation: glassDrop .28s ease both;
 }
 
+/* Keep the open credit picker above the following academic-period groups. */
+.course-form-credit-open {
+  position: relative;
+  z-index: 5;
+}
+
 .app-shell[data-theme="dark"] .course-form { border-color: rgba(255,255,255,.12); background: linear-gradient(145deg,rgba(39,40,43,.82),rgba(25,26,29,.78)); }
 .app-shell[data-theme="dark"] .course-form label { color: #d5cdc2; }
 
@@ -3125,6 +3169,7 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .academic-session-history { padding: clamp(11px, 3.5vw, 14px); }
   .academic-session-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); }
   .academic-session-actions button { min-width: 0; min-height: 44px; padding-inline: 8px; white-space: normal; }
+  .academic-session-confirm-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
   .study-period-banner { margin-bottom: 14px; }
   .study-form, .grade-form, .assignment-form:not(.course-form) { gap: 10px; padding: clamp(12px, 3.5vw, 16px); }
   .course-material-course-grid { grid-template-columns: minmax(0, 1fr); }
@@ -3152,6 +3197,31 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .academic-session-add, .academic-session-actions button, .academic-session-form-actions button,
   .study-form-actions button, .course-restore-button, .restore-course-button { min-height: 44px; }
   :where(.study-form, .assignment-form, .profile-edit-form) :where(input, select, textarea) { font-size: 16px; }
+}
+
+/* Keep touch devices responsive: avoid continuously repainting large glass surfaces. */
+@media (pointer: coarse) {
+  .assignment-entry-panel,
+  .popup-navigation,
+  .quick-search-popover,
+  .theme-menu,
+  .profile-panel,
+  .notification-panel,
+  .reminder-confirm-dialog,
+  .timetable-reminder-dialog,
+  .signout-confirm,
+  .attachment-delete-dialog,
+  .backup-dialog {
+    animation: glassDrop .34s cubic-bezier(.2,.8,.2,1) both;
+  }
+
+  .popup-navigation,
+  .quick-search-popover,
+  .profile-panel,
+  .notification-panel {
+    -webkit-backdrop-filter: blur(12px) saturate(135%);
+    backdrop-filter: blur(12px) saturate(135%);
+  }
 }
 
 /* Last-mile viewport fixes: preserve safe areas in the final mobile header rules. */
@@ -3676,6 +3746,81 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
 .courses-panel { align-self: start; }
 .dashboard-event-list { display: grid; }
 .dashboard-event-row { min-width: 0; }
+
+/* Keep the reminders popover reachable across desktop, tablet, and mobile viewports. */
+.notification-panel {
+  top: calc(var(--campusos-topbar-height, 72px) + 12px);
+  box-sizing: border-box;
+  max-height: calc(100vh - var(--campusos-topbar-height, 72px) - 24px - env(safe-area-inset-bottom));
+  max-height: calc(100dvh - var(--campusos-topbar-height, 72px) - 24px - env(safe-area-inset-bottom));
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 700px) {
+  .notification-panel {
+    left: max(8px, env(safe-area-inset-left));
+    right: max(8px, env(safe-area-inset-right));
+    width: min(420px, calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right)));
+    margin-inline: auto;
+    max-height: calc(100vh - var(--campusos-topbar-height, 76px) - 20px - env(safe-area-inset-bottom));
+    max-height: calc(100dvh - var(--campusos-topbar-height, 76px) - 20px - env(safe-area-inset-bottom));
+  }
+
+  .reminder-task-list,
+  .saved-reminder-list {
+    max-height: min(28dvh, 240px);
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+@media (max-height: 560px) {
+  .notification-panel {
+    top: calc(var(--campusos-topbar-height, 64px) + 8px);
+    max-height: calc(100vh - var(--campusos-topbar-height, 64px) - 16px - env(safe-area-inset-bottom));
+    max-height: calc(100dvh - var(--campusos-topbar-height, 64px) - 16px - env(safe-area-inset-bottom));
+  }
+}
+
+/* Keep glass effects smooth on battery-powered touch devices. */
+@media (pointer: coarse) and (max-width: 900px) {
+  :is(
+    .topbar, .liquid-glass, .panel, .stat-card, .course-card,
+    .schedule-form, .help-card, .profile-panel, .notification-panel,
+    .popup-navigation, .quick-search-popover, .theme-menu,
+    .study-form, .course-material-library, .backup-dialog,
+    .reminder-confirm-dialog, .timetable-reminder-dialog,
+    .attachment-delete-dialog, .grade-delete-dialog,
+    .academic-session-confirm-dialog
+  ) {
+    -webkit-backdrop-filter: blur(12px) saturate(125%);
+    backdrop-filter: blur(12px) saturate(125%);
+  }
+
+  :is(
+    .popup-navigation, .quick-search-popover, .theme-menu,
+    .profile-panel, .notification-panel, .study-form,
+    .backup-dialog, .reminder-confirm-dialog,
+    .timetable-reminder-dialog, .attachment-delete-dialog,
+    .grade-delete-dialog, .academic-session-confirm-dialog
+  ) {
+    animation-duration: 320ms;
+    animation-iteration-count: 1;
+  }
+}
+
+@media (max-width: 700px) and (orientation: landscape) and (max-height: 520px) {
+  .topbar { position: sticky; }
+  .page-content { padding-top: 14px; }
+  .popup-navigation, .profile-panel, .notification-panel,
+  .quick-search-popover, .theme-menu {
+    max-height: calc(100dvh - var(--campusos-topbar-height, 56px) - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 12px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}
 .dashboard-event-row .event-info { min-width: 0; }
 .dashboard-event-row .event-info :is(strong, span) { overflow-wrap: anywhere; }
 .dashboard-event-empty { margin-bottom: 0; }
@@ -3756,4 +3901,45 @@ button:not(.menu-backdrop), .assignment-row, .course-row, .lecture-row, .text-bu
   .study-editor-surface,
   .study-markdown-preview,
   .study-markdown-toolbar button { scroll-behavior: auto; }
+}
+
+/* Size academic-session controls to their account panel, not only the device
+   viewport. This also covers split-screen tablets and narrow desktop panes. */
+@container academic-session (max-width: 560px) {
+  .academic-session-heading { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .academic-session-heading p { max-width: 62ch; }
+  .academic-session-add { width: 100%; min-height: 46px; }
+  .academic-session-item { align-items: stretch; flex-direction: column; gap: 11px; padding: 11px; }
+  .academic-session-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 88px), 1fr)); width: 100%; gap: 7px; }
+  .academic-session-actions button { min-width: 0; min-height: 46px; padding-inline: 8px; white-space: normal; overflow-wrap: anywhere; line-height: 1.25; }
+  .academic-session-form { padding: clamp(11px, 3cqi, 15px); }
+  .academic-session-form-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .academic-session-form-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .academic-session-form-actions button { min-width: 0; min-height: 46px; }
+  .academic-session-confirm-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
+}
+
+@container academic-session (min-width: 561px) {
+  .academic-session-item { align-items: center; }
+  .academic-session-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .academic-session-actions button { min-height: 42px; }
+  .academic-session-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(10px, 2cqi, 16px); }
+  .academic-session-form-actions { justify-content: flex-end; }
+}
+
+@container academic-session (max-width: 340px) {
+  .academic-session-history { padding: 10px; }
+  .academic-session-actions { grid-template-columns: minmax(0, 1fr); }
+  .academic-session-form-actions { grid-template-columns: minmax(0, 1fr); }
+  .academic-session-heading h4 { font-size: 12px; }
+}
+
+@media (max-width: 520px) {
+  .academic-session-confirm-backdrop { padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
+  .academic-session-confirm { width: min(100%, 390px); padding: clamp(16px, 5vw, 22px); }
+}
+
+@media (max-width: 380px) {
+  .cloud-database-heading { grid-template-columns: minmax(0, 1fr); }
+  .cloud-database-heading .cloud-status-pill { justify-self: start; }
 }

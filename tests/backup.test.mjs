@@ -44,12 +44,12 @@ test("rejects malformed, duplicate, oversized, or privileged backup data", () =>
 });
 
 test("formats a readable PDF with student sections and labeled academic records", async () => {
-  const pdf = await createBackupPdf(backup("student-1")).text();
+  const pdf = await (await createBackupPdf(backup("student-1"))).text();
   assert.match(pdf, /^%PDF-1\.4/);
   assert.match(pdf, /Account summary/);
   assert.match(pdf, /Personal details/);
   assert.match(pdf, /Assignments/);
   assert.match(pdf, /Biology exam/);
   assert.match(pdf, /Weekly timetable/);
-  assert.match(pdf, /%%EOF\n$/);
+  assert.match(pdf, /%%EOF\n\n%CampusOSBackupV1Begin/);
 });

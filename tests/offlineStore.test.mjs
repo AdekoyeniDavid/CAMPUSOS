@@ -1,17 +1,99 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { indexedDB } from "fake-indexeddb";
+import { IDBKeyRange, indexedDB } from "fake-indexeddb";
 
 Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: indexedDB });
+Object.defineProperty(globalThis, "IDBKeyRange", { configurable: true, value: IDBKeyRange });
 Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: false } });
 
-const { deleteLocalAttachment, deleteLocalRecord, getLocalAttachment, listLocalRecords, pendingWriteCount, replaceWithRemoteRecords, restoreLocalRecords, saveLocalAttachment, saveLocalRecord, watchLocalRecords } = await import("../src/offlineStore.ts");
+const { deleteLocalAttachment, deleteLocalRecord, getLocalAttachment, listLocalRecords, mergeAcademicSessionHistory, mergeAcademicSessionSelections, nextAcademicSelectionTimestamp, pendingWriteCount, replaceWithRemoteRecords, restoreLocalRecords, saveLocalAttachment, saveLocalRecord, shouldApplyAcademicSelection, watchLocalRecords } = await import("../src/offlineStore.ts");
 const { normalizeCourseRecords } = await import("../src/courseRecords.ts");
 
+test("academic selection stamps remain newer across rapid actions and clock rollback", () => {
+  assert.equal(nextAcademicSelectionTimestamp("1800000000000", 1800000000000), 1800000000001);
+  assert.equal(nextAcademicSelectionTimestamp("1800000000001", 1799999999000), 1800000000002);
+  assert.equal(nextAcademicSelectionTimestamp(undefined, 1800000000000), 1800000000000);
+});
+
+test("queued current-session choices cannot overwrite newer or tied server selections", () => {
+  const currentRemoteStamp = 1800000000000;
+  assert.equal(shouldApplyAcademicSelection({ session: "2026/2027", semester: "Second semester", updatedAt: 1700000000000, onlineAtQueue: true }, currentRemoteStamp), false);
+  assert.equal(shouldApplyAcademicSelection({ session: "2025/2026", semester: "First semester", updatedAt: 1700000000000, onlineAtQueue: false }, currentRemoteStamp), false);
+  assert.equal(shouldApplyAcademicSelection({ session: "2025/2026", semester: "First semester", updatedAt: currentRemoteStamp, onlineAtQueue: false }, currentRemoteStamp), false);
+  assert.equal(shouldApplyAcademicSelection({ session: "2025/2026", semester: "First semester", updatedAt: currentRemoteStamp + 1, onlineAtQueue: false }, currentRemoteStamp), true);
+});
+
+test("the newest local academic selection replaces an older queued selection even if its clock stamp is lower", () => {
+  const queued = { session: "2025/2026", semester: "First semester", updatedAt: 1800000000000, onlineAtQueue: false };
+  const latest = { session: "2026/2027", semester: "Second semester", updatedAt: 1700000000000, onlineAtQueue: true };
+  assert.deepEqual(mergeAcademicSessionSelections([queued], latest), latest);
+});
+
+test("queued current-session intent survives outbox coalescing and later profile edits", async () => {
+  const uid = `academic-outbox-test-${crypto.randomUUID()}`;
+  const selection = { type: "select", session: "2026/2027", semester: "Second semester", updatedAt: 1700000000000, onlineAtQueue: true };
+  await saveLocalRecord(uid, "studentSections", "academic", {
+    session: selection.session,
+    semester: selection.semester,
+    selectionUpdatedAt: String(selection.updatedAt),
+    sessionHistory: JSON.stringify([{ id: "session-1", year: selection.session, semester: selection.semester, createdAt: 1 }]),
+  }, selection);
+  await saveLocalRecord(uid, "studentSections", "academic", {
+    department: "Science",
+    session: selection.session,
+    semester: selection.semester,
+    selectionUpdatedAt: String(selection.updatedAt),
+    sessionHistory: JSON.stringify([{ id: "session-1", year: selection.session, semester: selection.semester, createdAt: 1 }]),
+  });
+
+  const database = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("campusos-local-v1", 5);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const pending = await new Promise((resolve, reject) => {
+    const request = database.transaction("outbox", "readonly").objectStore("outbox").get(`${uid}/studentSections/academic`);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  assert.equal(pending.academicSessionOperations.at(-1).onlineAtQueue, true);
+  assert.equal(pending.academicSessionOperations.at(-1).session, "2026/2027");
+});
+
 test("course hydration restores missing course codes from their stable local document IDs", () => {
-  assert.deepEqual(normalizeCourseRecords([
+  const [course] = normalizeCourseRecords([
     { id: "BIO 101", name: "Biology" },
-  ]), [{ code: "BIO 101", name: "Biology", color: "leather" }]);
+  ]);
+  assert.equal(course.code, "BIO 101");
+  assert.equal(course.name, "Biology");
+  assert.equal(course.color, "leather");
+  assert.equal(course.storageId, "BIO 101");
+});
+
+test("concurrent academic updates preserve saved periods and stable session IDs", () => {
+  const existing = JSON.stringify([
+    { id: "first-session", year: "2025/2026", semester: "First semester", createdAt: 1 },
+    { id: "second-semester", year: "2025/2026", semester: "Second semester", createdAt: 2 },
+  ]);
+  const incoming = JSON.stringify([
+    { id: "conflicting-id", year: "2025/2026", semester: "First semester", createdAt: 3 },
+    { id: "new-session", year: "2026/2027", semester: "Extended semester", createdAt: 4 },
+  ]);
+
+  assert.deepEqual(JSON.parse(mergeAcademicSessionHistory(existing, incoming)), [
+    { id: "first-session", year: "2025/2026", semester: "First semester", createdAt: 1 },
+    { id: "second-semester", year: "2025/2026", semester: "Second semester", createdAt: 2 },
+    { id: "new-session", year: "2026/2027", semester: "Extended semester", createdAt: 4 },
+  ]);
+  assert.deepEqual(JSON.parse(mergeAcademicSessionHistory(existing, existing, { type: "delete", id: "first-session" })), [
+    { id: "second-semester", year: "2025/2026", semester: "Second semester", createdAt: 2 },
+  ]);
+  assert.deepEqual(JSON.parse(mergeAcademicSessionHistory(existing, existing, {
+    type: "upsert", record: { id: "first-session", year: "2026/2027", semester: "First semester", createdAt: 5 },
+  })), [
+    { id: "second-semester", year: "2025/2026", semester: "Second semester", createdAt: 2 },
+    { id: "first-session", year: "2026/2027", semester: "First semester", createdAt: 5 },
+  ]);
 });
 
 test("offline records persist per student and edits coalesce into one queued write", async () => {
@@ -44,7 +126,7 @@ test("offline records persist per student and edits coalesce into one queued wri
   assert.equal(await pendingWriteCount(uid), 1);
 
   const database = await new Promise((resolve, reject) => {
-    const request = indexedDB.open("campusos-local-v1", 2);
+    const request = indexedDB.open("campusos-local-v1", 5);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });

@@ -76,7 +76,7 @@ async function removeFirebaseData(user: User) {
   }
 
   if (studentSnapshot.exists()) {
-    const childCollections = ["courses", "assignments", "schedules", "exams", "events", "notificationReminders"];
+    const childCollections = ["courses", "assignments", "schedules", "exams", "events", "studyItems", "notificationReminders"];
     const childSnapshots = await Promise.all(childCollections.map((name) => getDocs(collection(db, "students", user.uid, name))));
     const securityRef = doc(db, "students", user.uid, "security", "session-control");
     const sessionControl = await getDoc(securityRef);

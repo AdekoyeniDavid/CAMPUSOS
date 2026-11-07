@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 import { firebaseConfigured } from "./firebase";
 import { saveStudentSection } from "./firestore";
-import { watchLocalRecords } from "./offlineStore";
+import { nextAcademicSelectionTimestamp, watchLocalRecords, type AcademicSessionSyncOperation } from "./offlineStore";
 import { clearDeferredInstallPrompt, getDeferredInstallPrompt, subscribeToInstallPrompt, type DeferredInstallPrompt } from "./pwaInstall";
 
 type CourseSummary = { code: string; name: string; creditUnits?: number };
@@ -72,7 +72,7 @@ const initialData: ProfileData = {
   institution: { name: "Not provided" },
   personal: { dateOfBirth: "", gender: "Not provided", genderDescription: "", nationality: deviceRegionNationality || "Not provided" },
   contact: { email: "", phoneCountryCode: deviceRegionCode, phone: "", address: "" },
-  academic: { department: "Not provided", programme: "Not provided", level: "Not provided", session: "Not provided", sessionHistory: "[]", semester: "Not provided", programStart: "", programEnd: "" },
+  academic: { department: "Not provided", programme: "Not provided", level: "Not provided", session: "Not provided", semester: "Not provided", selectionUpdatedAt: "0", sessionHistory: "[]", programStart: "", programEnd: "" },
   enrolment: { admissionDate: "", status: "Not provided" },
   courses: { registeredCourses: "" },
   progress: { gpa: "Not provided", completedCredits: "Not provided", standing: "Not provided" },
@@ -108,7 +108,7 @@ type SectionProps = {
   onChange: (key: string, value: string) => void;
   onSave: (event: FormEvent<HTMLFormElement>) => void;
   onCancel: () => void;
-  onPersistAcademicSessions?: (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string) => Promise<void>;
+  onPersistAcademicSessions?: (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string, operation?: AcademicSessionSyncOperation) => Promise<void>;
 };
 
 function readAcademicSessionRecords(serialized: string | undefined, currentSession: string | undefined, currentSemester: string | undefined): AcademicSessionRecord[] {
@@ -138,7 +138,7 @@ function readAcademicSessionRecords(serialized: string | undefined, currentSessi
   return records.sort((a, b) => b.year.localeCompare(a.year, undefined, { numeric: true }) || b.createdAt - a.createdAt);
 }
 
-function AcademicSessionManager({ serialized, currentSession, currentSemester, onPersist }: { serialized: string; currentSession: string; currentSemester: string; onPersist: (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string) => Promise<void> }) {
+function AcademicSessionManager({ serialized, currentSession, currentSemester, onPersist }: { serialized: string; currentSession: string; currentSemester: string; onPersist: (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string, operation?: AcademicSessionSyncOperation) => Promise<void> }) {
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AcademicSessionRecord | null>(null);
@@ -198,7 +198,7 @@ function AcademicSessionManager({ serialized, currentSession, currentSemester, o
     const selectedSession = wasCurrent || selectNewRecord ? year : currentSession;
     const selectedSemester = wasCurrent || selectNewRecord ? draft.semester : currentSemester;
     try {
-      await onPersist(nextRecords, selectedSession, selectedSemester);
+      await onPersist(nextRecords, selectedSession, selectedSemester, { type: "upsert", record: nextRecord });
       setEditorOpen(false);
       setEditingId(null);
     } catch (saveError) {
@@ -218,7 +218,7 @@ function AcademicSessionManager({ serialized, currentSession, currentSemester, o
     setBusy(true);
     setError("");
     try {
-      await onPersist(nextRecords, selectedSession, selectedSemester);
+      await onPersist(nextRecords, selectedSession, selectedSemester, { type: "delete", id: deleteTarget.id });
       setDeleteTarget(null);
       setEditorOpen(false);
     } catch (saveError) {
@@ -304,7 +304,7 @@ function ProfileSection({ id, title, fields, values, editing, menuOpen, onMenu, 
   </section>;
 }
 
-export function ProfilePanel({ studentUid, registeredEmail, requiresPasswordForDeletion, courses, studentName, onNameChange, onChangePassword, onDeleteAccount, onSignOut, onSignOutOtherSessions, onClose }: { studentUid: string; registeredEmail: string; requiresPasswordForDeletion: boolean; courses: CourseSummary[]; studentName: string; onNameChange: (name: string) => void; onChangePassword: (current: string, next: string) => Promise<void>; onDeleteAccount: (currentPassword: string) => Promise<void>; onSignOut: () => Promise<void>; onSignOutOtherSessions: () => Promise<void>; onClose: () => void }) {
+export function ProfilePanel({ studentUid, registeredEmail, requiresPasswordForDeletion, courses, studentName, onNameChange, onAcademicPeriodChange, onChangePassword, onDeleteAccount, onSignOut, onSignOutOtherSessions, onClose }: { studentUid: string; registeredEmail: string; requiresPasswordForDeletion: boolean; courses: CourseSummary[]; studentName: string; onNameChange: (name: string) => void; onAcademicPeriodChange: (session: string, semester: string) => void; onChangePassword: (current: string, next: string) => Promise<void>; onDeleteAccount: (currentPassword: string) => Promise<void>; onSignOut: () => Promise<void>; onSignOutOtherSessions: () => Promise<void>; onClose: () => void }) {
   const [data, setData] = useState<ProfileData>(() => ({ ...initialData, profile: { ...initialData.profile, fullName: studentName }, contact: { ...initialData.contact, email: registeredEmail }, courses: { registeredCourses: registeredCoursesText(courses) } }));
   const [editing, setEditing] = useState<SectionId | null>(null);
   const [openMenu, setOpenMenu] = useState<SectionId | null>(null);
@@ -444,10 +444,28 @@ export function ProfilePanel({ studentUid, registeredEmail, requiresPasswordForD
       onChange: (key, value) => setData((current) => ({ ...current, [id]: { ...current[id], [key]: value } })),
       onSave: (event) => { void saveSection(event, id); },
       onCancel: () => setEditing(null),
-      ...(id === "academic" ? { onPersistAcademicSessions: async (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string) => {
-        const updatedAcademic = { ...data.academic, session: selectedSession, semester: selectedSemester, sessionHistory: JSON.stringify(records) };
-        await saveStudentSection(studentUid, "academic", updatedAcademic);
+      ...(id === "academic" ? { onPersistAcademicSessions: async (records: AcademicSessionRecord[], selectedSession: string, selectedSemester: string, operation?: AcademicSessionSyncOperation) => {
+        const selection = {
+          session: selectedSession,
+          semester: selectedSemester,
+          updatedAt: nextAcademicSelectionTimestamp(data.academic.selectionUpdatedAt),
+        };
+        const syncOperation: AcademicSessionSyncOperation = operation && operation.type !== "select"
+          ? { ...operation, selection }
+          : { type: "select", ...selection };
+        const updatedAcademic = { ...data.academic, session: selectedSession, semester: selectedSemester, selectionUpdatedAt: String(selection.updatedAt), sessionHistory: JSON.stringify(records) };
+        const previousPeriod = { session: data.academic.session, semester: data.academic.semester };
+        // Change the workspace filter immediately; local persistence and the
+        // Firestore outbox proceed asynchronously behind this optimistic view.
+        onAcademicPeriodChange(selectedSession, selectedSemester);
         setData((current) => ({ ...current, academic: updatedAcademic }));
+        try {
+          await saveStudentSection(studentUid, "academic", updatedAcademic, syncOperation);
+        } catch (error) {
+          onAcademicPeriodChange(previousPeriod.session, previousPeriod.semester);
+          setData((current) => ({ ...current, academic: { ...current.academic, ...previousPeriod } }));
+          throw error;
+        }
       } } : {}),
     };
   }

@@ -55,11 +55,24 @@ export function getFirebaseStorageBucket() {
 export function getFirestoreDb(): Promise<Firestore | null> {
   if (!firebaseApp) return Promise.resolve(null);
   if (!firestoreDbPromise) {
-    firestoreDbPromise = import("firebase/firestore").then(({ getFirestore, initializeFirestore }) =>
-      firestoreWorkerHost
-        ? initializeFirestore(firebaseApp, { host: firestoreWorkerHost, ssl: true })
-        : getFirestore(firebaseApp),
-    ).catch((error: unknown) => {
+    firestoreDbPromise = import("firebase/firestore").then((firestore) => {
+      const { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager } = firestore;
+      const settings = firestoreWorkerHost ? { host: firestoreWorkerHost, ssl: true } : {};
+      try {
+        // Keep Firestore's own server cache durable across restarts and shared
+        // by tabs on this device. CampusOS's IndexedDB outbox remains the
+        // authoritative offline write queue; this cache backs realtime reads.
+        return initializeFirestore(firebaseApp, {
+          ...settings,
+          localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+        });
+      } catch {
+        // Private browsing, older WebViews, or an earlier SDK initialization
+        // can prevent persistent cache setup. Keep the app usable with the
+        // normal Firestore instance and CampusOS's own durable outbox.
+        return getFirestore(firebaseApp);
+      }
+    }).catch((error: unknown) => {
       firestoreDbPromise = undefined;
       throw error;
     });

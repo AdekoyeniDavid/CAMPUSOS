@@ -80,6 +80,27 @@ service cloud.firestore {
         || (data[key] is string && data[key].size() <= maxLength);
     }
 
+    function validProgress(progress) {
+      return progress is map
+        && progress.keys().hasOnly([
+          'gpa', 'completedCredits', 'standing',
+          'studyNotes', 'gradeRecords', 'academicSessions', 'deletedStudyRecords'
+        ])
+        && optionalString(progress, 'gpa', 40)
+        && optionalString(progress, 'completedCredits', 40)
+        && optionalString(progress, 'standing', 100)
+        && (!progress.keys().hasAny(['studyNotes'])
+          || (progress.studyNotes is list && progress.studyNotes.size() <= 500))
+        && (!progress.keys().hasAny(['gradeRecords'])
+          || (progress.gradeRecords is list && progress.gradeRecords.size() <= 1000))
+        // Academic-session data is keyed by year and semester. Restrict the
+        // count while Firestore's document-size limit bounds stored values.
+        && (!progress.keys().hasAny(['academicSessions'])
+          || (progress.academicSessions is map && progress.academicSessions.size() <= 100))
+        && (!progress.keys().hasAny(['deletedStudyRecords'])
+          || (progress.deletedStudyRecords is map && progress.deletedStudyRecords.size() <= 5000));
+    }
+
     function validStudentSections(data) {
       return data.profile is map
         && data.profile.keys().hasOnly(['fullName', 'studentId', 'programme', 'photo'])
@@ -103,12 +124,14 @@ service cloud.firestore {
         && optionalString(data.contact, 'phoneCountryCode', 24)
         && optionalString(data.contact, 'address', 1000)
         && data.academic is map
-        && data.academic.keys().hasOnly(['department', 'programme', 'level', 'session', 'semester', 'sessionHistory', 'programStart', 'programEnd'])
+        && data.academic.keys().hasOnly(['department', 'programme', 'level', 'session', 'semester', 'selectionUpdatedAt', 'sessionHistory', 'programStart', 'programEnd'])
         && optionalString(data.academic, 'department', 160)
         && optionalString(data.academic, 'programme', 160)
         && optionalString(data.academic, 'level', 40)
         && optionalString(data.academic, 'session', 20)
         && optionalString(data.academic, 'semester', 40)
+        && optionalString(data.academic, 'selectionUpdatedAt', 16)
+        && (!data.academic.keys().hasAny(['selectionUpdatedAt']) || data.academic.selectionUpdatedAt.matches('^[0-9]{1,16}$'))
         && optionalString(data.academic, 'sessionHistory', 20000)
         && optionalString(data.academic, 'programStart', 10)
         && optionalString(data.academic, 'programEnd', 10)
@@ -121,10 +144,7 @@ service cloud.firestore {
         && data.courses.keys().hasOnly(['registeredCourses'])
         && optionalString(data.courses, 'registeredCourses', 30000)
         && data.progress is map
-        && data.progress.keys().hasOnly(['gpa', 'completedCredits', 'standing'])
-        && optionalString(data.progress, 'gpa', 40)
-        && optionalString(data.progress, 'completedCredits', 40)
-        && optionalString(data.progress, 'standing', 100);
+        && validProgress(data.progress);
     }
 
     function studentEditableFieldsOnly() {
@@ -138,6 +158,103 @@ service cloud.firestore {
       && request.resource.data.createdAt == resource.data.createdAt;
     }
 
+    function validProgressOnlyUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['progress', 'updatedAt'])
+        && request.resource.data.progress is map
+        && resource.data.progress is map
+        && validChangedProgressFields();
+    }
+
+    // Validate only progress keys changed by this request. Student records
+    // created by earlier CampusOS versions can contain additional legacy
+    // values; those unchanged values must not block a notes/grades write.
+    function validChangedProgressFields() {
+      let progress = request.resource.data.progress;
+      let previousProgress = resource.data.progress;
+      let changed = progress.diff(previousProgress).affectedKeys();
+      return changed.hasOnly([
+          'gpa', 'completedCredits', 'standing',
+          'studyNotes', 'gradeRecords', 'academicSessions', 'deletedStudyRecords'
+        ])
+        && (!changed.hasAny(['gpa']) || optionalString(progress, 'gpa', 40))
+        && (!changed.hasAny(['completedCredits']) || optionalString(progress, 'completedCredits', 40))
+        && (!changed.hasAny(['standing']) || optionalString(progress, 'standing', 100))
+        && (!changed.hasAny(['studyNotes'])
+          || !progress.keys().hasAny(['studyNotes'])
+          || (progress.studyNotes is list && progress.studyNotes.size() <= 500))
+        && (!changed.hasAny(['gradeRecords'])
+          || !progress.keys().hasAny(['gradeRecords'])
+          || (progress.gradeRecords is list && progress.gradeRecords.size() <= 1000))
+        && (!changed.hasAny(['academicSessions'])
+          || !progress.keys().hasAny(['academicSessions'])
+          || (progress.academicSessions is map && progress.academicSessions.size() <= 100))
+        && (!changed.hasAny(['deletedStudyRecords'])
+          || !progress.keys().hasAny(['deletedStudyRecords'])
+          || (progress.deletedStudyRecords is map && progress.deletedStudyRecords.size() <= 5000));
+    }
+
+    // Existing student documents can contain fields written by older app
+    // versions. Validate only the section being changed so one stale section
+    // cannot block unrelated profile, academic, or course updates forever.
+    function validChangedStudentSections() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return (!changed.hasAny(['profile'])
+          || (request.resource.data.profile is map
+            && request.resource.data.profile.keys().hasOnly(['fullName', 'studentId', 'programme', 'photo'])
+            && optionalString(request.resource.data.profile, 'fullName', 160)
+            && optionalString(request.resource.data.profile, 'studentId', 80)
+            && optionalString(request.resource.data.profile, 'programme', 160)
+            && optionalString(request.resource.data.profile, 'photo', 2048)))
+        && (!changed.hasAny(['institution'])
+          || (request.resource.data.institution is map
+            && request.resource.data.institution.keys().hasOnly(['name'])
+            && optionalString(request.resource.data.institution, 'name', 200)))
+        && (!changed.hasAny(['personal'])
+          || (request.resource.data.personal is map
+            && request.resource.data.personal.keys().hasOnly(['dateOfBirth', 'gender', 'genderDescription', 'nationality'])
+            && optionalString(request.resource.data.personal, 'dateOfBirth', 10)
+            && optionalString(request.resource.data.personal, 'gender', 40)
+            && optionalString(request.resource.data.personal, 'genderDescription', 120)
+            && optionalString(request.resource.data.personal, 'nationality', 80)))
+        && (!changed.hasAny(['contact'])
+          || (request.resource.data.contact is map
+            && request.resource.data.contact.keys().hasOnly(['email', 'phone', 'phoneCountryCode', 'address'])
+            && request.resource.data.contact.email == request.resource.data.email
+            && optionalString(request.resource.data.contact, 'phone', 40)
+            && optionalString(request.resource.data.contact, 'phoneCountryCode', 24)
+            && optionalString(request.resource.data.contact, 'address', 1000)))
+        && (!changed.hasAny(['academic'])
+          || (request.resource.data.academic is map
+            && request.resource.data.academic.keys().hasOnly(['department', 'programme', 'level', 'session', 'semester', 'selectionUpdatedAt', 'sessionHistory', 'programStart', 'programEnd'])
+            && optionalString(request.resource.data.academic, 'department', 160)
+            && optionalString(request.resource.data.academic, 'programme', 160)
+            && optionalString(request.resource.data.academic, 'level', 40)
+            && optionalString(request.resource.data.academic, 'session', 20)
+            && optionalString(request.resource.data.academic, 'semester', 40)
+            && optionalString(request.resource.data.academic, 'selectionUpdatedAt', 16)
+            && (!request.resource.data.academic.keys().hasAny(['selectionUpdatedAt']) || request.resource.data.academic.selectionUpdatedAt.matches('^[0-9]{1,16}$'))
+            && optionalString(request.resource.data.academic, 'sessionHistory', 20000)
+            && optionalString(request.resource.data.academic, 'programStart', 10)
+            && optionalString(request.resource.data.academic, 'programEnd', 10)
+            && (!request.resource.data.academic.keys().hasAny(['session'])
+              || request.resource.data.academic.session == 'Not provided'
+              || request.resource.data.academic.session.matches('^[0-9]{4}/[0-9]{4}$'))
+            && (!request.resource.data.academic.keys().hasAny(['semester'])
+              || request.resource.data.academic.semester in ['First semester', 'Second semester', 'Extended semester', 'Not provided'])))
+        && (!changed.hasAny(['enrolment'])
+          || (request.resource.data.enrolment is map
+            && request.resource.data.enrolment.keys().hasOnly(['admissionDate', 'status', 'graduation'])
+            && optionalString(request.resource.data.enrolment, 'admissionDate', 10)
+            && optionalString(request.resource.data.enrolment, 'status', 80)
+            && optionalString(request.resource.data.enrolment, 'graduation', 10)))
+        && (!changed.hasAny(['courses'])
+          || (request.resource.data.courses is map
+            && request.resource.data.courses.keys().hasOnly(['registeredCourses'])
+            && optionalString(request.resource.data.courses, 'registeredCourses', 30000)))
+        && (!changed.hasAny(['progress'])
+          || validChangedProgressFields());
+    }
+
     function validAcademicPeriodFields() {
       return (!request.resource.data.keys().hasAny(['academicSession'])
           || (request.resource.data.academicSession is string
@@ -145,6 +262,24 @@ service cloud.firestore {
             && request.resource.data.academicSession.matches('^[0-9]{4}/[0-9]{4}$')))
         && (!request.resource.data.keys().hasAny(['semester'])
           || request.resource.data.semester in ['First semester', 'Second semester', 'Extended semester']);
+    }
+
+    function validStudyItem() {
+      return request.resource.data.keys().hasOnly([
+          'recordType', 'recordId', 'academicSession', 'semester', 'record', 'deleted', 'updatedAt'
+        ])
+        && request.resource.data.recordType in ['studyNotes', 'gradeRecords']
+        && request.resource.data.recordId is string
+        && request.resource.data.recordId.size() > 0
+        && request.resource.data.recordId.size() <= 150
+        && request.resource.data.academicSession is string
+        && (request.resource.data.academicSession == 'Not provided'
+          || request.resource.data.academicSession.matches('^[0-9]{4}/[0-9]{4}$'))
+        && request.resource.data.semester in ['First semester', 'Second semester', 'Extended semester', 'Not provided']
+        && request.resource.data.deleted is bool
+        && (request.resource.data.deleted
+          || (request.resource.data.record is map
+            && request.resource.data.record.id == request.resource.data.recordId));
     }
 
     function validCourse() {
@@ -271,7 +406,8 @@ service cloud.firestore {
       allow list: if isAdmin();
       allow create: if isVerifiedStudent(studentUid) && validStudentDocument(studentUid)
         && request.resource.data.authorizedStaffUids == [];
-      allow update: if (canModifyStudent(studentUid) && validStudentDocument(studentUid) && studentEditableFieldsOnly())
+      allow update: if (canModifyStudent(studentUid) && studentEditableFieldsOnly()
+          && (validStudentDocument(studentUid) || validProgressOnlyUpdate() || validChangedStudentSections()))
         || isAdmin();
       allow delete: if (isAdmin() || (ownsStudent(studentUid) && deletionRequested(studentUid)));
 
@@ -323,6 +459,12 @@ service cloud.firestore {
       match /events/{eventId} {
         allow read: if canReadStudent(studentUid);
         allow create, update: if (canModifyStudent(studentUid) && validEvent()) || isAdmin();
+        allow delete: if ownsStudent(studentUid) || isAdmin();
+      }
+
+      match /studyItems/{studyItemId} {
+        allow read: if canReadStudent(studentUid);
+        allow create, update: if (canModifyStudent(studentUid) && validStudyItem()) || isAdmin();
         allow delete: if ownsStudent(studentUid) || isAdmin();
       }
 

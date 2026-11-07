@@ -11,6 +11,7 @@ import {
   deleteSchedule as deleteScheduleRecord,
   cacheStudentDocument,
   ensureStudentRecord,
+  mergeStudyItemsIntoSections,
   renameCourse as renameCourseRecord,
   saveAssignment as saveAssignmentRecord,
   saveCourse as saveCourseRecord,
@@ -31,10 +32,11 @@ import {
   syncPendingStudyAttachments,
   type EventRecord,
 } from "./firestore";
-import { acknowledgePendingCloudOperation, listPendingCloudOperations, pendingRecordWriteCount, pendingWriteCount, queuePendingCloudOperation, replaceWithRemoteRecords, syncPendingWrites, watchLocalRecords } from "./offlineStore";
+import { acknowledgePendingCloudOperation, applyRemoteRecordChanges, listPendingCloudOperations, pendingRecordWriteCount, pendingWriteCount, queuePendingCloudOperation, replaceWithRemoteRecords, syncPendingWrites, watchLocalRecords, type OfflineCollection } from "./offlineStore";
 import "./App.css";
 import { createRecordId, readStoredValue, removeStoredValue, writeStoredValue } from "./browser";
 import { normalizeCourseRecords } from "./courseRecords";
+import { isCloudRealtimeConnected } from "./syncHealth";
 import { deleteStudentAccount } from "./accountDeletion";
 // Capture the browser's one-shot PWA install event before the lazy account panel loads.
 import "./pwaInstall";
@@ -204,6 +206,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   const quickSearchPopoverRef = useRef<HTMLElement>(null);
   const reminderCancelRef = useRef<HTMLButtonElement>(null);
   const academicPeriodHistoryReadyRef = useRef(false);
+  const legacyPeriodMigrationStartedRef = useRef(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [reminderMessage, setReminderMessage] = useState("");
@@ -398,12 +401,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
   }, [activeAcademicSession, activeAcademicSemester]);
 
   useEffect(() => {
+    legacyPeriodMigrationStartedRef.current = false;
     academicPeriodHistoryReadyRef.current = false;
   }, [user.uid]);
-
-  useEffect(() => {
-    if (hasActiveAcademicPeriod && academicPeriodHistoryReadyRef.current) void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined);
-  }, [user.uid, activeAcademicSession, activeAcademicSemester, hasActiveAcademicPeriod]);
 
   useEffect(() => {
     if (courses.length && !courses.some((course) => course.code === newCourse)) setNewCourse(courses[0].code);
@@ -741,6 +741,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
           semester: typeof semester === "string" && ["First semester", "Second semester", "Extended semester"].includes(semester) ? semester : "Not provided",
         });
       }),
+      watchLocalRecords(user.uid, "studyItems", () => { void mergeStudyItemsIntoSections(user.uid); }),
     ];
     const resumeSync = () => {
       if (!navigator.onLine) return;
@@ -792,6 +793,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
       if (detail?.uid === user.uid && detail.syncOperations === true && navigator.onLine) {
         setTimetableQueueVersion((version) => version + 1);
       }
+      if (detail?.uid === user.uid) void mergeStudyItemsIntoSections(user.uid);
     };
     // Online events are missed by some mobile browsers after radio handoffs or
     // app suspension. Keep the fallback short so durable local edits drain
@@ -830,11 +832,17 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     setCloudConnected(false);
     let readyParts = new Set<string>();
     let liveParts = new Set<string>();
+    const authoritativeCollections = new Set<string>();
+    // Firestore can emit a cache snapshot and then a server snapshot back to
+    // back. Serialize local reconciliation per collection so a slow cache
+    // write cannot finish last and downgrade a healthy server listener.
+    const collectionSnapshotQueues = new Map<string, Promise<void>>();
+    let profileSnapshotQueue: Promise<void> = Promise.resolve();
     let authoritativeStudentDocumentLoaded = false;
     let unsubscribers: Array<() => void> = [];
     const markReady = (key: string, fromCache: boolean) => {
       readyParts.add(key);
-      if (readyParts.size === 7) {
+      if (readyParts.size === 8) {
         setCloudMessage((message) => message.startsWith("Loading your saved student data") ? "" : message);
       }
       if (fromCache) liveParts.delete(key);
@@ -842,39 +850,89 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         liveParts.add(key);
         setCloudMessage((message) => message.startsWith("Cloud sync is temporarily unavailable") ? "" : message);
       }
-      academicPeriodHistoryReadyRef.current = authoritativeStudentDocumentLoaded && liveParts.size === 7 && navigator.onLine;
-      if (academicPeriodHistoryReadyRef.current) {
+      academicPeriodHistoryReadyRef.current = authoritativeStudentDocumentLoaded && liveParts.size === 8 && navigator.onLine;
+      if (academicPeriodHistoryReadyRef.current && !legacyPeriodMigrationStartedRef.current) {
         // Migrate only after every remote collection and the authoritative
-        // academic history have been hydrated locally.
-        void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => undefined);
+        // academic history have been hydrated locally. Run once per signed-in
+        // account; rerunning on snapshots or session switches can move new
+        // records into the first saved academic period.
+        legacyPeriodMigrationStartedRef.current = true;
+        void migrateLegacyRecordsToOldestAcademicPeriod(user.uid).catch(() => {
+          legacyPeriodMigrationStartedRef.current = false;
+        });
       }
-      // Report connected only after all independent academic collections and the
-      // student document (including its study records) have reached the device.
-      setCloudConnected(liveParts.size === 7 && navigator.onLine);
+      // Only show Connected when every core data subscription has a live
+      // server snapshot. A healthy course listener must not mask a failed
+      // academic, profile, or study-record channel.
+      updateCloudConnectionState();
     };
-    const failed = (key?: string) => {
+    const requiredLiveParts = 8;
+    const updateCloudConnectionState = () => {
+      setCloudConnected(isCloudRealtimeConnected(navigator.onLine, liveParts.size, requiredLiveParts));
+    };
+    const failed = (key?: string, error?: unknown) => {
       if (key) liveParts.delete(key);
       if (!key || key === "profile" || key === "studyRecords") authoritativeStudentDocumentLoaded = false;
       academicPeriodHistoryReadyRef.current = false;
-      setCloudConnected(liveParts.size === 7 && navigator.onLine);
+      updateCloudConnectionState();
+      if (import.meta.env.DEV && error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? String((error as { code: unknown }).code)
+          : "unknown";
+        // Keep diagnostics useful without printing student records or credentials.
+        console.warn(`[CampusOS sync] ${key ?? "listener"} subscription failed (${code}).`);
+      }
       setCloudMessage("");
     };
     const applyCollectionSnapshot = (
       key: string,
-      collection: "courses" | "assignments" | "schedules" | "exams" | "events",
+      collection: Exclude<OfflineCollection, "studentSections">,
       records: Array<Record<string, unknown> & { id: string }>,
       fromCache: boolean,
       hasPendingWrites: boolean,
+      changes: Array<{ type: "added" | "modified" | "removed"; record: Record<string, unknown> & { id: string } }>,
     ) => {
-      // Only report this collection ready after its remote snapshot is safely
-      // applied to the on-device store. This keeps Connected from racing ahead
-      // of the data shown by the UI on slower mobile devices.
-      // Firestore can emit our own optimistic local write in an online snapshot.
-      // It is not durable on the server until hasPendingWrites clears; treating
-      // it as authoritative can remove a queued item if the server rejects it.
-      void replaceWithRemoteRecords(user.uid, collection, records, !fromCache && !hasPendingWrites)
-        .then(() => markReady(key, fromCache))
-        .catch(() => failed(key));
+      // Show a live connection as soon as Firestore confirms a server snapshot;
+      // do not make the transport indicator wait for IndexedDB reconciliation.
+      if (fromCache && authoritativeCollections.has(key)) return;
+      const previous = collectionSnapshotQueues.get(key) ?? Promise.resolve();
+      const next = previous.catch(() => undefined).then(async () => {
+        // Recheck after prior reconciliation: a server snapshot may have
+        // completed while this queued cache callback was waiting.
+        if (fromCache && authoritativeCollections.has(key)) return;
+        // Firestore can emit our own optimistic local write in an online
+        // snapshot. It is not durable on the server until pending writes clear.
+        const authoritative = !fromCache && !hasPendingWrites;
+        const hasBaseline = authoritativeCollections.has(key);
+        if (hasBaseline) await applyRemoteRecordChanges(user.uid, collection, changes);
+        else await replaceWithRemoteRecords(user.uid, collection, records, authoritative);
+        if (authoritative) authoritativeCollections.add(key);
+        markReady(key, fromCache);
+      }).catch((error) => failed(key, error));
+      collectionSnapshotQueues.set(key, next);
+    };
+    const applyStudentDocumentSnapshot = (
+      studentData: Record<string, unknown> | undefined,
+      fromCache: boolean,
+      hasPendingWrites: boolean,
+    ) => {
+      profileSnapshotQueue = profileSnapshotQueue.catch(() => undefined).then(async () => {
+        const profileName = (studentData?.profile as Record<string, unknown> | undefined)?.fullName;
+        if (typeof profileName === "string" && profileName.trim()) setStudentName(profileName);
+        if (studentData) {
+          await cacheStudentDocument(user.uid, studentData, !fromCache && !hasPendingWrites);
+          if (!fromCache && !hasPendingWrites) authoritativeStudentDocumentLoaded = true;
+          markReady("profile", fromCache);
+          // Grades and notes/resources are stored inside the student profile's
+          // progress data, so keep their readiness tied to this same snapshot.
+          markReady("studyRecords", fromCache);
+        } else {
+          if (!fromCache && !hasPendingWrites) authoritativeStudentDocumentLoaded = false;
+          academicPeriodHistoryReadyRef.current = false;
+          markReady("profile", fromCache);
+          markReady("studyRecords", fromCache);
+        }
+      }).catch((error) => { failed("profile", error); failed("studyRecords", error); });
     };
     const clearLiveStatusWhenOffline = () => {
       if (!navigator.onLine) {
@@ -885,26 +943,9 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
     window.addEventListener("offline", clearLiveStatusWhenOffline);
     unsubscribers = [
         watchStudentDocument(user.uid, (studentData, fromCache, hasPendingWrites) => {
-          const profileName = (studentData?.profile as Record<string, unknown> | undefined)?.fullName;
-          if (typeof profileName === "string" && profileName.trim()) setStudentName(profileName);
-          if (studentData) {
-            void cacheStudentDocument(user.uid, studentData, !fromCache && !hasPendingWrites)
-              .then(() => {
-                if (!fromCache && !hasPendingWrites) authoritativeStudentDocumentLoaded = true;
-                markReady("profile", fromCache);
-                // Grades and notes/resources are stored inside the student profile's
-                // progress data, so wait for that hydration before reporting Connected.
-                markReady("studyRecords", fromCache);
-              })
-              .catch(() => { failed("profile"); failed("studyRecords"); });
-          } else {
-            if (!fromCache && !hasPendingWrites) authoritativeStudentDocumentLoaded = false;
-            academicPeriodHistoryReadyRef.current = false;
-            markReady("profile", fromCache);
-            markReady("studyRecords", fromCache);
-          }
-        }, () => { failed("profile"); failed("studyRecords"); }),
-        watchStudentCollection(user.uid, "courses", (records, fromCache, hasPendingWrites) => {
+          applyStudentDocumentSnapshot(studentData, fromCache, hasPendingWrites);
+        }, (error) => { failed("profile", error); failed("studyRecords", error); }),
+        watchStudentCollection(user.uid, "courses", (records, fromCache, hasPendingWrites, changes) => {
           const normalized = records.map((item) => ({ ...item, code: typeof item.code === "string" ? item.code : item.id }));
           // Keep the course code in the cached record as well as using it as its local ID.
           setRecentCourseCodes(records
@@ -915,20 +956,24 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
             })
             .map((item) => item.id)
             .slice(0, 6));
-          applyCollectionSnapshot("courses", "courses", normalized, fromCache, hasPendingWrites);
-        }, () => failed("courses")),
-        watchStudentCollection(user.uid, "assignments", (records, fromCache, hasPendingWrites) => {
-          applyCollectionSnapshot("assignments", "assignments", records, fromCache, hasPendingWrites);
-        }, () => failed("assignments")),
-        watchStudentCollection(user.uid, "schedules", (records, fromCache, hasPendingWrites) => {
-          applyCollectionSnapshot("schedules", "schedules", records, fromCache, hasPendingWrites);
-        }, () => failed("schedules")),
-        watchStudentCollection(user.uid, "exams", (records, fromCache, hasPendingWrites) => {
-          applyCollectionSnapshot("exams", "exams", records, fromCache, hasPendingWrites);
-        }, () => failed("exams")),
-        watchStudentCollection(user.uid, "events", (records, fromCache, hasPendingWrites) => {
-          applyCollectionSnapshot("events", "events", records, fromCache, hasPendingWrites);
-        }, () => failed("events")),
+          const normalizedChanges = changes.map((change) => ({ ...change, record: { ...change.record, code: typeof change.record.code === "string" ? change.record.code : change.record.id } }));
+          applyCollectionSnapshot("courses", "courses", normalized, fromCache, hasPendingWrites, normalizedChanges);
+        }, (error) => failed("courses", error)),
+        watchStudentCollection(user.uid, "assignments", (records, fromCache, hasPendingWrites, changes) => {
+          applyCollectionSnapshot("assignments", "assignments", records, fromCache, hasPendingWrites, changes);
+        }, (error) => failed("assignments", error)),
+        watchStudentCollection(user.uid, "schedules", (records, fromCache, hasPendingWrites, changes) => {
+          applyCollectionSnapshot("schedules", "schedules", records, fromCache, hasPendingWrites, changes);
+        }, (error) => failed("schedules", error)),
+        watchStudentCollection(user.uid, "exams", (records, fromCache, hasPendingWrites, changes) => {
+          applyCollectionSnapshot("exams", "exams", records, fromCache, hasPendingWrites, changes);
+        }, (error) => failed("exams", error)),
+        watchStudentCollection(user.uid, "events", (records, fromCache, hasPendingWrites, changes) => {
+          applyCollectionSnapshot("events", "events", records, fromCache, hasPendingWrites, changes);
+        }, (error) => failed("events", error)),
+        watchStudentCollection(user.uid, "studyItems", (records, fromCache, hasPendingWrites, changes) => {
+          applyCollectionSnapshot("studyItems", "studyItems", records, fromCache, hasPendingWrites, changes);
+        }, (error) => failed("studyItems", error)),
     ];
     // Do not hold up live subscriptions on the optional first-login profile write.
     if (navigator.onLine) void ensureStudentRecord(user).catch(() => failed());
@@ -2204,7 +2249,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
         {courseRestoreRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!courseRestoreBusy && event.target === event.currentTarget) setCourseRestoreRequest(null); }}><section className="attachment-delete-dialog liquid-glass course-restore-dialog" role="alertdialog" aria-modal="true" aria-labelledby="course-restore-title" aria-describedby="course-restore-description"><div className="attachment-delete-icon course-restore-icon" aria-hidden="true">↶</div><p className="profile-kicker">COURSE ARCHIVE</p><h2 id="course-restore-title">Restore this course?</h2><p id="course-restore-description"><strong>{courseRestoreRequest.code} · {courseRestoreRequest.name}</strong> will return to your active courses and remain saved to your account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={courseRestoreBusy} onClick={() => setCourseRestoreRequest(null)}>Keep archived</button><button type="button" className="attachment-delete-confirm course-restore-confirm" disabled={courseRestoreBusy} onClick={() => void confirmCourseRestore()}>{courseRestoreBusy ? "Restoring…" : "Restore course"}</button></div></section></div>}
         {assignmentDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!assignmentDeleteBusy && event.target === event.currentTarget) setAssignmentDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="assignment-delete-title" aria-describedby="assignment-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">ASSIGNMENT REMOVAL</p><h2 id="assignment-delete-title">Delete this assignment?</h2><p id="assignment-delete-description"><strong>{assignmentDeleteRequest.title}</strong> will be removed from your assignment list and deleted from this device and account.</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={assignmentDeleteBusy} onClick={() => setAssignmentDeleteRequest(null)}>Keep assignment</button><button type="button" className="attachment-delete-confirm" disabled={assignmentDeleteBusy} onClick={() => void confirmAssignmentDelete()}>{assignmentDeleteBusy ? "Deleting…" : "Delete assignment"}</button></div></section></div>}
         {timetableDeleteRequest && <div className="attachment-delete-backdrop" onMouseDown={(event) => { if (!timetableDeleteBusy && event.target === event.currentTarget) setTimetableDeleteRequest(null); }}><section className="attachment-delete-dialog liquid-glass" role="alertdialog" aria-modal="true" aria-labelledby="timetable-delete-title" aria-describedby="timetable-delete-description"><div className="attachment-delete-icon" aria-hidden="true">⌫</div><p className="profile-kicker">TIMETABLE REMOVAL</p><h2 id="timetable-delete-title">{timetableDeleteRequest.type === "event" ? timetableDeleteRequest.action === "schedule" ? "Delete this event schedule?" : "Delete this event?" : "Delete this timetable entry?"}</h2><p id="timetable-delete-description">{timetableDeleteRequest.type === "weekly" ? <><strong>{timetableDeleteRequest.entry.courseCode}</strong> · {timetableDeleteRequest.entry.day}, {timetableDeleteRequest.entry.start}–{timetableDeleteRequest.entry.end} will be removed from your weekly timetable.</> : timetableDeleteRequest.type === "exam" ? <><strong>{timetableDeleteRequest.entry.title}</strong> · {timetableDeleteRequest.entry.courseCode}, {timetableDeleteRequest.entry.date} at {timetableDeleteRequest.entry.start} will be removed from your exam timetable.</> : timetableDeleteRequest.action === "schedule" ? <>The date, time, venue, and notification reminder for <strong>{timetableDeleteRequest.entry.title}</strong> will be removed. The event details will remain.</> : <> <strong>{timetableDeleteRequest.entry.title}</strong> and its schedule will be removed from this academic session.</>}</p><div className="attachment-delete-actions"><button type="button" className="attachment-delete-cancel" disabled={timetableDeleteBusy} onClick={() => setTimetableDeleteRequest(null)}>Keep {timetableDeleteRequest.type === "event" ? timetableDeleteRequest.action === "schedule" ? "schedule" : "event" : "entry"}</button><button type="button" className="attachment-delete-confirm" disabled={timetableDeleteBusy} onClick={() => void confirmTimetableDelete()}>{timetableDeleteBusy ? "Deleting…" : timetableDeleteRequest.type === "event" ? timetableDeleteRequest.action === "schedule" ? "Delete schedule" : "Delete event" : "Delete timetable"}</button></div></section></div>}
-        {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} requiresPasswordForDeletion={user.providerData.some((provider) => provider.providerId === "password")} courses={courses} studentName={studentName} onNameChange={updateStudentName} onChangePassword={changeStudentPassword} onDeleteAccount={deleteCurrentStudentAccount} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
+        {profileOpen && <Suspense fallback={<div className="profile-loading liquid-glass" role="status">Loading profile…</div>}><ProfilePanel studentUid={user.uid} registeredEmail={user.email ?? ""} requiresPasswordForDeletion={user.providerData.some((provider) => provider.providerId === "password")} courses={courses} studentName={studentName} onNameChange={updateStudentName} onAcademicPeriodChange={(session, semester) => setAcademicPeriod({ session, semester })} onChangePassword={changeStudentPassword} onDeleteAccount={deleteCurrentStudentAccount} onSignOut={onSignOut} onSignOutOtherSessions={signOutOtherSessions} onClose={() => setProfileOpen(false)} /></Suspense>}
         {menuOpen && (
           <>
             <button className="menu-backdrop" aria-label="Close navigation menu" onClick={() => setMenuOpen(false)} />
@@ -2488,7 +2533,7 @@ function CampusOSWorkspace({ user, onSignOut }: { user: User; onSignOut: () => P
                 </button>
               </div>
               {showCourseForm && (
-                <form className="assignment-form course-form liquid-glass" onSubmit={saveCourse}>
+                <form className={`assignment-form course-form liquid-glass ${showCourseCredits ? "course-form-credit-open" : ""}`} onSubmit={saveCourse}>
                   <label>Course code<input value={newCourseCode} onChange={(event) => setNewCourseCode(event.target.value)} placeholder="e.g. BIO 104" required /></label>
                   <label>Course name<input value={newCourseName} onChange={(event) => setNewCourseName(event.target.value)} placeholder="e.g. Introductory Biology" required /></label>
                   <label><span>Lecturer name <small className="course-field-optional">(optional)</small></span><input value={newCourseLecturer} onChange={(event) => setNewCourseLecturer(event.target.value)} placeholder="e.g. Dr. Ada Okafor" maxLength={100} autoComplete="name" /></label>

@@ -1,7 +1,7 @@
 import type { User } from "firebase/auth";
 import type { DocumentData, QuerySnapshot } from "firebase/firestore";
 import { getFirebaseAppInstance, getFirebaseStorageBucket, getFirestoreDb } from "./firebase";
-import { clearPendingAttachmentDelete, clearUnreferencedAttachmentUpload, deleteLocalRecord, listLocalAttachments, listLocalRecords, listPendingAttachmentDeletes, markLocalAttachmentCloudSynced, pendingWriteKeys, queueLocalAttachmentUpload, replaceWithRemoteRecords, saveLocalRecord, type OfflineCollection } from "./offlineStore";
+import { clearPendingAttachmentDelete, clearUnreferencedAttachmentUpload, deleteLocalRecord, getLocalRecord, listLocalAttachments, listLocalRecords, listPendingAttachmentDeletes, markLocalAttachmentCloudSynced, pendingWriteKeys, queueLocalAttachmentUpload, replaceWithRemoteRecords, saveLocalRecord, type AcademicSessionSyncOperation, type OfflineCollection, type StudyRecordSyncOperation } from "./offlineStore";
 import { watchWithReconnect } from "./reconnect";
 
 export type StudentSection = "profile" | "institution" | "personal" | "contact" | "academic" | "enrolment" | "courses" | "progress";
@@ -13,6 +13,10 @@ export type EventRecord = { title: string; description: string; date?: string; s
 export type TimetableReminderPreference = { sourceType: "weekly" | "exam" | "event"; sourceId: string; courseCode: string; leadMinutes: number };
 export type AssignmentReminderPreference = { sourceType: "assignment"; sourceId: string; courseCode: string; dueDate: string; dueTime: string; leadMinutes: number };
 const studentSections: StudentSection[] = ["profile", "institution", "personal", "contact", "academic", "enrolment", "courses", "progress"];
+// Profile snapshots and study-item materialization both update the same
+// IndexedDB studentSections records. Keep them on one per-account queue so an
+// older profile hydration cannot finish after a newer note/grade merge.
+const studentSectionReconciliationQueues = new Map<string, Promise<void>>();
 
 function validateStudyAttachmentPath(uid: string, attachmentId: string) {
   if (!uid || !/^[A-Za-z0-9_-]{1,128}$/.test(attachmentId)) throw new Error("This study document has an invalid identifier.");
@@ -123,9 +127,9 @@ export async function ensureStudentRecord(user: User) {
   });
 }
 
-export async function saveStudentSection(uid: string, section: StudentSection, values: Record<string, string>) {
+export async function saveStudentSection(uid: string, section: StudentSection, values: Record<string, string>, academicSessionOperation?: AcademicSessionSyncOperation) {
   validateStudentSection(section, values);
-  await saveLocalRecord(uid, "studentSections", section, values);
+  await saveLocalRecord(uid, "studentSections", section, values, section === "academic" ? academicSessionOperation : undefined);
 }
 
 const sectionFields: Record<StudentSection, Record<string, number>> = {
@@ -133,7 +137,7 @@ const sectionFields: Record<StudentSection, Record<string, number>> = {
   institution: { name: 200 },
   personal: { dateOfBirth: 10, gender: 40, genderDescription: 120, nationality: 80 },
   contact: { email: 320, phone: 40, phoneCountryCode: 24, address: 1000 },
-  academic: { department: 160, programme: 160, level: 40, session: 20, semester: 40, sessionHistory: 20000, programStart: 10, programEnd: 10 },
+  academic: { department: 160, programme: 160, level: 40, session: 20, semester: 40, selectionUpdatedAt: 16, sessionHistory: 20000, programStart: 10, programEnd: 10 },
   enrolment: { admissionDate: 10, status: 80, graduation: 10 },
   courses: { registeredCourses: 30000 },
   progress: { gpa: 40, completedCredits: 40, standing: 100 },
@@ -156,6 +160,7 @@ function validateStudentSection(section: StudentSection, values: Record<string, 
   if (section === "academic") {
     if (values.session && values.session !== "Not provided" && !/^\d{4}\/\d{4}$/.test(values.session)) throw new Error("Enter the academic year as YYYY/YYYY.");
     if (values.semester && !["First semester", "Second semester", "Extended semester", "Not provided"].includes(values.semester)) throw new Error("Choose an available semester.");
+    if (values.selectionUpdatedAt && !/^\d{1,16}$/.test(values.selectionUpdatedAt)) throw new Error("The current academic session timestamp is invalid.");
     for (const key of ["programStart", "programEnd"]) if (values[key] && !/^\d{4}-\d{2}-\d{2}$/.test(values[key])) throw new Error("Enter a valid program date.");
     if (values.sessionHistory) {
       let sessions: unknown;
@@ -178,7 +183,27 @@ export async function saveStudyRecord(uid: string, field: "studyNotes" | "gradeR
     throw new Error("Set a current academic year and semester in Student Account → Academic Details before saving study records.");
   }
   const id = studyRecordId(field, session, semester);
-  await saveLocalRecord(uid, "studentSections", id, { value, academicSession: session, semester });
+  const current = await getLocalRecord(uid, "studentSections", id);
+  const previousValue = Array.isArray(current?.value) ? current.value : [];
+  const stableRecords = (records: unknown[]) => records.every((record) => Boolean(record && typeof record === "object"
+    && !Array.isArray(record) && typeof (record as Record<string, unknown>).id === "string"));
+  let operation: StudyRecordSyncOperation | undefined;
+  if (stableRecords(previousValue) && stableRecords(value)) {
+    const before = new Map(previousValue.map((record) => [(record as Record<string, unknown>).id as string, record]));
+    const after = new Map(value.map((record) => [(record as Record<string, unknown>).id as string, record]));
+    const changes: StudyRecordSyncOperation["changes"] = [];
+    // Send only changed entries during normal edits. The cloud transaction
+    // merges by ID, while snapshot reconciliation below repairs missing local
+    // records in a single pass when devices reconnect.
+    for (const [recordId, record] of after) {
+      if (!before.has(recordId) || JSON.stringify(before.get(recordId)) !== JSON.stringify(record)) {
+        changes.push({ id: recordId, data: record, deleted: false });
+      }
+    }
+    for (const recordId of before.keys()) if (!after.has(recordId)) changes.push({ id: recordId, deleted: true });
+    operation = { changes };
+  }
+  await saveLocalRecord(uid, "studentSections", id, { value, academicSession: session, semester }, undefined, operation);
 }
 
 const semesterOptions = ["First semester", "Second semester", "Extended semester"] as const;
@@ -260,16 +285,13 @@ export async function migrateLegacyRecordsToOldestAcademicPeriod(uid: string): P
     const isUnscoped = (record: Record<string, unknown>) =>
       typeof record["academicSession"] !== "string" || !/^\d{4}\/\d{4}$/.test(record["academicSession"])
       || !semesterOptions.includes(record["semester"] as typeof semesterOptions[number]);
-    // Older builds may already have placed legacy records in the session that
-    // happened to be current at the time. If the record predates the user's
-    // first saved academic period, rehome it to that original period too.
+    // Only records without a complete saved period are ambiguous. Preserve the
+    // explicit academic period on all tagged records; their creation timestamp
+    // cannot safely determine which semester the student intended.
     const belongsToOldestPeriod = (collection: OfflineCollection, record: Record<string, unknown>) => {
       const id = typeof record["id"] === "string" ? record["id"] : "";
       if (!id || pendingKeys.has(`${collection}/${id}`)) return false;
-      if (isUnscoped(record)) return true;
-      if (record["academicSession"] === session && record["semester"] === semester) return false;
-      const createdAt = timestampMilliseconds(record["createdAt"]);
-      return destination.createdAt > 0 && createdAt > 0 && createdAt < destination.createdAt;
+      return isUnscoped(record);
     };
     let migrated = 0;
     for (const record of courses) {
@@ -347,17 +369,32 @@ export function watchStudentDocument(
 export function watchStudentCollection(
   uid: string,
   collectionName: Exclude<OfflineCollection, "studentSections">,
-  listener: (records: Array<Record<string, unknown> & { id: string }>, fromCache: boolean, hasPendingWrites: boolean) => void,
+  listener: (
+    records: Array<Record<string, unknown> & { id: string }>,
+    fromCache: boolean,
+    hasPendingWrites: boolean,
+    changes: Array<{ type: "added" | "modified" | "removed"; record: Record<string, unknown> & { id: string } }>,
+  ) => void,
   onError: (error: unknown) => void,
 ) {
-  return watchWithReconnect<[Array<Record<string, unknown> & { id: string }>, boolean, boolean]>(async (next, error) => {
+  return watchWithReconnect<[
+    Array<Record<string, unknown> & { id: string }>,
+    boolean,
+    boolean,
+    Array<{ type: "added" | "modified" | "removed"; record: Record<string, unknown> & { id: string } }>,
+  ]>(async (next, error) => {
     const db = await getFirestoreDb();
     if (!db) throw new Error("Firebase is not configured.");
     const { collection, onSnapshot } = await import("firebase/firestore");
     return onSnapshot(collection(db, "students", uid, collectionName), { includeMetadataChanges: true }, (snapshot) => {
-      next([snapshot.docs.map((item) => ({ ...item.data(), id: item.id })), snapshot.metadata.fromCache, snapshot.metadata.hasPendingWrites]);
+      const records = snapshot.docs.map((item) => ({ ...item.data(), id: item.id }));
+      const changes = snapshot.docChanges().map((change) => ({
+        type: change.type as "added" | "modified" | "removed",
+        record: { ...change.doc.data(), id: change.doc.id },
+      }));
+      next([records, snapshot.metadata.fromCache, snapshot.metadata.hasPendingWrites, changes]);
     }, error);
-  }, ([records, fromCache, hasPendingWrites]) => listener(records, fromCache, hasPendingWrites), onError, { isHealthy: ([, fromCache]) => !fromCache });
+  }, ([records, fromCache, hasPendingWrites, changes]) => listener(records, fromCache, hasPendingWrites, changes), onError, { isHealthy: ([, fromCache]) => !fromCache });
 }
 
 export function watchTimetableReminderPreferences(
@@ -470,7 +507,107 @@ export async function revokeOtherSessions(uid: string, authTime: number) {
   });
 }
 
-export async function cacheStudentDocument(uid: string, student: Record<string, unknown>, authoritative: boolean) {
+export function cacheStudentDocument(uid: string, student: Record<string, unknown>, authoritative: boolean) {
+  // Firestore delivers document snapshots in order, but each hydration reads
+  // IndexedDB asynchronously before applying the result. Without this queue,
+  // an older snapshot whose local read is slower can finish last and roll back
+  // a newer set of notes, grades, or student details on this device.
+  const previous = studentSectionReconciliationQueues.get(uid) ?? Promise.resolve();
+  const task = previous.catch(() => undefined).then(() => applyStudentDocumentSnapshot(uid, student, authoritative));
+  studentSectionReconciliationQueues.set(uid, task);
+  return task.finally(() => {
+    if (studentSectionReconciliationQueues.get(uid) === task) studentSectionReconciliationQueues.delete(uid);
+  });
+}
+
+function mergeStudyItemsIntoRecords(
+  records: Array<Record<string, unknown> & { id: string }>,
+  items: Array<Record<string, unknown> & { id: string }>,
+  pendingKeys: Set<string>,
+) {
+  const sections = new Map(records.map((record) => [record.id, record]));
+  const merged = new Map<string, Map<string, unknown>>();
+  const itemScopes = new Map<string, Array<Record<string, unknown> & { id: string }>>();
+  for (const item of items) {
+    const field = item.recordType;
+    const recordId = item.recordId;
+    if ((field !== "studyNotes" && field !== "gradeRecords") || typeof recordId !== "string") continue;
+    const session = typeof item.academicSession === "string" ? item.academicSession : "Not provided";
+    const semester = typeof item.semester === "string" ? item.semester : "Not provided";
+    const sectionId = /^\d{4}\/\d{4}$/.test(session)
+      ? studyRecordId(field, session, semester !== "Not provided" ? semester : undefined)
+      : field;
+    if (pendingKeys.has(`studentSections/${sectionId}`)) continue;
+    let recordsById = merged.get(sectionId);
+    if (!recordsById) {
+      recordsById = new Map();
+      const local = sections.get(sectionId)?.value;
+      if (Array.isArray(local)) for (const record of local) {
+        if (record && typeof record === "object" && !Array.isArray(record) && typeof (record as Record<string, unknown>).id === "string") {
+          recordsById.set((record as Record<string, unknown>).id as string, record);
+        }
+      }
+      merged.set(sectionId, recordsById);
+    }
+    const scopedItems = itemScopes.get(sectionId) ?? [];
+    scopedItems.push(item);
+    itemScopes.set(sectionId, scopedItems);
+    if (item.deleted === true) recordsById.delete(recordId);
+    else if (item.record && typeof item.record === "object" && !Array.isArray(item.record)) recordsById.set(recordId, item.record);
+  }
+  for (const [sectionId, recordsById] of merged) {
+    const current = sections.get(sectionId);
+    const data = current ? Object.fromEntries(Object.entries(current).filter(([key]) => key !== "id")) : {};
+    const result: Record<string, unknown> = { ...data, value: [...recordsById.values()] };
+    if (sectionId.includes("__")) {
+      const match = /^(?:studyNotes|gradeRecords)__(\d{4}-\d{4})(?:__(first-semester|second-semester|extended-semester))?$/.exec(sectionId);
+      if (match) {
+        result.academicSession = match[1].replace("-", "/");
+        const semester = { "first-semester": "First semester", "second-semester": "Second semester", "extended-semester": "Extended semester" }[match[2] ?? ""];
+        if (semester) result.semester = semester;
+      }
+    }
+    // Keep the tombstones alongside the legacy profile payload. V2 deletes
+    // remain authoritative over any older copy still stored in that payload.
+    const tombstones = { ...(current?.deletedStudyRecords && typeof current.deletedStudyRecords === "object" ? current.deletedStudyRecords as Record<string, unknown> : {}) };
+    for (const item of itemScopes.get(sectionId) ?? []) {
+      if (typeof item.recordId !== "string") continue;
+      if (item.deleted === true) tombstones[item.recordId] = true;
+      else delete tombstones[item.recordId];
+    }
+    result.deletedStudyRecords = tombstones;
+    sections.set(sectionId, { ...result, id: sectionId });
+  }
+  return [...sections.values()];
+}
+
+/** Materialize per-record Firestore updates into the existing local study arrays. */
+export async function mergeStudyItemsIntoSections(uid: string) {
+  // Serialize the complete read/merge/write operation, rather than only its
+  // final IndexedDB write. Firestore can deliver several document snapshots in
+  // quick succession; parallel reads may finish out of order and let an older
+  // merged list overwrite a newer one on this device. This is especially easy
+  // to hit for notes and grades because one Firestore document represents each
+  // item while the UI consumes a materialized academic-period array.
+  const previous = studentSectionReconciliationQueues.get(uid) ?? Promise.resolve();
+  const task = previous.catch(() => undefined).then(async () => {
+    const [sections, items, pending] = await Promise.all([
+      listLocalRecords(uid, "studentSections"),
+      listLocalRecords(uid, "studyItems"),
+      pendingWriteKeys(uid),
+    ]);
+    const merged = mergeStudyItemsIntoRecords(sections, items, pending);
+    await replaceWithRemoteRecords(uid, "studentSections", merged, false);
+  });
+  studentSectionReconciliationQueues.set(uid, task);
+  try {
+    await task;
+  } finally {
+    if (studentSectionReconciliationQueues.get(uid) === task) studentSectionReconciliationQueues.delete(uid);
+  }
+}
+
+async function applyStudentDocumentSnapshot(uid: string, student: Record<string, unknown>, authoritative: boolean) {
   const records: Array<Record<string, unknown> & { id: string }> = [];
   for (const section of studentSections) {
     const value = student[section];
@@ -479,6 +616,7 @@ export async function cacheStudentDocument(uid: string, student: Record<string, 
       if (section === "progress") {
         delete sectionData.studyNotes;
         delete sectionData.gradeRecords;
+        delete sectionData.deletedStudyRecords;
       }
       records.push({ ...sectionData, id: section });
     }
@@ -487,7 +625,7 @@ export async function cacheStudentDocument(uid: string, student: Record<string, 
   if (progress && typeof progress === "object") {
     const progressData = progress as Record<string, unknown>;
     for (const field of ["studyNotes", "gradeRecords"] as const) {
-      if (Array.isArray(progressData[field])) records.push({ id: field, value: progressData[field] });
+      if (Array.isArray(progressData[field])) records.push({ id: field, value: progressData[field], deletedStudyRecords: progressData.deletedStudyRecords ?? {} });
     }
     const academicSessions = progressData.academicSessions;
     if (academicSessions && typeof academicSessions === "object" && !Array.isArray(academicSessions)) {
@@ -497,20 +635,82 @@ export async function cacheStudentDocument(uid: string, student: Record<string, 
         const session = sessionKey.replace("-", "/");
         const scoped = sessionValue as Record<string, unknown>;
         for (const field of ["studyNotes", "gradeRecords"] as const) {
-          if (Array.isArray(scoped[field])) records.push({ id: studyRecordId(field, session), value: scoped[field], academicSession: session });
+          if (Array.isArray(scoped[field])) records.push({ id: studyRecordId(field, session), value: scoped[field], academicSession: session, deletedStudyRecords: scoped.deletedStudyRecords ?? {} });
         }
         for (const [semesterSlug, semesterValue] of Object.entries(scoped)) {
           const semester = semesterNames[semesterSlug];
           if (!semester || !semesterValue || typeof semesterValue !== "object" || Array.isArray(semesterValue)) continue;
           const semesterData = semesterValue as Record<string, unknown>;
           for (const field of ["studyNotes", "gradeRecords"] as const) {
-            if (Array.isArray(semesterData[field])) records.push({ id: studyRecordId(field, session, semester), value: semesterData[field], academicSession: session, semester });
+            if (Array.isArray(semesterData[field])) records.push({ id: studyRecordId(field, session, semester), value: semesterData[field], academicSession: session, semester, deletedStudyRecords: semesterData.deletedStudyRecords ?? {} });
           }
         }
       }
     }
   }
-  await replaceWithRemoteRecords(uid, "studentSections", records, authoritative);
+  {
+    // Preserve local-only study items even on Firestore's initial cache
+    // snapshot. Replacing IndexedDB with that possibly stale cache before the
+    // server snapshot arrives can permanently discard the only copy of notes
+    // or grades saved on this device.
+    const localStudyRecords = (await listLocalRecords(uid, "studentSections"))
+      .filter((record) => /^(studyNotes|gradeRecords)(?:__\d{4}-\d{4}(?:__(?:first-semester|second-semester|extended-semester))?)?$/.test(record.id));
+    const remoteById = new Map(records.map((record) => [record.id, record]));
+    const mergedRecords: Array<Record<string, unknown> & { id: string }> = [];
+    for (const localRecord of localStudyRecords) {
+      const remoteRecord = remoteById.get(localRecord.id);
+      const remoteValue = Array.isArray(remoteRecord?.value) ? remoteRecord.value : [];
+      const localValue = Array.isArray(localRecord.value) ? localRecord.value : [];
+      const tombstones = remoteRecord?.deletedStudyRecords && typeof remoteRecord.deletedStudyRecords === "object"
+        ? remoteRecord.deletedStudyRecords as Record<string, unknown>
+        : {};
+      const byId = new Map<string, unknown>();
+      const legacy: unknown[] = [];
+      for (const value of localValue) {
+        const recordId = value && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>).id === "string"
+          ? (value as Record<string, unknown>).id as string : undefined;
+        if (recordId) { if (!(recordId in tombstones)) byId.set(recordId, value); }
+        else legacy.push(value);
+      }
+      // The server value wins for edits to the same record ID. Local-only IDs
+      // are retained and queued, while server tombstones prevent deleted items
+      // from being resurrected by a device that had been offline.
+      for (const value of remoteValue) {
+        const recordId = value && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>).id === "string"
+          ? (value as Record<string, unknown>).id as string : undefined;
+        if (recordId) { if (!(recordId in tombstones)) byId.set(recordId, value); }
+        else legacy.push(value);
+      }
+      const value = [...legacy, ...byId.values()];
+      const merged = { ...(remoteRecord ?? Object.fromEntries(Object.entries(localRecord).filter(([key]) => key !== "id"))), id: localRecord.id, value, deletedStudyRecords: tombstones };
+      mergedRecords.push(merged);
+      remoteById.delete(localRecord.id);
+    }
+    mergedRecords.push(...remoteById.values());
+    records.splice(0, records.length, ...mergedRecords);
+  }
+  const [studyItems, existingPending] = await Promise.all([
+    listLocalRecords(uid, "studyItems"),
+    pendingWriteKeys(uid),
+  ]);
+  const mergedRecords = mergeStudyItemsIntoRecords(records, studyItems, existingPending);
+  await replaceWithRemoteRecords(uid, "studentSections", mergedRecords, authoritative);
+  if (authoritative) {
+    const syncedItems = new Set(studyItems.map((item) => `${item.recordType}/${item.academicSession}/${item.semester}/${item.recordId}`));
+    const pending = await pendingWriteKeys(uid);
+    for (const record of mergedRecords) {
+      if (!record.id.startsWith("studyNotes") && !record.id.startsWith("gradeRecords")) continue;
+      if (pending.has(`studentSections/${record.id}`) || !Array.isArray(record.value)) continue;
+      const operation: StudyRecordSyncOperation = { changes: record.value.flatMap((item) => item && typeof item === "object" && !Array.isArray(item) && typeof (item as Record<string, unknown>).id === "string"
+        ? [{ id: (item as Record<string, unknown>).id as string, data: item, deleted: false }]
+        : []) };
+      const unsyncedLegacyRecord = record.value.some((item) => {
+        const id = item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).id : undefined;
+        return typeof id === "string" && !syncedItems.has(`${record.id.startsWith("gradeRecords") ? "gradeRecords" : "studyNotes"}/${record.academicSession ?? "Not provided"}/${record.semester ?? "Not provided"}/${id}`);
+      });
+      if (unsyncedLegacyRecord) await saveLocalRecord(uid, "studentSections", record.id, { value: record.value, academicSession: record.academicSession, semester: record.semester }, undefined, operation);
+    }
+  }
 }
 
 function sessionCourseId(session: string | undefined, semester: string | undefined, code: string) {

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { firebaseConfigured } from "./firebase";
 import { createRecordId } from "./browser";
-import { downloadStudyAttachmentFromCloud, saveStudyRecord, studyRecordId } from "./firestore";
+import { downloadStudyAttachmentFromCloud, mergeStudyItemsIntoSections, saveStudyRecord, studyRecordId } from "./firestore";
 import { deleteLocalAttachment, getLocalAttachment, listLocalRecords, markLocalAttachmentCloudSynced, queueLocalAttachmentUpload, restoreLocalRecords, saveLocalAttachment, watchLocalRecords } from "./offlineStore";
 import { parseBackupFile, recordsFromBackup, studyCollectionNames } from "./backup";
 import type { Backup } from "./backup";
@@ -820,6 +820,7 @@ export function StudyTools({ page, studentUid, currentAcademicSession, currentAc
   }
 
   async function collectBackup(): Promise<Backup> {
+    await mergeStudyItemsIntoSections(studentUid);
     const [sectionRecords, ...collections] = await Promise.all([
       listLocalRecords(studentUid, "studentSections"),
       ...studyCollectionNames.map((name) => listLocalRecords(studentUid, name)),

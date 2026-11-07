@@ -1,8 +1,14 @@
 import { firebaseAuth, getFirestoreDb } from "./firebase.ts";
 
-export type OfflineCollection = "courses" | "assignments" | "schedules" | "exams" | "events" | "studentSections";
+export type OfflineCollection = "courses" | "assignments" | "schedules" | "exams" | "events" | "studentSections" | "studyItems";
 type StoredRecord = { key: string; uid: string; collection: OfflineCollection; id: string; data: Record<string, unknown> };
-type PendingWrite = StoredRecord & { deleted: boolean; queuedAt: number; token: string };
+export type AcademicSessionSelection = { session: string; semester: string; updatedAt: number; onlineAtQueue?: boolean };
+export type AcademicSessionSyncOperation =
+  | { type: "upsert"; record: Record<string, unknown>; selection?: AcademicSessionSelection }
+  | { type: "delete"; id: string; selection?: AcademicSessionSelection }
+  | ({ type: "select" } & AcademicSessionSelection);
+export type StudyRecordSyncOperation = { changes: Array<{ id: string; data?: unknown; deleted: boolean }> };
+type PendingWrite = StoredRecord & { deleted: boolean; queuedAt: number; token: string; academicSessionOperation?: AcademicSessionSyncOperation; academicSessionOperations?: AcademicSessionSyncOperation[]; studyRecordOperation?: StudyRecordSyncOperation };
 export type LocalRestoreRecord = { collection: OfflineCollection; id: string; data: Record<string, unknown> };
 export type LocalAttachmentRecord = { id: string; blob: Blob; cloudSynced: boolean; cloudUploadPending: boolean };
 export type PendingCloudOperation = { id: string; operation: Record<string, unknown>; token: string; queuedAt: number };
@@ -13,9 +19,11 @@ const cloudOperationsDatabaseName = "campusos-cloud-operations-v1";
 const recordStore = "records";
 const outboxStore = "outbox";
 const attachmentStore = "attachments";
+const conflictStore = "conflicts";
 const cloudOperationStore = "operations";
 const pendingWritesByUserAndTimeIndex = "by-user-and-queue-time";
 const watchers = new Map<string, Set<(records: Array<Record<string, unknown> & { id: string }>) => void>>();
+const watcherRefreshVersions = new Map<string, number>();
 const remoteSnapshotWrites = new Map<string, Promise<void>>();
 let databasePromise: Promise<StoreDatabase> | undefined;
 let cloudOperationsDatabasePromise: Promise<StoreDatabase> | undefined;
@@ -26,16 +34,54 @@ const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const initialRetryDelayMs = 750;
 const maxRetryDelayMs = 10_000;
 const maxConcurrentRecordWrites = 4;
+const writesPerFlush = 32;
 const localChangeChannel = (() => {
   if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") return undefined;
   try { return new BroadcastChannel("campusos-local-record-changes-v1"); } catch { return undefined; }
 })();
 
+/**
+ * Produce a strictly increasing selection stamp even when two taps happen in
+ * the same millisecond or the device clock moves backwards. Firestore uses
+ * this stamp to keep a delayed outbox write from reverting a newer selection.
+ */
+export function nextAcademicSelectionTimestamp(previousTimestamp: unknown, now = Date.now()) {
+  const previous = typeof previousTimestamp === "number" && Number.isFinite(previousTimestamp)
+    ? previousTimestamp
+    : typeof previousTimestamp === "string" && /^\d{1,16}$/.test(previousTimestamp)
+      ? Number(previousTimestamp)
+      : 0;
+  return Math.max(Math.trunc(now), Math.trunc(previous) + 1);
+}
+
+export function shouldApplyAcademicSelection(selection: AcademicSessionSelection, currentTimestamp: number) {
+  // navigator.onLine only reports a network interface, not that Firestore
+  // accepted this queued transaction. Always compare against the latest
+  // server stamp so an old write whose acknowledgment was lost cannot revert
+  // a newer selection from another signed-in device when it retries.
+  // Strict ordering also makes same-millisecond actions from two devices
+  // deterministic: the transaction that has already advanced the server stamp
+  // wins, rather than a different selection with a tied client timestamp.
+  return selection.updatedAt > currentTimestamp;
+}
+
+export function mergeAcademicSessionSelections(queued: AcademicSessionSelection[], next?: AcademicSessionSelection) {
+  // This outbox belongs to one device. Its write order is the reliable order
+  // of that device's user actions; comparing wall clocks here can discard the
+  // latest tap when a prior selection has a future-dated stamp.
+  const candidates = [...queued, ...(next ? [next] : [])];
+  return candidates[candidates.length - 1];
+}
+
 function openDatabase(): Promise<StoreDatabase> {
   if (typeof indexedDB === "undefined") return Promise.reject(new Error("This browser does not support local data storage."));
   if (databasePromise) return databasePromise;
   databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(databaseName, 3);
+    // The currently deployed app uses database version 5. Opening an existing
+    // version-5 database at version 3 raises VersionError and prevents local
+    // saves. Keep the deployed version and add any missing store without
+    // deleting or replacing existing user records.
+    const request = indexedDB.open(databaseName, 5);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(recordStore)) db.createObjectStore(recordStore, { keyPath: "key" });
@@ -46,6 +92,7 @@ function openDatabase(): Promise<StoreDatabase> {
         outbox.createIndex(pendingWritesByUserAndTimeIndex, ["uid", "queuedAt"]);
       }
       if (!db.objectStoreNames.contains(attachmentStore)) db.createObjectStore(attachmentStore, { keyPath: "key" });
+      if (!db.objectStoreNames.contains(conflictStore)) db.createObjectStore(conflictStore, { keyPath: "key" });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => { databasePromise = undefined; reject(request.error ?? new Error("Could not open local storage.")); };
@@ -340,7 +387,7 @@ function normalizeLocalValue(value: unknown, ancestors = new WeakSet<object>()):
 }
 
 function prepareLocalRecord(uid: string, collection: OfflineCollection, id: string, data: Record<string, unknown>) {
-  const allowed: OfflineCollection[] = ["courses", "assignments", "schedules", "exams", "events", "studentSections"];
+  const allowed: OfflineCollection[] = ["courses", "assignments", "schedules", "exams", "events", "studentSections", "studyItems"];
   if (!uid || uid.length > 128 || uid.includes("/") || !allowed.includes(collection)) throw new Error("This account or record type is invalid and could not be saved.");
   if (!id || id.length > 150 || id.includes("/") || id.includes("\u0000")) throw new Error("This entry has an invalid identifier and could not be saved.");
   if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("This entry has invalid data and could not be saved.");
@@ -383,9 +430,16 @@ function pendingWritesCountForUser(uid: string): Promise<number> {
 
 function refreshWatchers(uid: string, collection: OfflineCollection) {
   const key = watcherKey(uid, collection);
-  const listeners = watchers.get(key);
-  if (!listeners?.size) return;
-  void listLocalRecords(uid, collection).then((records) => listeners.forEach((listener) => listener(records)));
+  if (!watchers.get(key)?.size) return;
+  const version = (watcherRefreshVersions.get(key) ?? 0) + 1;
+  watcherRefreshVersions.set(key, version);
+  void listLocalRecords(uid, collection).then((records) => {
+    // IndexedDB requests can resolve out of order under load. Deliver only the
+    // newest read so a slower stale academic snapshot cannot roll back a view
+    // after a newer server reconciliation or local save has already completed.
+    if (watcherRefreshVersions.get(key) !== version) return;
+    for (const listener of watchers.get(key) ?? []) listener(records);
+  });
 }
 
 function commit(uid: string, collection: OfflineCollection) {
@@ -396,7 +450,7 @@ function commit(uid: string, collection: OfflineCollection) {
 localChangeChannel?.addEventListener("message", (event: MessageEvent<unknown>) => {
   const change = event.data as { uid?: unknown; collection?: unknown; sync?: unknown; syncOperations?: unknown } | null;
   if (!change || typeof change.uid !== "string") return;
-  if (typeof change.collection === "string" && ["courses", "assignments", "schedules", "exams", "events", "studentSections"].includes(change.collection)) {
+  if (typeof change.collection === "string" && ["courses", "assignments", "schedules", "exams", "events", "studentSections", "studyItems"].includes(change.collection)) {
     refreshWatchers(change.uid, change.collection as OfflineCollection);
   }
   // Another tab may have created the queue entry while this tab was active or
@@ -410,6 +464,19 @@ localChangeChannel?.addEventListener("message", (event: MessageEvent<unknown>) =
 export async function listLocalRecords(uid: string, collection: OfflineCollection): Promise<Array<Record<string, unknown> & { id: string }>> {
   return (await readAllByKeyPrefix<StoredRecord>(recordStore, `${uid}/${collection}/`))
     .map(({ id, data }) => ({ ...data, id }));
+}
+
+/** Read one local entry directly instead of materializing an entire collection. */
+export async function getLocalRecord(uid: string, collection: OfflineCollection, id: string): Promise<(Record<string, unknown> & { id: string }) | undefined> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(recordStore, "readonly").objectStore(recordStore).get(makeKey(uid, collection, id));
+    request.onsuccess = () => {
+      const record = request.result as StoredRecord | undefined;
+      resolve(record ? { ...record.data, id: record.id } : undefined);
+    };
+    request.onerror = () => reject(request.error ?? new Error("Could not read the saved record."));
+  });
 }
 
 /** Return local queue keys so cloud migrations can leave unsynced edits untouched. */
@@ -434,7 +501,9 @@ export function watchLocalRecords(uid: string, collection: OfflineCollection, li
   if (typeof document !== "undefined") document.addEventListener("visibilitychange", refreshOnResume);
   return () => {
     listeners.delete(listener);
-    if (!listeners.size) watchers.delete(key);
+    if (!listeners.size) {
+      watchers.delete(key);
+    }
     if (typeof window !== "undefined") {
       window.removeEventListener("focus", refreshOnResume);
       window.removeEventListener("pageshow", refreshOnResume);
@@ -443,14 +512,74 @@ export function watchLocalRecords(uid: string, collection: OfflineCollection, li
   };
 }
 
-export async function saveLocalRecord(uid: string, collection: OfflineCollection, id: string, data: Record<string, unknown>) {
+function mergeQueuedStudyOperations(previous: StudyRecordSyncOperation | undefined, next: StudyRecordSyncOperation, legacyValue?: unknown) {
+  const changes = new Map((previous?.changes ?? []).map((change) => [change.id, change]));
+  // Upgrade an older pending whole-array write without losing its local adds
+  // when the next client edit is converted to record-level operations.
+  if (!previous && Array.isArray(legacyValue)) {
+    for (const record of legacyValue) {
+      const id = studyRecordIdValue(record);
+      if (id) changes.set(id, { id, data: record, deleted: false });
+    }
+  }
+  for (const change of next.changes) changes.set(change.id, change);
+  return { changes: [...changes.values()] } satisfies StudyRecordSyncOperation;
+}
+
+function academicSelection(operation: AcademicSessionSyncOperation): AcademicSessionSelection | undefined {
+  if (operation.type === "select") return {
+    session: operation.session,
+    semester: operation.semester,
+    updatedAt: operation.updatedAt,
+    ...(operation.onlineAtQueue === undefined ? {} : { onlineAtQueue: operation.onlineAtQueue }),
+  };
+  return operation.selection;
+}
+
+function mergeQueuedAcademicOperations(previous: AcademicSessionSyncOperation[], next?: AcademicSessionSyncOperation) {
+  const mutations = new Map<string, AcademicSessionSyncOperation>();
+  const selections: AcademicSessionSelection[] = [];
+  for (const operation of [...previous, ...(next ? [next] : [])]) {
+    if (operation.type === "upsert" && typeof operation.record.id === "string") mutations.set(operation.record.id, { type: "upsert", record: operation.record });
+    else if (operation.type === "delete") mutations.set(operation.id, { type: "delete", id: operation.id });
+    const selection = academicSelection(operation);
+    if (selection) selections.push(selection);
+  }
+  const selected = mergeAcademicSessionSelections(selections);
+  return [
+    ...mutations.values(),
+    ...(selected ? [{ type: "select", ...selected } satisfies AcademicSessionSyncOperation] : []),
+  ];
+}
+
+export async function saveLocalRecord(
+  uid: string,
+  collection: OfflineCollection,
+  id: string,
+  data: Record<string, unknown>,
+  academicSessionOperation?: AcademicSessionSyncOperation,
+  studyRecordOperation?: StudyRecordSyncOperation,
+) {
   const safeData = prepareLocalRecord(uid, collection, id, data);
   const db = await openDatabase();
   const key = makeKey(uid, collection, id);
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction([recordStore, outboxStore], "readwrite");
     tx.objectStore(recordStore).put({ key, uid, collection, id, data: safeData } satisfies StoredRecord);
-    tx.objectStore(outboxStore).put({ key, uid, collection, id, data: safeData, deleted: false, queuedAt: Date.now(), token: crypto.randomUUID() } satisfies PendingWrite);
+    const outbox = tx.objectStore(outboxStore);
+    const pendingRequest = outbox.get(key);
+    pendingRequest.onsuccess = () => {
+      const previous = pendingRequest.result as PendingWrite | undefined;
+        const previousAcademicOperations = previous?.academicSessionOperations
+          ?? (previous?.academicSessionOperation ? [previous.academicSessionOperation] : []);
+        const academicSessionOperations = mergeQueuedAcademicOperations(previousAcademicOperations, academicSessionOperation);
+      outbox.put({
+        key, uid, collection, id, data: safeData, deleted: false, queuedAt: Date.now(), token: crypto.randomUUID(),
+        ...(academicSessionOperations.length ? { academicSessionOperations } : {}),
+        ...(academicSessionOperation ? { academicSessionOperation } : previous?.academicSessionOperation ? { academicSessionOperation: previous.academicSessionOperation } : {}),
+        ...(studyRecordOperation ? { studyRecordOperation: mergeQueuedStudyOperations(previous?.studyRecordOperation, studyRecordOperation, previous?.data.value) } : {}),
+      } satisfies PendingWrite);
+    };
     tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
   });
   commit(uid, collection);
@@ -461,7 +590,7 @@ export async function saveLocalRecord(uid: string, collection: OfflineCollection
 /** Apply an imported backup and enqueue its cloud writes in one IndexedDB transaction. */
 export async function restoreLocalRecords(uid: string, records: LocalRestoreRecord[]) {
   if (!uid || !Array.isArray(records) || records.length > 5000) throw new Error("This backup contains too many records to restore safely.");
-  const allowed: OfflineCollection[] = ["courses", "assignments", "schedules", "exams", "events", "studentSections"];
+  const allowed: OfflineCollection[] = ["courses", "assignments", "schedules", "exams", "events", "studentSections", "studyItems"];
   const seen = new Set<string>();
   const prepared = records.map(({ collection, id, data }) => {
     if (!allowed.includes(collection) || typeof id !== "string" || !id || id.length > 150 || id.includes("/")
@@ -538,7 +667,7 @@ export async function purgeLocalUserData(uid: string) {
       tx.onabort = () => reject(tx.error ?? new Error("Could not clear this device's saved account updates."));
     }),
   ]);
-  for (const collection of ["courses", "assignments", "schedules", "exams", "events", "studentSections"] as const) {
+  for (const collection of ["courses", "assignments", "schedules", "exams", "events", "studentSections", "studyItems"] as const) {
     for (const listener of watchers.get(watcherKey(uid, collection)) ?? []) listener([]);
     watchers.delete(watcherKey(uid, collection));
   }
@@ -574,6 +703,142 @@ function remoteValueMatchesExpected(remoteValue: unknown, expectedValue: unknown
   return Object.is(remote, expected);
 }
 
+function academicSessionHistory(value: unknown) {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"
+      && typeof item.id === "string" && typeof item.year === "string"
+      && /^\d{4}\/\d{4}$/.test(item.year) && typeof item.semester === "string"));
+  } catch {
+    return [];
+  }
+}
+
+function studyRecordIdValue(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && typeof (value as Record<string, unknown>).id === "string"
+    ? (value as Record<string, unknown>).id as string
+    : undefined;
+}
+
+function mergeRemoteStudySnapshotWithPending(
+  remoteData: Record<string, unknown>,
+  localData: Record<string, unknown> | undefined,
+  pending: PendingWrite,
+) {
+  const remoteValue = Array.isArray(remoteData.value) ? remoteData.value : [];
+  const localValue = Array.isArray(localData?.value) ? localData.value : [];
+  const tombstones = remoteData.deletedStudyRecords && typeof remoteData.deletedStudyRecords === "object" && !Array.isArray(remoteData.deletedStudyRecords)
+    ? remoteData.deletedStudyRecords as Record<string, unknown>
+    : {};
+  const operation = pending.studyRecordOperation ?? {
+    changes: (Array.isArray(pending.data.value) ? pending.data.value : []).flatMap((record) => {
+      const id = studyRecordIdValue(record);
+      return id ? [{ id, data: record, deleted: false }] : [];
+    }),
+  };
+  const changes = new Map(operation.changes.map((change) => [change.id, change]));
+  const recordsById = new Map<string, unknown>();
+  const legacyRecords: unknown[] = [];
+  const legacyKeys = new Set<string>();
+  const addLegacy = (record: unknown) => {
+    const key = JSON.stringify(record);
+    if (!legacyKeys.has(key)) { legacyKeys.add(key); legacyRecords.push(record); }
+  };
+
+  for (const record of remoteValue) {
+    const id = studyRecordIdValue(record);
+    if (id) {
+      if (!(id in tombstones) && !changes.get(id)?.deleted) recordsById.set(id, record);
+    } else addLegacy(record);
+  }
+  // A pending edit wins only for its own ID. Other remote records are merged
+  // immediately, even though the period itself still has an outbox entry.
+  for (const record of localValue) {
+    const id = studyRecordIdValue(record);
+    if (!id) { addLegacy(record); continue; }
+    if (id in tombstones || changes.get(id)?.deleted) continue;
+    if (!recordsById.has(id) || changes.has(id)) recordsById.set(id, record);
+  }
+  for (const change of operation.changes) {
+    if (change.deleted || change.id in tombstones) recordsById.delete(change.id);
+    else if (!recordsById.has(change.id) && change.data !== undefined) recordsById.set(change.id, change.data);
+  }
+  return {
+    ...remoteData,
+    ...(localData?.academicSession === undefined ? {} : { academicSession: localData.academicSession }),
+    ...(localData?.semester === undefined ? {} : { semester: localData.semester }),
+    value: [...legacyRecords, ...recordsById.values()],
+    deletedStudyRecords: tombstones,
+  };
+}
+
+/** Merge session history by academic period, preserving each existing entry ID. */
+export function mergeAcademicSessionHistory(existingValue: unknown, incomingValue: unknown, operation?: AcademicSessionSyncOperation) {
+  const periods = new Map<string, Record<string, unknown>>();
+  for (const record of [...academicSessionHistory(existingValue), ...academicSessionHistory(incomingValue)]) {
+    const periodKey = `${record.year}/${record.semester}`;
+    if (!periods.has(periodKey)) periods.set(periodKey, record);
+  }
+  if (operation?.type === "delete") {
+    for (const [key, record] of periods) if (record.id === operation.id) periods.delete(key);
+  } else if (operation?.type === "upsert") {
+    const record = operation.record;
+    if (typeof record.id === "string" && typeof record.year === "string" && typeof record.semester === "string") {
+      for (const [key, saved] of periods) {
+        if (saved.id === record.id || (saved.year === record.year && saved.semester === record.semester)) periods.delete(key);
+      }
+      periods.set(`${record.year}/${record.semester}`, record);
+    }
+  }
+  return JSON.stringify([...periods.values()]);
+}
+
+function pendingWriteMatchesRemote(item: PendingWrite, remoteItem: Record<string, unknown> & { id: string }) {
+  const remoteData = Object.fromEntries(Object.entries(remoteItem).filter(([key]) => key !== "id"));
+  if (item.studyRecordOperation) {
+    const remoteRecords = Array.isArray(remoteData.value) ? remoteData.value : [];
+    return item.studyRecordOperation.changes.every((change) => {
+      const current = remoteRecords.find((record) => studyRecordIdValue(record) === change.id);
+      const tombstones = remoteData.deletedStudyRecords && typeof remoteData.deletedStudyRecords === "object"
+        ? remoteData.deletedStudyRecords as Record<string, unknown>
+        : {};
+      return change.deleted ? current === undefined && change.id in tombstones
+        : current ? remoteValueMatchesExpected(current, change.data) : change.id in tombstones;
+    });
+  }
+  if (item.collection !== "studentSections" || item.id !== "academic") {
+    return remoteValueMatchesExpected(remoteData, item.data);
+  }
+
+  const expectedHistory = item.data.sessionHistory;
+  const actualHistory = remoteData.sessionHistory;
+  const expectedFields = Object.fromEntries(Object.entries(item.data).filter(([key]) => !["sessionHistory", "session", "semester", "selectionUpdatedAt"].includes(key)));
+  const actualFields = Object.fromEntries(Object.entries(remoteData).filter(([key]) => !["sessionHistory", "session", "semester", "selectionUpdatedAt"].includes(key)));
+  if (!remoteValueMatchesExpected(actualFields, expectedFields)) return false;
+  const academicOperations = item.academicSessionOperations
+    ?? (item.academicSessionOperation ? [item.academicSessionOperation] : []);
+  const selection = academicOperations.reduce<AcademicSessionSelection | undefined>((latest, operation) => {
+    const candidate = academicSelection(operation);
+    return candidate && (!latest || candidate.updatedAt >= latest.updatedAt) ? candidate : latest;
+  }, undefined);
+  if (selection) {
+    const remoteSelectionTime = Number(remoteData.selectionUpdatedAt) || 0;
+    if (remoteSelectionTime < selection.updatedAt
+      || (remoteSelectionTime === selection.updatedAt && (remoteData.session !== selection.session || remoteData.semester !== selection.semester))) return false;
+  }
+  const actualRecords = academicSessionHistory(actualHistory);
+  for (const operation of academicOperations) {
+    if (operation.type === "delete" && actualRecords.some((record) => record.id === operation.id)) return false;
+    if (operation.type === "upsert" && !actualRecords.some((record) => record.id === operation.record.id
+      && record.year === operation.record.year && record.semester === operation.record.semester)) return false;
+  }
+  const actualPeriods = new Set(actualRecords.map((record) => `${record.year}/${record.semester}`));
+  return academicSessionHistory(expectedHistory).every((record) => actualPeriods.has(`${record.year}/${record.semester}`));
+}
+
 export function replaceWithRemoteRecords(uid: string, collection: OfflineCollection, remote: Array<Record<string, unknown> & { id: string }>, authoritative = true) {
   // Firestore may deliver a second snapshot while IndexedDB is still applying
   // the first one. Serialize per collection so an older, slower reconciliation
@@ -581,6 +846,52 @@ export function replaceWithRemoteRecords(uid: string, collection: OfflineCollect
   const key = watcherKey(uid, collection);
   const previous = remoteSnapshotWrites.get(key) ?? Promise.resolve();
   const task = previous.catch(() => undefined).then(() => applyRemoteSnapshot(uid, collection, remote, authoritative));
+  remoteSnapshotWrites.set(key, task);
+  return task.finally(() => {
+    if (remoteSnapshotWrites.get(key) === task) remoteSnapshotWrites.delete(key);
+  });
+}
+
+/** Apply Firestore's incremental document changes without rescanning a whole collection. */
+export function applyRemoteRecordChanges(
+  uid: string,
+  collection: OfflineCollection,
+  changes: Array<{ type: "added" | "modified" | "removed"; record: (Record<string, unknown> & { id: string }) }>,
+) {
+  if (!changes.length) return Promise.resolve();
+  const key = watcherKey(uid, collection);
+  const previous = remoteSnapshotWrites.get(key) ?? Promise.resolve();
+  const task = previous.catch(() => undefined).then(async () => {
+    const db = await openDatabase();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([recordStore, outboxStore], "readwrite");
+      const records = tx.objectStore(recordStore);
+      const outbox = tx.objectStore(outboxStore);
+      let changed = false;
+      for (const change of changes) {
+        const recordKey = makeKey(uid, collection, change.record.id);
+        const pendingRequest = outbox.get(recordKey);
+        pendingRequest.onsuccess = () => {
+          // Local edits win until their durable outbox entry has been accepted.
+          if (pendingRequest.result) return;
+          if (change.type === "removed") {
+            records.delete(recordKey);
+            changed = true;
+            return;
+          }
+          const { id, ...data } = change.record;
+          records.put({ key: recordKey, uid, collection, id, data: normalizeLocalValue(data) as Record<string, unknown> } satisfies StoredRecord);
+          changed = true;
+        };
+      }
+      tx.oncomplete = () => {
+        if (changed) commit(uid, collection);
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  });
   remoteSnapshotWrites.set(key, task);
   return task.finally(() => {
     if (remoteSnapshotWrites.get(key) === task) remoteSnapshotWrites.delete(key);
@@ -602,10 +913,12 @@ async function applyRemoteSnapshot(uid: string, collection: OfflineCollection, r
     let pending: PendingWrite[] | undefined;
     let applied = false;
     let reconciledCount = 0;
+    let changedCount = 0;
     const apply = () => {
       if (!existing || !pending || applied) return;
       applied = true;
       const scope = existing.filter((item) => item.uid === uid && item.collection === collection);
+      const scopeByKey = new Map(scope.map((item) => [item.key, item]));
       const remoteIds = new Set(remote.map((item) => item.id));
       const scopePending = pending.filter((item) => item.uid === uid && item.collection === collection);
       const remoteById = new Map(remote.map((item) => [item.id, item]));
@@ -613,10 +926,7 @@ async function applyRemoteSnapshot(uid: string, collection: OfflineCollection, r
         const remoteItem = remoteById.get(item.id);
         const acknowledged = item.deleted
           ? !remoteItem
-          : Boolean(remoteItem && remoteValueMatchesExpected(
-            Object.fromEntries(Object.entries(remoteItem).filter(([key]) => key !== "id")),
-            item.data,
-          ));
+          : Boolean(remoteItem && pendingWriteMatchesRemote(item, remoteItem));
         if (acknowledged) {
           tx.objectStore(outboxStore).delete(item.key);
           reconciledCount += 1;
@@ -625,12 +935,37 @@ async function applyRemoteSnapshot(uid: string, collection: OfflineCollection, r
         return true;
       }) : scopePending;
       const pendingKeys = new Set(unresolved.map((item) => item.key));
+      // Snapshot reconciliation runs for every Firestore update. Index pending
+      // writes once so merging a large note/grade collection stays linear
+      // instead of rescanning the outbox for each remote record.
+      const unresolvedByKey = new Map(unresolved.map((item) => [item.key, item]));
       if (authoritative) {
-        for (const item of scope) if (!remoteIds.has(item.id) && !pendingKeys.has(item.key)) store.delete(item.key);
+        for (const item of scope) if (!remoteIds.has(item.id) && !pendingKeys.has(item.key)) {
+          store.delete(item.key);
+          changedCount += 1;
+        }
       }
       for (const { id, ...data } of remote) {
         const key = makeKey(uid, collection, id);
-        if (!pendingKeys.has(key)) store.put({ key, uid, collection, id, data: normalizeLocalValue(data) as Record<string, unknown> } satisfies StoredRecord);
+        const normalized = normalizeLocalValue(data) as Record<string, unknown>;
+        const old = scopeByKey.get(key);
+        if (pendingKeys.has(key)) {
+          const pendingItem = unresolvedByKey.get(key);
+          const isStudyRecord = collection === "studentSections"
+            && /^(studyNotes|gradeRecords)(?:__\d{4}-\d{4}(?:__(?:first-semester|second-semester|extended-semester))?)?$/.test(id);
+          if (isStudyRecord && pendingItem) {
+            const merged = mergeRemoteStudySnapshotWithPending(normalized, old?.data, pendingItem);
+            if (!old || !remoteValueMatchesExpected(old.data, merged) || !remoteValueMatchesExpected(merged, old.data)) {
+              store.put({ key, uid, collection, id, data: merged } satisfies StoredRecord);
+              changedCount += 1;
+            }
+          }
+          continue;
+        }
+        if (!old || !remoteValueMatchesExpected(old.data, normalized) || !remoteValueMatchesExpected(normalized, old.data)) {
+          store.put({ key, uid, collection, id, data: normalized } satisfies StoredRecord);
+          changedCount += 1;
+        }
       }
     };
     existingRequest.onsuccess = () => { existing = existingRequest.result as StoredRecord[]; apply(); };
@@ -639,11 +974,11 @@ async function applyRemoteSnapshot(uid: string, collection: OfflineCollection, r
       if (reconciledCount && typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("campusos-sync", { detail: { uid, progress: true, reconciled: reconciledCount } }));
       }
+      if (changedCount || reconciledCount) commit(uid, collection);
       resolve();
     };
     tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error);
   });
-  commit(uid, collection);
 }
 
 export async function pendingWriteCount(uid: string, collection?: OfflineCollection) {
@@ -683,12 +1018,125 @@ function countPendingAttachmentOperations(uid: string): Promise<number> {
   }));
 }
 
+async function stableStudyItemDocumentId(uid: string, periodId: string, recordId: string) {
+  const source = `${uid}\u0000${periodId}\u0000${recordId}`;
+  if (globalThis.crypto?.subtle) {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  // Stable fallback for restricted WebViews that do not expose SubtleCrypto.
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < source.length; index++) {
+    first = Math.imul(first ^ source.charCodeAt(index), 0x01000193);
+    second = Math.imul(second ^ source.charCodeAt(index), 0x85ebca6b);
+  }
+  return `${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0).toString(16).padStart(8, "0")}`;
+}
+
 async function writePendingItem(uid: string, item: PendingWrite, db: NonNullable<Awaited<ReturnType<typeof getFirestoreDb>>>) {
-  const { deleteDoc, deleteField, doc, serverTimestamp, setDoc } = await import("firebase/firestore");
+  const { deleteDoc, deleteField, doc, runTransaction, serverTimestamp, setDoc } = await import("firebase/firestore");
   const ref = item.collection === "studentSections"
     ? doc(db, "students", uid)
     : doc(db, "students", uid, item.collection, item.id);
-  if (item.collection === "studentSections") {
+  const isStudyRecord = item.collection === "studentSections"
+    && /^(studyNotes|gradeRecords)(?:__\d{4}-\d{4}(?:__(?:first-semester|second-semester|extended-semester))?)?$/.test(item.id);
+  const studyRecordOperation = item.studyRecordOperation ?? (isStudyRecord && Array.isArray(item.data.value)
+    ? { changes: item.data.value.flatMap((record) => {
+      const id = studyRecordIdValue(record);
+      return id ? [{ id, data: record, deleted: false }] : [];
+    }) }
+    : undefined);
+  let committedAcademic: Record<string, unknown> | undefined;
+  if (item.collection === "studentSections" && item.id === "academic" && !item.deleted) {
+    // Keep history and current selection in one transaction. The outbox
+    // coalesces edits to the academic profile into one record; if a user adds a
+    // period and selects a current period before the first write completes, a
+    // selection-only setDoc would otherwise replace the queued add and publish
+    // only the current fields. The latest local history is merged here with
+    // server history, while the selection timestamp prevents an older offline
+    // device from reverting a newer selection when it reconnects.
+    committedAcademic = await runTransaction(db, async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      const current = snapshot.get("academic");
+      const allowedAcademicFields = new Set([
+        "department", "programme", "level", "session", "semester", "selectionUpdatedAt",
+        "sessionHistory", "programStart", "programEnd",
+      ]);
+      const currentAcademic = current && typeof current === "object" && !Array.isArray(current)
+        ? Object.fromEntries(Object.entries(current as Record<string, unknown>).filter(([key]) => allowedAcademicFields.has(key)))
+        : {};
+      const incomingSession = item.data.session;
+      const incomingSemester = item.data.semester;
+      const incomingSelectionTime = Number(item.data.selectionUpdatedAt) || item.queuedAt;
+      const incomingAcademic = Object.fromEntries(Object.entries(item.data).filter(([key]) => !["session", "semester", "selectionUpdatedAt"].includes(key)));
+      const academic: Record<string, unknown> = {
+        ...currentAcademic,
+        ...incomingAcademic,
+      };
+      const academicOperations = item.academicSessionOperations
+        ?? (item.academicSessionOperation ? [item.academicSessionOperation] : []);
+      let sessionHistory = mergeAcademicSessionHistory(currentAcademic["sessionHistory"], item.data["sessionHistory"]);
+      for (const operation of academicOperations) {
+        if (operation.type === "delete" || operation.type === "upsert") {
+          sessionHistory = mergeAcademicSessionHistory(sessionHistory, undefined, operation);
+        }
+      }
+      academic["sessionHistory"] = sessionHistory;
+      const selection = academicOperations.reduce<AcademicSessionSelection | undefined>((latest, operation) => {
+        const candidate = academicSelection(operation);
+        return candidate && (!latest || candidate.updatedAt >= latest.updatedAt) ? candidate : latest;
+      }, undefined);
+      const currentSelectionTime = Number(currentAcademic["selectionUpdatedAt"]) || 0;
+      if (selection && shouldApplyAcademicSelection(selection, currentSelectionTime)) {
+        academic["session"] = selection.session;
+        academic["semester"] = selection.semester;
+        // Keep the server-side stamp increasing even if this device's clock
+        // is behind another signed-in device's clock.
+        academic["selectionUpdatedAt"] = String(Math.max(selection.updatedAt, currentSelectionTime + 1));
+      } else if (typeof currentAcademic["session"] !== "string" && typeof incomingSession === "string") {
+        academic["session"] = incomingSession;
+        academic["semester"] = incomingSemester;
+        academic["selectionUpdatedAt"] = String(incomingSelectionTime);
+      }
+      transaction.set(ref, { academic, updatedAt: serverTimestamp() }, { merge: true });
+      return academic;
+    });
+  } else if (isStudyRecord && studyRecordOperation && !item.deleted) {
+    const scopedStudyPeriod = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})__(first-semester|second-semester|extended-semester)$/.exec(item.id);
+    const scopedStudyYear = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})$/.exec(item.id);
+    const legacyStudyRecord = item.id === "studyNotes" || item.id === "gradeRecords";
+    const session = scopedStudyPeriod?.[2]?.replace("-", "/") ?? scopedStudyYear?.[2]?.replace("-", "/") ?? "Not provided";
+    const semester = scopedStudyPeriod
+      ? ({ "first-semester": "First semester", "second-semester": "Second semester", "extended-semester": "Extended semester" } as const)[scopedStudyPeriod[3]]
+      : "Not provided";
+    if (!scopedStudyPeriod && !scopedStudyYear && !legacyStudyRecord) throw new Error("This study record has an unsupported academic period.");
+
+    // Notes and grades used to be arrays nested in the large student profile
+    // document. Give each record its own stable document so a write does not
+    // read/rewrite the whole profile and concurrent devices can edit separate
+    // records without contending on that parent document. Old profile arrays
+    // remain readable and are overlaid with these per-record updates.
+    const { doc: studyDoc, writeBatch: makeBatch } = await import("firebase/firestore");
+    for (let offset = 0; offset < studyRecordOperation.changes.length; offset += 400) {
+      const changes = studyRecordOperation.changes.slice(offset, offset + 400);
+      const batch = makeBatch(db);
+      for (const change of changes) {
+        const cloudId = await stableStudyItemDocumentId(uid, item.id, change.id);
+        const itemRef = studyDoc(db, "students", uid, "studyItems", cloudId);
+        batch.set(itemRef, {
+          recordType: item.id.startsWith("gradeRecords") ? "gradeRecords" : "studyNotes",
+          recordId: change.id,
+          academicSession: session,
+          semester,
+          deleted: change.deleted,
+          ...(!change.deleted && change.data !== undefined ? { record: change.data } : {}),
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      }
+      if (changes.length) await batch.commit();
+    }
+  } else if (item.collection === "studentSections") {
     const scopedStudyPeriod = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})__(first-semester|second-semester|extended-semester)$/.exec(item.id);
     const scopedStudyYear = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})$/.exec(item.id);
     if (item.deleted && (item.id === "studyNotes" || item.id === "gradeRecords")) {
@@ -710,17 +1158,34 @@ async function writePendingItem(uid: string, item: PendingWrite, db: NonNullable
   else await setDoc(ref, item.data, { merge: true });
 
   const database = await openDatabase();
+  let materializedAcademic = false;
   await new Promise<void>((resolve, reject) => {
-    const tx = database.transaction(outboxStore, "readwrite");
+    const tx = database.transaction(committedAcademic ? [recordStore, outboxStore] : [outboxStore], "readwrite");
     const store = tx.objectStore(outboxStore);
     const request = store.get(item.key);
     request.onsuccess = () => {
-      if ((request.result as PendingWrite | undefined)?.token === item.token) store.delete(item.key);
+      if ((request.result as PendingWrite | undefined)?.token === item.token) {
+        store.delete(item.key);
+        if (committedAcademic) {
+          tx.objectStore(recordStore).put({
+            key: makeKey(uid, "studentSections", "academic"),
+            uid,
+            collection: "studentSections",
+            id: "academic",
+            data: normalizeLocalValue(committedAcademic) as Record<string, unknown>,
+          } satisfies StoredRecord);
+          materializedAcademic = true;
+        }
+      }
     };
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
   });
+  // A server snapshot can arrive before this IndexedDB acknowledgment. If the
+  // listener saw the still-pending key it correctly kept the local value; now
+  // apply the transaction's final server-resolved value and notify every view.
+  if (materializedAcademic) commit(uid, "studentSections");
   announceSyncProgress(uid);
 }
 
@@ -782,83 +1247,26 @@ async function writePendingRecordBatch(items: PendingWrite[], db: NonNullable<Aw
   await acknowledgePendingWrites(items);
 }
 
-function mergeAtPath(target: Record<string, unknown>, path: string[], value: unknown) {
-  let node = target;
-  for (const segment of path.slice(0, -1)) {
-    const current = node[segment];
-    if (!current || typeof current !== "object" || Array.isArray(current) || Object.getPrototypeOf(current) !== Object.prototype) {
-      node[segment] = {};
-    }
-    node = node[segment] as Record<string, unknown>;
-  }
-  const leaf = path.at(-1)!;
-  const existing = node[leaf];
-  if (value && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype) {
-    const destination = existing && typeof existing === "object" && !Array.isArray(existing) && Object.getPrototypeOf(existing) === Object.prototype
-      ? existing as Record<string, unknown>
-      : {};
-    for (const [key, child] of Object.entries(value)) mergeAtPath(destination, [key], child);
-    node[leaf] = destination;
-  } else node[leaf] = value;
-}
-
-/** Send queued fields for the shared student document together, preserving merge semantics. */
-async function writePendingSectionBatch(
-  uid: string,
-  items: PendingWrite[],
-  db: NonNullable<Awaited<ReturnType<typeof getFirestoreDb>>>,
-) {
-  if (!items.length) return;
-  const { doc, serverTimestamp, setDoc, deleteField } = await import("firebase/firestore");
-  const updates: Record<string, unknown> = {};
-  for (const item of items) {
-    const scopedStudyPeriod = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})__(first-semester|second-semester|extended-semester)$/.exec(item.id);
-    const scopedStudyYear = /^(studyNotes|gradeRecords)__(\d{4}-\d{4})$/.exec(item.id);
-    let path: string[];
-    let value: unknown;
-    if (item.id === "studyNotes" || item.id === "gradeRecords") {
-      path = ["progress", item.id];
-      value = item.deleted ? deleteField() : item.data.value;
-    } else if (scopedStudyPeriod) {
-      path = ["progress", "academicSessions", scopedStudyPeriod[2], scopedStudyPeriod[3], scopedStudyPeriod[1]];
-      value = item.deleted ? deleteField() : item.data.value;
-    } else if (scopedStudyYear) {
-      path = ["progress", "academicSessions", scopedStudyYear[2], scopedStudyYear[1]];
-      value = item.deleted ? deleteField() : item.data.value;
-    } else if (!item.deleted) {
-      path = [item.id];
-      value = item.data;
-    } else {
-      // Delete any student section, including sections added by newer app versions.
-      // Otherwise an unsupported delete can remain queued forever.
-      path = [item.id];
-      value = deleteField();
-    }
-    mergeAtPath(updates, path, value);
-  }
-  if (!Object.keys(updates).length) return;
-  await setDoc(doc(db, "students", uid), { ...updates, updatedAt: serverTimestamp() }, { merge: true });
-
-  // Delete only queue entries that still match the version sent. A save made while
-  // this network write was in flight keeps its newer token and is retried next.
-  const database = await openDatabase();
-  await new Promise<void>((resolve, reject) => {
-    const tx = database.transaction(outboxStore, "readwrite");
-    const store = tx.objectStore(outboxStore);
-    for (const item of items) {
-      const request = store.get(item.key);
-      request.onsuccess = () => {
-        if ((request.result as PendingWrite | undefined)?.token === item.token) store.delete(item.key);
-      };
-    }
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
-  announceSyncProgress(uid);
-}
-
 export async function syncPendingWrites(uid: string) {
+  if (!uid || !navigator.onLine) return;
+  const lockManager = (navigator as Navigator & { locks?: LockManager }).locks;
+  if (!lockManager) {
+    await runPendingWriteSync(uid);
+    return;
+  }
+  try {
+    // Queue behind the current account writer rather than polling for its lock.
+    // Web Locks wakes this request as soon as that flush releases the lock,
+    // avoiding an artificial 300 ms handoff delay between open tabs.
+    await lockManager.request(`campusos-firestore-sync:${uid}`, { mode: "exclusive" }, () => runPendingWriteSync(uid));
+  } catch {
+    // Web Locks are an optimization for browsers that support them. Fall back
+    // to idempotent Firestore writes plus token-checked outbox acknowledgments.
+    await runPendingWriteSync(uid);
+  }
+}
+
+async function runPendingWriteSync(uid: string) {
   if (!navigator.onLine) return;
   if (flushRunning.has(uid)) return;
   flushRunning.add(uid);
@@ -871,9 +1279,34 @@ export async function syncPendingWrites(uid: string) {
     // The compound index reads only this account's queue in oldest-first order,
     // avoiding a full key-prefix scan and an in-memory sort on every flush.
     const queue = await pendingWritesForUser(uid);
-    const sectionWrites = queue.filter((item) => item.collection === "studentSections");
-    const recordWrites = queue.filter((item) => item.collection !== "studentSections");
+    const academicWrites = queue.filter((item) => item.collection === "studentSections" && item.id === "academic");
+    const prioritizedQueue = queue.filter((item) => !(item.collection === "studentSections" && item.id === "academic"))
+      .sort((left, right) => right.queuedAt - left.queuedAt)
+      .slice(0, writesPerFlush);
+    const pendingSections = prioritizedQueue.filter((item) => item.collection === "studentSections");
+    const isStudyRecord = (item: PendingWrite) => item.collection === "studentSections"
+      && /^(studyNotes|gradeRecords)(?:__\d{4}-\d{4}(?:__(?:first-semester|second-semester|extended-semester))?)?$/.test(item.id);
+    const studyWrites = pendingSections.filter(isStudyRecord).sort((left, right) => right.queuedAt - left.queuedAt);
+    const sectionWrites = pendingSections.filter((item) => !isStudyRecord(item)).sort((left, right) => right.queuedAt - left.queuedAt);
+    // New edits should not wait behind a large historical backlog. Each key
+    // has one coalesced pending value, so newest-first is safe; deletes remain
+    // idempotent and the academic selection is still committed first above.
+    const recordWrites = prioritizedQueue.filter((item) => item.collection !== "studentSections");
     const recordBatches = makeRecordWriteBatches(recordWrites);
+    // Commit the current-period selection before dependent academic records.
+    // This keeps a newly selected session and a course/assignment created for
+    // it in the same order across devices, even when the outbox has a backlog.
+    for (const item of academicWrites) {
+      if (!navigator.onLine) break;
+      try { await writePendingItem(uid, item, db); }
+      catch (error) {
+        failed = true;
+        if (!failureCode && error && typeof error === "object" && "code" in error) {
+          const code = (error as { code?: unknown }).code;
+          if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
+        }
+      }
+    }
     let nextRecordBatch = 0;
     const recordWorker = async () => {
       while (navigator.onLine) {
@@ -881,7 +1314,7 @@ export async function syncPendingWrites(uid: string) {
         if (index >= recordBatches.length) return;
         const batch = recordBatches[index];
         try { await writePendingRecordBatch(batch, db); }
-        catch (error) {
+        catch {
           // A rejected batch must not let one invalid record block unrelated
           // valid changes. Fall back to the existing idempotent per-record path.
           let nextItem = 0;
@@ -904,18 +1337,45 @@ export async function syncPendingWrites(uid: string) {
       }
     };
     const sectionWorker = async () => {
-      if (!sectionWrites.length || !navigator.onLine) return;
-      try { await writePendingSectionBatch(uid, sectionWrites, db); }
-      catch (error) {
-        failed = true;
-        if (!failureCode && error && typeof error === "object" && "code" in error) {
-          const code = (error as { code?: unknown }).code;
-          if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
+      // Student details share one Firestore document. Sending all queued fields
+      // as one update means a single stale/invalid field can reject unrelated
+      // edits (and leave every field queued). Send each section independently,
+      // just like study records, so valid account changes continue syncing and
+      // only the field Firestore rejects remains pending for retry.
+      for (const item of sectionWrites) {
+        if (!navigator.onLine) break;
+        try { await writePendingItem(uid, item, db); }
+        catch (error) {
+          failed = true;
+          if (!failureCode && error && typeof error === "object" && "code" in error) {
+            const code = (error as { code?: unknown }).code;
+            if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
+          }
+        }
+      }
+    };
+    // Study-period records are stored under independent Firestore documents.
+    // Drain those concurrently within the device/network budget so one larger
+    // note batch cannot hold up grades (or another period) on a fast desktop,
+    // while low-memory/mobile or metered connections remain single-file.
+    let nextStudyWrite = 0;
+    const studyWorker = async () => {
+      while (navigator.onLine) {
+        const index = nextStudyWrite++;
+        if (index >= studyWrites.length) return;
+        try { await writePendingItem(uid, studyWrites[index], db); }
+        catch (error) {
+          failed = true;
+          if (!failureCode && error && typeof error === "object" && "code" in error) {
+            const code = (error as { code?: unknown }).code;
+            if (typeof code === "string" && /^[a-z0-9-]+(?:\/[a-z0-9-]+)?$/.test(code)) failureCode = code.split("/").pop();
+          }
         }
       }
     };
     await Promise.all([
       ...Array.from({ length: Math.min(syncConcurrencyForDevice(), recordBatches.length) }, () => recordWorker()),
+      ...Array.from({ length: Math.min(syncConcurrencyForDevice(), studyWrites.length) }, () => studyWorker()),
       sectionWorker(),
     ]);
   } catch (error) {
@@ -938,7 +1398,8 @@ export async function syncPendingWrites(uid: string) {
     }));
     if ((failed || hasMore) && navigator.onLine && !retryTimers.has(uid)) {
       const baseDelay = retryDelayMs.get(uid) ?? initialRetryDelayMs;
-      const delay = failed ? Math.max(100, Math.round(baseDelay * (0.8 + Math.random() * 0.2))) : 0;
+      const hasUnprocessedQueue = hasMore && !failed;
+      const delay = hasUnprocessedQueue ? 0 : failed ? Math.max(100, Math.round(baseDelay * (0.8 + Math.random() * 0.2))) : 0;
       const timer = setTimeout(() => {
         retryTimers.delete(uid);
         void syncPendingWrites(uid);
